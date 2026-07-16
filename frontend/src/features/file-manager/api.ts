@@ -1,3 +1,5 @@
+// DDC-CWICR-OE: DataDrivenConstruction · OpenConstructionERP
+// Copyright (c) 2026 Artem Boiko / DataDrivenConstruction
 /** API client for the project file manager (Issue #109). */
 
 import { apiDelete, apiGet, apiPatch, apiPost, extractErrorMessageFromBody } from '@/shared/lib/api';
@@ -423,6 +425,24 @@ export async function setDocumentCdeState(
   return apiPatch<DocumentPatchResponse, { cde_state: CdeState }>(
     `${DOCUMENTS_BASE}/${documentId}`,
     { cde_state: cdeState },
+  );
+}
+
+/** Rename a document via ``PATCH /v1/documents/{id}``.
+ *
+ * The documents module's ``DocumentUpdate`` schema already accepts a
+ * ``name`` field (1-255 chars, whitespace-stripped). Only the ``document``
+ * kind is backed by that table, so callers must guard on
+ * ``kind === 'document'`` before invoking. The file manager rows surface
+ * the current value via ``row.name``.
+ */
+export async function renameDocument(
+  documentId: string,
+  name: string,
+): Promise<DocumentPatchResponse> {
+  return apiPatch<DocumentPatchResponse, { name: string }>(
+    `${DOCUMENTS_BASE}/${documentId}`,
+    { name },
   );
 }
 

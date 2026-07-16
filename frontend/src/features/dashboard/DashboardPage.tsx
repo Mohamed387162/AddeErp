@@ -1,4 +1,6 @@
-import { Fragment, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+// DDC-CWICR-OE: DataDrivenConstruction · OpenConstructionERP
+// Copyright (c) 2026 Artem Boiko / DataDrivenConstruction
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useNavigate } from 'react-router-dom';
@@ -46,25 +48,12 @@ import { Card, CardHeader, CardContent, Button, Badge, Skeleton, ActivityFeed as
 import { dashboardGuide } from './dashboardGuide';
 import { MultiCurrencyTotal } from '@/shared/ui/MultiCurrencyTotal';
 import { WhatsNewCard } from '@/shared/ui/WhatsNewCard';
-import BIMCoverageCard from './BIMCoverageCard';
 import { DashboardCasesCard } from './DashboardCasesCard';
-import { FinanceSummaryCard } from './FinanceSummaryCard';
-import { InboxPanel } from '@/features/inbox';
 import { CompactProjectCard } from './components/CompactProjectCard';
-import { DashboardProjectsMap, type ProjectPin } from './components/DashboardProjectsMap';
-import { DashboardSitesPanel } from './components/DashboardSitesPanel';
-import { WeatherSiteWidget } from './components/NewWidgets';
-import { OperationsSnapshotCard } from './components/OperationsSnapshotCard';
-import { LatestSitePhotosCard } from './components/LatestSitePhotosCard';
-import { LabourCostWidget } from './LabourCostWidget';
-import { UpcomingMilestonesCard } from './UpcomingMilestonesCard';
-import { RfiTurnaroundCard } from './RfiTurnaroundCard';
-import { SubmittalsPendingCard } from './SubmittalsPendingCard';
-import { InspectionsQualityCard } from './InspectionsQualityCard';
-import { PunchListQualityCard } from './PunchListQualityCard';
+import { type ProjectPin } from './components/DashboardProjectsMap';
 import { DateDisplay } from '@/shared/ui/DateDisplay';
 import { DashboardLayoutManager } from './DashboardLayoutManager';
-import { DASHBOARD_WIDGET_IDS } from './widgetRegistry';
+import { DASHBOARD_WIDGET_IDS, DASHBOARD_WIDGET_BY_ID } from './widgetRegistry';
 import {
   useDashboardLayoutStore,
   reconcileOrder,
@@ -74,6 +63,102 @@ import {
   DashboardRollupProvider,
   useDashboardRollupContext,
 } from './context/DashboardRollupContext';
+
+// Static Tailwind class strings (dynamic `lg:col-span-${n}` would be purged).
+const DASH_SPAN_CLASS: Record<number, string> = {
+  2: 'lg:col-span-2',
+  3: 'lg:col-span-3',
+  4: 'lg:col-span-4',
+  6: 'lg:col-span-6',
+};
+
+/* ── Progressive load ─────────────────────────────────────────────────────
+ * The dashboard's widget cards are code-split so the page shell + skeletons
+ * paint immediately and each widget's JS (and its own data fetch) streams in
+ * independently, top-to-bottom, instead of the whole page blocking on one big
+ * chunk. Every lazy card below is rendered inside a per-cell <Suspense> in the
+ * widget grid; self-hiding cards keep a `null` fallback (see WIDGET_NULL_FALLBACK)
+ * so an empty widget never flashes a skeleton before it removes itself.
+ * ─────────────────────────────────────────────────────────────────────── */
+const InboxPanel = lazy(() => import('@/features/inbox/InboxPanel'));
+const BIMCoverageCard = lazy(() => import('./BIMCoverageCard'));
+const FinanceSummaryCard = lazy(() =>
+  import('./FinanceSummaryCard').then((m) => ({ default: m.FinanceSummaryCard })),
+);
+const EstimateResourceCard = lazy(() =>
+  import('./EstimateResourceCard').then((m) => ({ default: m.EstimateResourceCard })),
+);
+const DashboardProjectsMap = lazy(() =>
+  import('./components/DashboardProjectsMap').then((m) => ({ default: m.DashboardProjectsMap })),
+);
+const DashboardSitesPanel = lazy(() =>
+  import('./components/DashboardSitesPanel').then((m) => ({ default: m.DashboardSitesPanel })),
+);
+const WeatherSiteWidget = lazy(() =>
+  import('./components/NewWidgets').then((m) => ({ default: m.WeatherSiteWidget })),
+);
+const OperationsSnapshotCard = lazy(() =>
+  import('./components/OperationsSnapshotCard').then((m) => ({
+    default: m.OperationsSnapshotCard,
+  })),
+);
+const LatestSitePhotosCard = lazy(() =>
+  import('./components/LatestSitePhotosCard').then((m) => ({ default: m.LatestSitePhotosCard })),
+);
+const LabourCostWidget = lazy(() =>
+  import('./LabourCostWidget').then((m) => ({ default: m.LabourCostWidget })),
+);
+const UpcomingMilestonesCard = lazy(() =>
+  import('./UpcomingMilestonesCard').then((m) => ({ default: m.UpcomingMilestonesCard })),
+);
+const RfiTurnaroundCard = lazy(() =>
+  import('./RfiTurnaroundCard').then((m) => ({ default: m.RfiTurnaroundCard })),
+);
+const SubmittalsPendingCard = lazy(() =>
+  import('./SubmittalsPendingCard').then((m) => ({ default: m.SubmittalsPendingCard })),
+);
+const InspectionsQualityCard = lazy(() =>
+  import('./InspectionsQualityCard').then((m) => ({ default: m.InspectionsQualityCard })),
+);
+const PunchListQualityCard = lazy(() =>
+  import('./PunchListQualityCard').then((m) => ({ default: m.PunchListQualityCard })),
+);
+
+/**
+ * Widget ids whose card self-hides internally (renders `null` when its module
+ * has no data). These get a `null` Suspense fallback so a still-loading empty
+ * widget never flashes a skeleton and then vanishes. Widgets that always render
+ * something (inbox, projects map) instead show a WidgetSkeleton while loading.
+ */
+const WIDGET_NULL_FALLBACK = new Set<string>([
+  'finance_summary',
+  'estimate_resources',
+  'bim_coverage',
+  'operations_snapshot',
+  'upcoming_milestones',
+  'rfi_turnaround',
+  'submittals_pending',
+  'inspections_quality',
+  'punch_quality',
+  'weather_site',
+  'labour_cost',
+  'latest_photos',
+]);
+
+/**
+ * Placeholder shown in a widget's grid cell while its code-split chunk (and
+ * first data) load, so the dashboard paints structure immediately instead of a
+ * blank gap. Purely visual (no translated text), so it is safe to render before
+ * the active locale finishes loading - no useI18nReady() gating needed.
+ */
+function WidgetSkeleton() {
+  return (
+    <div
+      aria-hidden="true"
+      className="h-full min-h-[8rem] w-full animate-pulse rounded-2xl border border-border-subtle bg-surface-muted/40"
+    />
+  );
+}
 
 /* ── Helpers ──────────────────────────────────────────────────────────── */
 
@@ -1784,14 +1869,14 @@ function QuickUploadCard({ projects }: { projects?: ProjectSummary[] }) {
   const hasProjects = selectableProjects.length > 0;
 
   return (
-    <div className="animate-card-in" style={{ animationDelay: '120ms' }}>
-      <Card padding="none">
+    <div className="animate-card-in h-full" style={{ animationDelay: '120ms' }}>
+      <Card padding="none" className="h-full">
         <div
           onDrop={onDrop}
           onDragOver={onDragOver}
           onDragLeave={onDragLeave}
           className={[
-            'relative flex items-center gap-4 rounded-xl border-2 border-dashed px-5 py-5 transition-all',
+            'relative flex h-full items-center gap-4 rounded-xl border-2 border-dashed px-5 py-5 transition-all',
             dragOver
               ? 'border-oe-blue bg-oe-blue-subtle/40'
               : 'border-border-light bg-surface-secondary/30 hover:border-oe-blue/40',
@@ -1938,6 +2023,7 @@ function DashboardPageInner() {
 
   const widgetOrder = useDashboardLayoutStore((s) => s.order);
   const widgetHidden = useDashboardLayoutStore((s) => s.hidden);
+  const widgetSpans = useDashboardLayoutStore((s) => s.spans);
   const resolvedWidgets = useMemo(
     () => reconcileOrder(widgetOrder, DASHBOARD_WIDGET_IDS),
     [widgetOrder],
@@ -2235,6 +2321,8 @@ function DashboardPageInner() {
     ),
 
     finance_summary: <FinanceSummaryCard />,
+
+    estimate_resources: <EstimateResourceCard />,
 
     projects: (
       <>
@@ -2595,11 +2683,24 @@ function DashboardPageInner() {
       {/* ─── Widgets - rendered in the user's saved order, hidden ones
           skipped. Conditional widgets resolve to null and contribute
           nothing (same behaviour as when they were inline). ──────────── */}
-      {resolvedWidgets.map((id) => {
-        if (widgetHidden.includes(id)) return null;
-        const node = widgetNodes[id];
-        return node ? <Fragment key={id}>{node}</Fragment> : null;
-      })}
+      <div className="grid grid-cols-1 gap-5 lg:grid-cols-6 lg:grid-flow-row-dense">
+        {resolvedWidgets.map((id) => {
+          if (widgetHidden.includes(id)) return null;
+          const node = widgetNodes[id];
+          if (!node) return null;
+          const span = widgetSpans[id] ?? DASHBOARD_WIDGET_BY_ID[id]?.defaultSpan ?? 6;
+          return (
+            <div
+              key={id}
+              className={`h-full [&>*]:h-full ${DASH_SPAN_CLASS[span] ?? 'lg:col-span-6'}`}
+            >
+              <Suspense fallback={WIDGET_NULL_FALLBACK.has(id) ? null : <WidgetSkeleton />}>
+                {node}
+              </Suspense>
+            </div>
+          );
+        })}
+      </div>
     </div>
     </DashboardRollupProvider>
   );

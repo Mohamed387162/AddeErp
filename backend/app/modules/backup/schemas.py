@@ -1,3 +1,5 @@
+# DDC-CWICR-OE: DataDrivenConstruction · OpenConstructionERP
+# Copyright (c) 2026 Artem Boiko / DataDrivenConstruction
 """Pydantic schemas for the Backup & Restore module.
 
 Schemas are kept here so they appear explicitly in the OpenAPI spec.
@@ -55,6 +57,7 @@ class RestoreResponse(BaseModel):
     imported: dict[str, int]
     skipped: dict[str, int]
     warnings: list[str]
+    files_restored: int = 0
 
 
 class ValidateResponse(BaseModel):

@@ -1,3 +1,5 @@
+// DDC-CWICR-OE: DataDrivenConstruction · OpenConstructionERP
+// Copyright (c) 2026 Artem Boiko / DataDrivenConstruction
 import { useState, useCallback, useEffect, useMemo, useRef, Fragment } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { NavLink, useLocation, useNavigate } from 'react-router-dom';
@@ -46,6 +48,7 @@ import {
   HelpCircle,
   Route,
   AlertOctagon,
+  CircleDot,
   FileCheck,
   Mail,
   Send,
@@ -91,13 +94,14 @@ import {
   Wand2,
   PackageCheck,
   Loader2,
+  ScanEye,
   type LucideIcon,
 } from 'lucide-react';
 import { useAuthStore } from '@/stores/useAuthStore';
 import { useModuleStore } from '@/stores/useModuleStore';
 import { apiGet } from '@/shared/lib/api';
 import { UpdateNotification } from '@/shared/ui/UpdateChecker';
-import { VideoNewsCard } from '@/shared/ui/VideoNewsCard';
+import { ArticleNewsCard } from '@/shared/ui/ArticleNewsCard';
 import { useViewModeStore } from '@/stores/useViewModeStore';
 import { useNavPendingStore } from '@/shared/lib/navigationProgress';
 import { useRecentStore } from '@/stores/useRecentStore';
@@ -234,10 +238,10 @@ const navGroups: NavGroup[] = [
     defaultLabel: 'Takeoff',
     defaultOpen: true,
     items: [
-      { labelKey: 'nav.quantities', to: '/quantities', icon: Ruler },
       { labelKey: 'nav.pdf_measurements', to: '/takeoff?tab=measurements', icon: Ruler },
       { labelKey: 'nav.dwg_takeoff', to: '/dwg-takeoff', icon: PencilRuler },
       { labelKey: 'nav.bim_viewer', to: '/bim', icon: Box },
+      { labelKey: 'nav.quantities', to: '/quantities', icon: Ruler },
     ],
   },
   // ── 3. ESTIMATING ──────────────────────────────────────────────────
@@ -270,6 +274,7 @@ const navGroups: NavGroup[] = [
       { labelKey: 'nav.estimate_basis', to: '/estimate-basis', icon: FileText, advancedOnly: true },
       { labelKey: 'nav.preliminaries', to: '/preliminaries', icon: ClipboardList, advancedOnly: true },
       { labelKey: 'nav.allowances', to: '/allowances', icon: Wallet, advancedOnly: true },
+      { labelKey: 'nav.design_options', to: '/design-options', icon: Scale, advancedOnly: true },
     ],
   },
   // ── 4. COST DATA ───────────────────────────────────────────────────
@@ -322,8 +327,10 @@ const navGroups: NavGroup[] = [
     hideInSimple: true,
     items: [
       { labelKey: 'nav.coordination_hub', to: '/coordination', icon: LayoutDashboard, badge: 'BETA' },
+      { labelKey: 'nav.model_review', to: '/model-review', icon: ScanEye, badge: 'BETA' },
       { labelKey: 'nav.bim_federations', to: '/bim/federations', icon: Layers },
       { labelKey: 'nav.clash_detection', to: '/clash', icon: Radar, badge: 'BETA' },
+      { labelKey: 'nav.model_issues', to: '/bcf', icon: MessageSquare, badge: 'BETA' },
       { labelKey: 'nav.bim_rules', to: '/bim/rules?mode=requirements', icon: SlidersHorizontal },
       { labelKey: 'nav.eir_matrix', to: '/requirements/matrix', icon: FileCheck, advancedOnly: true, badge: 'BETA' },
     ],
@@ -536,6 +543,7 @@ const navGroups: NavGroup[] = [
     defaultOpen: true,
     hideInSimple: true,
     items: [
+      { labelKey: 'nav.issues', to: '/issues', icon: CircleDot },
       { labelKey: 'validation.title', to: '/validation', icon: ShieldCheck, moduleKey: 'validation' },
       { labelKey: 'inspections.title', to: '/inspections', icon: ClipboardCheck },
       { labelKey: 'construction_control.title', to: '/construction-control', icon: ClipboardList },
@@ -673,6 +681,29 @@ const navGroups: NavGroup[] = [
       { labelKey: 'nav.architecture_map', to: '/architecture', icon: GitBranch, advancedOnly: true, adminOnly: true },
     ],
   },
+  // ── 19b. RATE BUILD-UP ─────────────────────────────────────────────
+  // The unit-rate build-up cohort: production norms (resource demand per
+  // quantity), all-in labour rates, material waste factors, price escalation,
+  // and the resource statement they feed. Sits right above the AI surfaces
+  // because rate build-up is core estimating work. Still badged beta per item
+  // until each is wired into the position resource split
+  // (`metadata_["resources"]`) / assembly components. Ordered as the build-up
+  // actually flows: norm -> rate -> waste -> escalation -> summary.
+  {
+    id: 'grp_rate_buildup',
+    labelKey: 'sidebar.group.rate_buildup',
+    defaultLabel: 'Rate Build-up',
+    defaultOpen: true,
+    hideInSimple: true,
+    separator: true,
+    items: [
+      { labelKey: 'nav.norm_expansion', to: '/norm-expansion', icon: ListChecks, advancedOnly: true },
+      { labelKey: 'nav.labor_rates', to: '/labor-rates', icon: HardHat, advancedOnly: true },
+      { labelKey: 'nav.waste_factors', to: '/waste-factors', icon: Ruler, advancedOnly: true },
+      { labelKey: 'nav.price_index', to: '/price-index', icon: TrendingUp, advancedOnly: true },
+      { labelKey: 'nav.resource_summary', to: '/resource-summary', icon: Package, advancedOnly: true },
+    ],
+  },
   // ── 20. AUTOMATION & AI ────────────────────────────────────────────
   // AI agents, advisor, ERP chat, and the pipeline builder (listed
   // statically — its manifest group `ai` no longer matches any group id,
@@ -705,30 +736,6 @@ const navGroups: NavGroup[] = [
       { labelKey: 'nav.ai_estimate', to: '/ai-estimate', icon: Sparkles, badge: 'BETA' },
       { labelKey: 'nav.ai_estimator', to: '/ai-estimator', icon: Wand2, badge: 'BETA' },
       { labelKey: 'nav.estimate_copilot', to: '/estimate-copilot', icon: Bot, badge: 'BETA' },
-    ],
-  },
-  // ── 20b. RATE BUILD-UP (beta, in development) ──────────────────────
-  // The unit-rate build-up cohort: production norms (resource demand per
-  // quantity), all-in labour rates, material waste factors, price escalation,
-  // and the resource statement they feed. These compute correctly today but
-  // stand apart from the BOQ / assembly cost spine, so they are parked low
-  // and badged beta. As each is wired to write into the position resource
-  // split (`metadata_["resources"]`) / assembly components, it graduates back
-  // up next to Cost Data. Ordered as the build-up actually flows: norm ->
-  // rate -> waste -> escalation -> summary.
-  {
-    id: 'grp_rate_buildup',
-    labelKey: 'sidebar.group.rate_buildup',
-    defaultLabel: 'Rate Build-up',
-    defaultOpen: false,
-    hideInSimple: true,
-    separator: true,
-    items: [
-      { labelKey: 'nav.norm_expansion', to: '/norm-expansion', icon: ListChecks, advancedOnly: true },
-      { labelKey: 'nav.labor_rates', to: '/labor-rates', icon: HardHat, advancedOnly: true },
-      { labelKey: 'nav.waste_factors', to: '/waste-factors', icon: Ruler, advancedOnly: true },
-      { labelKey: 'nav.price_index', to: '/price-index', icon: TrendingUp, advancedOnly: true },
-      { labelKey: 'nav.resource_summary', to: '/resource-summary', icon: Package, advancedOnly: true },
     ],
   },
   // ── REGIONAL EXCHANGE (setup-only, dynamic) ────────────────────────
@@ -864,6 +871,7 @@ const ROUTE_BACKEND_MODULE: Record<string, string> = {
   '/variations': 'oe_variations',
   '/moc': 'oe_moc',
   '/supplier-catalogs': 'oe_supplier_catalogs',
+  '/design-options': 'oe_design_options',
   // Real estate development
   '/property-dev': 'oe_property_dev',
   '/accommodation': 'oe_accommodation',
@@ -1073,6 +1081,11 @@ export function Sidebar({ onClose }: { onClose?: () => void }) {
   const navigate = useNavigate();
   const location = useLocation();
   const { isModuleEnabled } = useModuleStore();
+  // Hidden whole-sections (nav groups) the user has switched off via the
+  // "Edit menu". Persisted in useModuleStore alongside module state; here we
+  // read the list and the bulk setter the Save action commits to.
+  const hiddenGroups = useModuleStore((s) => s.hiddenGroups);
+  const setHiddenGroups = useModuleStore((s) => s.setHiddenGroups);
   const isAdvanced = useViewModeStore((s) => s.isAdvanced);
   const setViewMode = useViewModeStore((s) => s.setMode);
   const badgeCounts = useSidebarBadges();
@@ -1166,29 +1179,46 @@ export function Sidebar({ onClose }: { onClose?: () => void }) {
   // `editMode` is the transient "Edit menu" toggle.
   // `editingHidden` is the in-memory working copy users edit while in
   // edit mode; only committed to `hiddenModules` on Save.
+  // Two independent working copies: one for individual rows (`editingHidden`,
+  // routes) and one for whole sections (`editingHiddenGroups`, group ids).
+  // Both are seeded on entry and committed together on Save, so hiding a
+  // module and hiding a section share one Save/Cancel gesture.
   const { hiddenModules, setHiddenModules } = useHiddenModules();
   const [editMode, setEditMode] = useState(false);
   const [editingHidden, setEditingHidden] = useState<string[]>([]);
+  const [editingHiddenGroups, setEditingHiddenGroups] = useState<string[]>([]);
 
   const enterEditMode = useCallback(() => {
     setEditingHidden(hiddenModules);
+    setEditingHiddenGroups(hiddenGroups);
     setEditMode(true);
-  }, [hiddenModules]);
+  }, [hiddenModules, hiddenGroups]);
 
   const cancelEditMode = useCallback(() => {
     setEditMode(false);
     setEditingHidden([]);
+    setEditingHiddenGroups([]);
   }, []);
 
   const saveEditMode = useCallback(() => {
     setHiddenModules(editingHidden);
+    setHiddenGroups(editingHiddenGroups);
     setEditMode(false);
     setEditingHidden([]);
-  }, [editingHidden, setHiddenModules]);
+    setEditingHiddenGroups([]);
+  }, [editingHidden, editingHiddenGroups, setHiddenModules, setHiddenGroups]);
 
   const toggleItemHidden = useCallback((route: string) => {
     setEditingHidden((prev) =>
       prev.includes(route) ? prev.filter((r) => r !== route) : [...prev, route],
+    );
+  }, []);
+
+  // Flip a whole section's hidden state inside the working copy. Committed to
+  // the store (and localStorage) only when the user hits Save.
+  const toggleGroupHidden = useCallback((groupId: string) => {
+    setEditingHiddenGroups((prev) =>
+      prev.includes(groupId) ? prev.filter((g) => g !== groupId) : [...prev, groupId],
     );
   }, []);
 
@@ -1197,6 +1227,10 @@ export function Sidebar({ onClose }: { onClose?: () => void }) {
   // normal mode actually filters. The visual "muted" state is driven by
   // `editingHidden` so re-enabled rows visually un-mute immediately.
   const effectiveHidden = editMode ? [] : hiddenModules;
+  // Same idea for whole sections: in normal mode a hidden group (its header
+  // and every row) drops out entirely; in edit mode this is empty so the
+  // group still renders — dimmed — and the user can switch it back on.
+  const effectiveHiddenGroups = editMode ? [] : hiddenGroups;
 
   // Custom-module request dialog — opens from the "Request a custom
   // module" CTA at the bottom of the nav (below the "+ Add module"
@@ -1590,6 +1624,13 @@ export function Sidebar({ onClose }: { onClose?: () => void }) {
           // Hide entire group in simple mode if flagged
           if (group.hideInSimple && !isAdvanced) return null;
 
+          // Menu-editor: a section the user has hidden drops out completely
+          // (header + every row) in normal mode. In edit mode
+          // `effectiveHiddenGroups` is empty, so the section still renders and
+          // shows dimmed via `editingHiddenGroups` (see NavGroupSection) with
+          // an eye control to switch it back on.
+          if (effectiveHiddenGroups.includes(group.id)) return null;
+
           // Merge static items + dynamic module items for this group.
           // Most groups inject by their own `id`; `grp_reality` overrides
           // with `dynamicGroupKey: 'reality'` so `oe_pointcloud`'s manifest
@@ -1617,13 +1658,17 @@ export function Sidebar({ onClose }: { onClose?: () => void }) {
           // the menu tidy.
           const allItems = [...group.items, ...dynamicItems];
           const visibleItems = allItems.filter((item) => {
-            // Company Profiles / onboarding packs PRE-SELECT modules, they do
-            // not remove them. Every module stays listed in the menu whatever
-            // profile was chosen during onboarding, so nothing a company might
-            // need is ever hidden by its profile. The per-project focus gate
-            // below only annotates rows with a sequence number; it never drops
-            // them either.
+            // A company profile (picked in onboarding, or switched on the
+            // Modules > Company Profiles tab) now shapes the menu: a row whose
+            // `moduleKey` maps to a module the profile disabled drops out, so
+            // the sidebar matches the profile the company chose. Core modules
+            // are never disabled and `isModuleEnabled` is fail-open, so nothing
+            // essential disappears, and any module can be switched back on from
+            // the Modules page. In menu-edit mode we skip this gate so every row
+            // stays reachable to toggle. The per-project focus gate below only
+            // annotates rows with a sequence number; it never drops them.
             return (
+              (editMode || !item.moduleKey || isModuleEnabled(item.moduleKey)) &&
               (!item.advancedOnly || isAdvanced) &&
               (!item.adminOnly || userRole === 'admin') &&
               // Backend-disabled gate - a System Module a company admin has
@@ -1667,6 +1712,9 @@ export function Sidebar({ onClose }: { onClose?: () => void }) {
               isCollapsed={isCollapsed}
               onToggle={() => toggleGroup(group.id)}
               iconified={iconified}
+              editMode={editMode}
+              isGroupHidden={editingHiddenGroups.includes(group.id)}
+              onToggleGroupHidden={() => toggleGroupHidden(group.id)}
             >
               <ul className="space-y-0.5">
                 {visibleItems.map((item, i) => {
@@ -1742,11 +1790,11 @@ export function Sidebar({ onClose }: { onClose?: () => void }) {
                   <X size={12} strokeWidth={2.25} />
                   <span>{t('sidebar.cancel', { defaultValue: 'Cancel' })}</span>
                 </button>
-                {editingHidden.length > 0 && (
+                {editingHidden.length + editingHiddenGroups.length > 0 && (
                   <span className="shrink-0 text-2xs text-content-tertiary tabular-nums">
                     {t('sidebar.hidden_count', {
                       defaultValue: '{{count}} hidden',
-                      count: editingHidden.length,
+                      count: editingHidden.length + editingHiddenGroups.length,
                     })}
                   </span>
                 )}
@@ -1764,14 +1812,14 @@ export function Sidebar({ onClose }: { onClose?: () => void }) {
                   <Pencil size={12} strokeWidth={2} />
                   <span>{t('sidebar.edit_menu', { defaultValue: 'Edit menu' })}</span>
                 </button>
-                {hiddenModules.length > 0 && (
+                {hiddenModules.length + hiddenGroups.length > 0 && (
                   <span
                     className="shrink-0 rounded-full bg-surface-tertiary/70 px-1.5 py-px text-[10px] font-medium text-content-tertiary tabular-nums"
                     title={t('sidebar.show_hidden', { defaultValue: 'Show hidden' })}
                   >
                     {t('sidebar.hidden_count', {
                       defaultValue: '{{count}} hidden',
-                      count: hiddenModules.length,
+                      count: hiddenModules.length + hiddenGroups.length,
                     })}
                   </span>
                 )}
@@ -1899,13 +1947,12 @@ export function Sidebar({ onClose }: { onClose?: () => void }) {
           </div>
         )}
 
-        {/* Featured video card - links to the YouTube video on the
+        {/* Featured article card - links out to the long-form article on the
             uberization of construction and the idea behind the platform.
-            Hidden in icon-only mode (image + text need width); dismissible
-            and remembered per-video in localStorage. */}
+            Hidden in icon-only mode (the title + subtitle need width). */}
         {!iconified && (
           <div className="mt-2">
-            <VideoNewsCard />
+            <ArticleNewsCard />
           </div>
         )}
 
@@ -2025,6 +2072,9 @@ function NavGroupSection({
   onToggle,
   children,
   iconified,
+  editMode,
+  isGroupHidden,
+  onToggleGroupHidden,
 }: {
   label: string;
   description?: string;
@@ -2032,6 +2082,12 @@ function NavGroupSection({
   onToggle: () => void;
   children: React.ReactNode;
   iconified?: boolean;
+  /** When true, the header shows an Eye / EyeOff control that hides or
+   *  restores this whole section in one click, and the section renders
+   *  dimmed while hidden — the section-level twin of the per-row toggle. */
+  editMode?: boolean;
+  isGroupHidden?: boolean;
+  onToggleGroupHidden?: () => void;
 }) {
   const { t } = useTranslation();
   // In icon-only mode there is no room for the group header chevron;
@@ -2053,7 +2109,11 @@ function NavGroupSection({
   // keyboard focus shows a clean ring without bleeding outside the
   // padded box.
   return (
-    <div className="mt-3 mb-0.5">
+    <div className={clsx('mt-3 mb-0.5', editMode && isGroupHidden && 'opacity-50')}>
+      {/* Header row — the collapse toggle plus, in Edit-menu mode, a
+          section-level Eye / EyeOff control. Kept as sibling buttons (not
+          nested) so both stay valid, focusable controls. */}
+      <div className="mb-0.5 flex items-center gap-0.5">
       <button
         onClick={onToggle}
         aria-expanded={!isCollapsed}
@@ -2063,7 +2123,7 @@ function NavGroupSection({
             : t('common.collapse_section', { defaultValue: 'Collapse {{label}}', label })
         }
         className={clsx(
-          'mb-0.5 flex w-full items-center justify-between gap-2 rounded-md',
+          'flex flex-1 min-w-0 items-center justify-between gap-2 rounded-md',
           'px-2 py-1 group cursor-pointer text-left',
           'hover:bg-surface-secondary/60 focus-visible:outline-none',
           'focus-visible:ring-1 focus-visible:ring-oe-blue/40',
@@ -2097,6 +2157,35 @@ function NavGroupSection({
           aria-hidden
         />
       </button>
+      {editMode && onToggleGroupHidden && (
+        <button
+          type="button"
+          onClick={onToggleGroupHidden}
+          aria-label={
+            isGroupHidden
+              ? t('sidebar.show_group', { defaultValue: 'Show {{label}} section', label })
+              : t('sidebar.hide_group', { defaultValue: 'Hide {{label}} section', label })
+          }
+          title={
+            isGroupHidden
+              ? t('sidebar.show_group', { defaultValue: 'Show {{label}} section', label })
+              : t('sidebar.hide_group', { defaultValue: 'Hide {{label}} section', label })
+          }
+          className={clsx(
+            'flex h-6 w-6 shrink-0 items-center justify-center rounded-md',
+            'text-content-tertiary hover:text-oe-blue hover:bg-oe-blue/10',
+            'focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-oe-blue/40',
+            'transition-colors duration-150',
+          )}
+        >
+          {isGroupHidden ? (
+            <EyeOff size={12} strokeWidth={2} />
+          ) : (
+            <Eye size={12} strokeWidth={2} />
+          )}
+        </button>
+      )}
+      </div>
       {!isCollapsed && description && (
         <p className="mb-1 px-2 text-[10px] leading-snug text-content-quaternary">
           {description}

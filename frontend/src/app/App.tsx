@@ -1,3 +1,5 @@
+// DDC-CWICR-OE: DataDrivenConstruction · OpenConstructionERP
+// Copyright (c) 2026 Artem Boiko / DataDrivenConstruction
 import { Suspense, lazy, useState, useCallback, useEffect, useLayoutEffect, useContext, createContext } from 'react';
 import { Routes, Route, Navigate, Outlet, useLocation, useParams } from 'react-router-dom';
 import { AppLayout } from './layout';
@@ -111,6 +113,13 @@ const PdfComparePage = lazy(() =>
 );
 const PunchListPage = lazy(() =>
   import('@/features/punchlist/PunchListPage').then((m) => ({ default: m.PunchListPage }))
+);
+const IssuesHubPage = lazy(() =>
+  import('@/features/issues/IssuesHubPage').then((m) => ({ default: m.IssuesHubPage }))
+);
+const BcfPage = lazy(() => import('@/features/bcf/BcfPage').then((m) => ({ default: m.BcfPage })));
+const ModelReviewPage = lazy(() =>
+  import('@/features/bim/ModelReviewPage').then((m) => ({ default: m.ModelReviewPage }))
 );
 const CloseoutPage = lazy(() => import('@/features/closeout/CloseoutPage'));
 const InboxPage = lazy(() =>
@@ -522,6 +531,7 @@ const PreliminariesPage = lazy(() =>
 const AllowancesPage = lazy(() =>
   import('@/features/allowances').then((m) => ({ default: m.AllowancesPage }))
 );
+const DesignOptionsPage = lazy(() => import('@/features/design-options'));
 const WasteFactorsPage = lazy(() =>
   import('@/features/waste-factors').then((m) => ({ default: m.WasteFactorsPage }))
 );
@@ -834,7 +844,13 @@ export default function App() {
   // immediately sees their workspace brand.
   useEffect(() => {
     void useBrandingStore.getState().hydrateFromServer();
-    void usePreferencesStore.getState().hydrateFromServer();
+    // Account-level preferences are a user-scoped endpoint, so only pull them
+    // once the user is authenticated. Firing this before sign-in 401s on
+    // /v1/users/me/preferences/ and, though the store swallows the error, the
+    // failed request still lands in the in-app bug-report buffer (issue #340).
+    if (isAuthenticated) {
+      void usePreferencesStore.getState().hydrateFromServer();
+    }
   }, [isAuthenticated]);
 
   // Onboarding-tour migration (one-shot). The app used to mount two
@@ -984,6 +1000,8 @@ export default function App() {
         <Route path="/clash/profiles" element={<P title="Clash Profiles"><ClashProfileManager /></P>} />
         <Route path="/projects/:projectId/clash/profiles" element={<P title="Clash Profiles"><ClashProfileManager /></P>} />
         <Route path="/coordination" element={<P title="Model Coordination"><CoordinationHubPage /></P>} />
+        <Route path="/bcf" element={<P title="Model Issues"><BcfPage /></P>} />
+        <Route path="/model-review" element={<P title="Model Review"><ModelReviewPage /></P>} />
         <Route path="/assets" element={<P title="Asset Register"><AssetsPage /></P>} />
         <Route path="/bim/:modelId" element={<P title="BIM Viewer"><BIMPage /></P>} />
         <Route path="/projects/:projectId/bim" element={<P title="BIM Viewer"><BIMPage /></P>} />
@@ -1011,6 +1029,7 @@ export default function App() {
         <Route path="/estimate-basis" element={<P title="Basis of Estimate"><EstimateBasisPage /></P>} />
         <Route path="/preliminaries" element={<P title="Preliminaries"><PreliminariesPage /></P>} />
         <Route path="/allowances" element={<P title="Allowances"><AllowancesPage /></P>} />
+        <Route path="/design-options" element={<P title="Design Options"><DesignOptionsPage /></P>} />
         <Route path="/price-index" element={<P title="Price Index"><PriceIndexPage /></P>} />
         <Route path="/labor-rates" element={<P title="Labor Rates"><LaborRatesPage /></P>} />
         <Route path="/resource-summary" element={<P title="Resource Summary"><ResourceSummaryPage /></P>} />
@@ -1082,6 +1101,7 @@ export default function App() {
         <Route path="/markups" element={<P title="Markups"><MarkupsPage /></P>} />
         <Route path="/markups/compare" element={<P title="Compare Revisions"><PdfComparePage /></P>} />
         <Route path="/punchlist" element={<P title="Punch List"><PunchListPage /></P>} />
+        <Route path="/issues" element={<P title="Issues"><IssuesHubPage /></P>} />
         <Route path="/closeout" element={<P title="Handover & Closeout"><CloseoutPage /></P>} />
         <Route path="/field-reports" element={<P title="Field Reports"><FieldReportsPage /></P>} />
 

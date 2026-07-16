@@ -1,3 +1,5 @@
+// DDC-CWICR-OE: DataDrivenConstruction · OpenConstructionERP
+// Copyright (c) 2026 Artem Boiko / DataDrivenConstruction
 /**
  * WhatsNewCard — friendly "what's new in vX.Y.Z" release-notes card.
  *
@@ -36,12 +38,12 @@ import {
   Sparkles,
   X,
   ArrowRight,
-  ShieldCheck,
-  FileText,
-  Map,
-  ArrowLeftRight,
-  ScanLine,
-  ListTree,
+  Scissors,
+  Ruler,
+  Mountain,
+  Camera,
+  Coins,
+  GraduationCap,
   type LucideIcon,
 } from 'lucide-react';
 import { APP_VERSION } from '@/shared/lib/version';
@@ -83,139 +85,125 @@ interface Section {
   bullets: { key: string; default: string }[];
 }
 
-/* ── v8.2.0 release content ─────────────────────────────────────────────
-   Six chips for the v8.2 wave: the project journey map (headline), the
-   currency inversion guard, BIM bulk-import validation, takeoff scanned-page
-   flagging, DIN 276 dotted CAD codes, and the comment/DWG-preview fixes.
-   Bullets surface only when the chip is expanded. */
-const SECTIONS_V820: Section[] = [
+/* ── v11.0.0 release content ────────────────────────────────────────────
+   Six chips for the v11.0 wave: the new point cloud review tools take the
+   headline (section a scan, measure on it, colour it by height, snapshot a
+   view), then onboarding that leads with the cost base, and the start-here
+   worked cases now translated into every language. Bullets surface only
+   when the chip is expanded. */
+const SECTIONS_V1110: Section[] = [
   {
-    id: 'journey',
-    icon: Map,
-    titleKey: 'whatsnew.v820.journey.title',
-    titleDefault: 'Project journey map in the top bar',
-    chipKey: 'whatsnew.v820.journey.chip',
-    chipDefault: 'Journey map',
+    id: 'pc-section',
+    icon: Scissors,
+    titleKey: 'whatsnew.v1110.section.title',
+    titleDefault: 'Slice a point cloud',
+    chipKey: 'whatsnew.v1110.section.chip',
+    chipDefault: 'Section a scan',
     bullets: [
       {
-        key: 'whatsnew.v820.journey.b1',
+        key: 'whatsnew.v1110.section.b1',
         default:
-          'A control in the top bar names the lifecycle phase the screen you are on belongs to.',
+          'Cut a reality-capture scan to a height band and read just that slice.',
       },
       {
-        key: 'whatsnew.v820.journey.b2',
+        key: 'whatsnew.v1110.section.b2',
         default:
-          'Open it to see the whole project from first lead to handover: three arcs and eleven numbered phases.',
-      },
-      {
-        key: 'whatsnew.v820.journey.b3',
-        default:
-          'Every major module sits on its phase as a link, and it is translated in every language.',
+          'Switch the slice to a top-down plan view to work it like a floor plan.',
       },
     ],
   },
   {
-    id: 'fx',
-    icon: ArrowLeftRight,
-    titleKey: 'whatsnew.v820.fx.title',
-    titleDefault: 'Currency inversion guard',
-    chipKey: 'whatsnew.v820.fx.chip',
-    chipDefault: 'FX guard',
+    id: 'pc-measure',
+    icon: Ruler,
+    titleKey: 'whatsnew.v1110.measure.title',
+    titleDefault: 'Measure on the cloud',
+    chipKey: 'whatsnew.v1110.measure.chip',
+    chipDefault: 'Measure points',
     bullets: [
       {
-        key: 'whatsnew.v820.fx.b1',
+        key: 'whatsnew.v1110.measure.b1',
         default:
-          'The currency dialog warns when a project exchange rate looks entered upside down.',
+          'Measure point to point and read the distance with its horizontal and vertical parts in millimetres.',
       },
       {
-        key: 'whatsnew.v820.fx.b2',
+        key: 'whatsnew.v1110.measure.b2',
         default:
-          'It also flags a rate that sits far from a typical market rate, and shows it the right way round.',
-      },
-      {
-        key: 'whatsnew.v820.fx.b3',
-        default:
-          'A slip no longer quietly skews rolled-up totals.',
+          'Box off a region with a clip box to isolate part of a scan.',
       },
     ],
   },
   {
-    id: 'bim',
-    icon: ShieldCheck,
-    titleKey: 'whatsnew.v820.bim.title',
-    titleDefault: 'BIM bulk-import validation',
-    chipKey: 'whatsnew.v820.bim.chip',
-    chipDefault: 'BIM import',
+    id: 'pc-elevation',
+    icon: Mountain,
+    titleKey: 'whatsnew.v1110.elevation.title',
+    titleDefault: 'Colour points by height',
+    chipKey: 'whatsnew.v1110.elevation.chip',
+    chipDefault: 'Elevation colours',
     bullets: [
       {
-        key: 'whatsnew.v820.bim.b1',
+        key: 'whatsnew.v1110.elevation.b1',
         default:
-          'Models imported from a spreadsheet or a bulk element file now run the same validation pass as the CAD path.',
+          'Colour the cloud by elevation with a legend from the lowest to the highest point.',
       },
       {
-        key: 'whatsnew.v820.bim.b2',
+        key: 'whatsnew.v1110.elevation.b2',
         default:
-          'Every imported model gets a validation report, not only the ones brought in through a converter.',
+          'Pin a height band to hold the colour range while you look around.',
       },
     ],
   },
   {
-    id: 'takeoff',
-    icon: ScanLine,
-    titleKey: 'whatsnew.v820.takeoff.title',
-    titleDefault: 'Takeoff flags scanned pages',
-    chipKey: 'whatsnew.v820.takeoff.chip',
-    chipDefault: 'Scanned pages',
+    id: 'pc-snapshot',
+    icon: Camera,
+    titleKey: 'whatsnew.v1110.snapshot.title',
+    titleDefault: 'Save the view',
+    chipKey: 'whatsnew.v1110.snapshot.chip',
+    chipDefault: 'Snapshot',
     bullets: [
       {
-        key: 'whatsnew.v820.takeoff.b1',
+        key: 'whatsnew.v1110.snapshot.b1',
         default:
-          'Quantity takeoff now reports how many PDF pages came back with no text layer, usually scanned drawings.',
-      },
-      {
-        key: 'whatsnew.v820.takeoff.b2',
-        default:
-          'They are no longer treated silently as empty, so it is clear which pages need OCR.',
+          'Save the current point cloud view as a PNG image in one click.',
       },
     ],
   },
   {
-    id: 'din276',
-    icon: ListTree,
-    titleKey: 'whatsnew.v820.din276.title',
-    titleDefault: 'DIN 276 dotted CAD codes',
-    chipKey: 'whatsnew.v820.din276.chip',
-    chipDefault: 'DIN 276',
+    id: 'onboarding-base',
+    icon: Coins,
+    titleKey: 'whatsnew.v1110.onboarding.title',
+    titleDefault: 'Onboarding leads with the cost base',
+    chipKey: 'whatsnew.v1110.onboarding.chip',
+    chipDefault: 'Cost base first',
     bullets: [
       {
-        key: 'whatsnew.v820.din276.b1',
+        key: 'whatsnew.v1110.onboarding.b1',
         default:
-          'Completeness and hierarchy checks now fold dotted CAD codes such as 330.10 to their three-digit cost group.',
+          'Choose your national price base first, right at the start of setup.',
       },
       {
-        key: 'whatsnew.v820.din276.b2',
+        key: 'whatsnew.v1110.onboarding.b2',
         default:
-          'A model classified with deeper codes is scored against the right group instead of being undercounted.',
+          'The left menu is rebuilt to the company profile you pick, so the app opens shaped to how you work.',
       },
     ],
   },
   {
-    id: 'fixes',
-    icon: FileText,
-    titleKey: 'whatsnew.v820.fixes.title',
-    titleDefault: 'Comment and DWG preview fixes',
-    chipKey: 'whatsnew.v820.fixes.chip',
-    chipDefault: 'Fixes',
+    id: 'start-here',
+    icon: GraduationCap,
+    titleKey: 'whatsnew.v1110.cases.title',
+    titleDefault: 'Learn by example',
+    chipKey: 'whatsnew.v1110.cases.chip',
+    chipDefault: 'Start-here cases',
     bullets: [
       {
-        key: 'whatsnew.v820.fixes.b1',
+        key: 'whatsnew.v1110.cases.b1',
         default:
-          'A comment that carries a viewpoint now checks its entity type against the same allowlist as the standalone path.',
+          'A start-here row on the dashboard opens worked cases you can follow step by step.',
       },
       {
-        key: 'whatsnew.v820.fixes.b2',
+        key: 'whatsnew.v1110.cases.b2',
         default:
-          'DWG drawing previews render again on newer ezdxf builds, version 1.1 and later.',
+          'The full case library is translated into every language.',
       },
     ],
   },
@@ -341,7 +329,7 @@ export function WhatsNewCard({ forceShow = false, versionOverride }: WhatsNewCar
     navigate('/about#changelog');
   }, [navigate, handleDismiss]);
 
-  const sections = useMemo(() => SECTIONS_V820, []);
+  const sections = useMemo(() => SECTIONS_V1110, []);
 
   if (mode === null) return null;
 

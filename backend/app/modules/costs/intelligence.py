@@ -1,9 +1,11 @@
+# DDC-CWICR-OE: DataDrivenConstruction · OpenConstructionERP
+# Copyright (c) 2026 Artem Boiko / DataDrivenConstruction
 """Cost Intelligence service (v3.12.0 - Stream B).
 
 Implements three small, independent services that share the same module:
 
 * ``RegionalIndexService`` - region × category factor lookup; backs the
-  RSMeans-style "what would this rate cost in city X?" workflow.
+  regional "what would this rate cost in city X?" workflow.
 * ``CostCertaintyService`` - frequency + recency analysis on the per-item
   usage ledger; emits the green / yellow / red badge thresholds.
 * ``CostUsageRecorder`` - append-only writer for the usage ledger,

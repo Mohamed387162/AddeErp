@@ -1,3 +1,5 @@
+# DDC-CWICR-OE: DataDrivenConstruction · OpenConstructionERP
+# Copyright (c) 2026 Artem Boiko / DataDrivenConstruction
 """Notification templates - English fallback strings for every notification.
 
 Notifications are stored with i18n keys (``title_key`` + ``body_key``) so
@@ -129,6 +131,11 @@ _TEMPLATES: dict[str, str] = {
     "notifications.approval.escalated.body": "Step {step_ordinal} on this {target_kind} escalated to you (level {level}).",
     "notifications.approval.reassigned.title": "Approval reassigned to you",
     "notifications.approval.reassigned.body": "Step {step_ordinal} on this {target_kind} is now yours to decide.",
+    # ── Portal (client & partner portal) ─────────────────────────────
+    "notifications.portal.user_invited.title": "Portal user invited",
+    "notifications.portal.user_invited.body": "{portal_user_email} invited as {portal_role}.",
+    "notifications.portal.message_received.title": "New portal message",
+    "notifications.portal.message_received.body": "{buyer_name} sent a message.",
 }
 
 

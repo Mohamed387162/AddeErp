@@ -1,3 +1,5 @@
+// DDC-CWICR-OE: DataDrivenConstruction · OpenConstructionERP
+// Copyright (c) 2026 Artem Boiko / DataDrivenConstruction
 // Tests for <RomReconciliationPanel>.
 //
 // Covers the read-side reconciliation of the project's conceptual baseline
@@ -36,7 +38,18 @@ vi.mock('@/shared/hooks/useActiveProjectId', () => ({ useActiveProjectId: () => 
 
 const apiMocks = vi.hoisted(() => ({ reconciliationMock: vi.fn() }));
 vi.mock('./api', () => ({
-  romEstimateApi: { reconciliation: apiMocks.reconciliationMock },
+  romEstimateApi: {
+    reconciliation: apiMocks.reconciliationMock,
+    // The panel only calls reconciliation; the rest of the module surface is
+    // stubbed so importing it (which also loads the page) never touches a
+    // missing function.
+    reference: vi.fn(),
+    generate: vi.fn(),
+    create: vi.fn(),
+    list: vi.fn(),
+    delete: vi.fn(),
+    createBoq: vi.fn(),
+  },
 }));
 
 import { RomReconciliationPanel } from './RomEstimatePage';

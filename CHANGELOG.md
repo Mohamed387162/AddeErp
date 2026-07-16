@@ -7,6 +7,142 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [11.10.0] - 2026-07-16
+
+Onboarding no longer makes a new user wait. Importing a regional cost base or installing a sample project can take a while on a small server, and the first-run wizard used to sit and wait for it. Now it hands that work to the server, moves you straight on to the next step, and shows a live progress bar while the base and the samples load in the background. If a base is slow or unavailable the wizard carries on regardless, so nothing blocks the start.
+
+The team-size step now shows what each size actually gets. Alongside a plain size hint, from just you up to fifty plus people, picking or hovering a size previews the modules it switches on and the ones it grows into at the next size up, with the always-on essentials called out. It stays a single step, so it is clear at a glance what a small firm starts with and what is there to grow into later.
+
+Model Review became a place to run a coordination review, not just a list of issues next to a model. Zoom to issue flies the 3D view back to where an issue was raised and highlights the elements it concerns, from either the list or the issue detail. Coordination mode walks the open issues one at a time for a review meeting, flying to each, changing status and dropping notes as you go, paged with the arrow keys. A review dashboard sums the backlog up by status, priority, assignee, overdue and ageing, and the issue list prints to a clean report for a meeting hand-out.
+
+The Windows installer now speaks the platform's languages, so the setup screens follow the language the rest of the app is in instead of always defaulting to English.
+
+## [11.9.0] - 2026-07-16
+
+The files area grew into a proper document workspace. A right-click menu now opens rename, download, move, status and delete right where you are working, search looks inside document contents and not just file names, and long folders load a page at a time instead of all at once. You can drag files straight in from your desktop to upload them, move between files with the keyboard, and set the review status on a whole selection at once.
+
+The How it works guide now points at the real thing. Instead of describing a feature in a side panel, each step lights up the actual button or area it is talking about across the modules, and the takeoff measure-tools step lands on its own toolbar group so there is no guessing which control it means.
+
+Takeoff measurements no longer live on their own. A measurement can now be linked to an issue or RFI, and once it is linked it shows the other places it is referenced, so a quantity on a drawing and the question raised about it stay connected as you move between the takeoff, the issue log and the rest of the project.
+
+Setup now asks how big your company is. The first-run wizard offers a simple choice between a single user, a small team, a mid-sized company and a large organization, and tailors what it sets up to match, so a solo estimator and a seventy-person contractor each start from something that fits.
+
+The worked-case library is fuller and reads better. The step flow on a case is connected end to end, each case opens with an at-a-glance panel that sums up the situation before you dive in, and twelve new cases are included, from a three-way match before paying a supplier to witnessing MEP commissioning. The flow arrows on the reactive facilities-management case are redrawn so they line up cleanly instead of clashing. Around the app, the sidebar card about the uberization article now links straight to it, the Takeoff menu keeps quantities in its natural last place, and the ecosystem list on the About page reads as two tidy columns.
+
+## [11.8.0] - 2026-07-16
+
+PDF takeoff gets a round of viewer fixes that make measuring on a busy drawing far less fiddly. The small readout card that follows the cursor no longer freezes on top of a point while you drag it, so you can see what you are reshaping. A measurement's value now sits just off its line instead of on top of it, so a wide line no longer hides its own number. While you drag the points of a wide line, or move it, the full width band follows the cursor rather than a single hairline, so you see the real footprint as you work. Pressing a tool shortcut in the middle of dragging a point no longer leaks that drag into a brand new measurement.
+
+The canvas overlays stay put. The group legend, the tool hints and the on-screen readout used to scroll away with the drawing, and they now stay pinned in view while the drawing pans underneath. The group legend can also be dragged out of the way by its header when it covers something you need to see, and it remembers where you put it. Each measurement now has its own show and hide control in the list, so you can hide a single line rather than a whole group, and hiding is a view setting only, so it never changes the quantities in your exports.
+
+Portal notifications now read correctly on Telegram. A client-portal alert such as a new user invite or a new message carried an internal label that only the in-app bell knew how to translate, so the Telegram bridge showed that raw label instead of a readable line. The server now fills in the real text, so every channel reads the same.
+
+## [11.7.1] - 2026-07-14
+
+The Windows desktop app now stops its background service before it installs or uninstalls, so reinstalling no longer fails with a file-in-use error. The backend runs as a separate process that could keep running after the app was closed or uninstalled, and because Windows locks a running program on disk, the next install could not replace it until you ended the process by hand in Task Manager. The installer and the uninstaller now end that process for you first, so a reinstall just works.
+
+The backend service is also renamed from openestimate-server to openconstructionerp-server, so the whole app carries one name. An upgrade from an older version still stops the old process by its former name, so nothing is left running behind. Your data folder and settings are untouched.
+
+## [11.7.0] - 2026-07-14
+
+The national cost bases now open up the same way the global base does. China, Turkey, Brazil, Spain, Italy, Greece and Indonesia each show all of their market and language variants as cards, and picking a market loads the base and reprices it into that market at its own price level and currency. The global CWICR base keeps its thirty market variants, so every base is now browsable market by market from one place, and the browser shows the running total across all nine bases, which now comes to more than 120,000 priced positions.
+
+We finished taking third-party cost-index product names out of the product. The last references were in the German, Chinese and two dozen other translations along with a few marketing pages, and they now read as plain descriptions such as a UK construction cost index. The open standards like NRM, DIN, RICS and GAEB and the CWICR name stay as they are.
+
+The interface translations caught up with the last few releases. Strings added recently for work calendars, bill-of-quantities paste and the model viewer were still showing in English for people using other languages, and they are now translated across all 27 languages. The headline cost figure in the app, the readme and the marketing site now shows the 120,000 plus total across the nine bases, while any text that names the CWICR base on its own keeps its 55,000 figure.
+
+## [11.6.2] - 2026-07-14
+
+Switching the interface language now takes effect at once. The language menu used to load the chosen locale in the background and switch before it was ready, so the interface dropped back to English until you reloaded the page. It now loads the locale first and then switches, and it re-renders the moment a language finishes loading, so the whole interface changes on the spot.
+
+The cost base browser now labels the flagship global base as Russia and gives it the Russian flag, since it is built from the GESN, FER and TER norm structure. The worked-case pages read more cleanly too: the step rail on the left packs tighter, a finished step is marked with a green check so your progress is clear at a glance, and the in, action and out arrows on the right are larger and softer without the heavy circular badge.
+
+Third-party cost-index product names were removed from the application. They appeared only in code comments and a few catalog, benchmark and marketplace labels, and are replaced with plain functional descriptions while the underlying identifiers stay the same, so nothing you have loaded changes.
+
+## [11.6.1] - 2026-07-14
+
+The in-app How it works manual now reads in a sensible order and lets you set your own. The section cards used to fill one column top to bottom and then the next, so they did not read one, two, three down the page. They now lay out row by row in the order a project runs, and each card is numbered so the sequence is clear. A Sort control at the top switches between the project Lifecycle order, which is the default, plain Alphabetical, or a Custom order you arrange yourself with an up and down arrow on each section, and your choice is remembered between visits. Worked cases can also carry a longer description that shows on the case page under the title, and the case cards no longer cut the summary as short.
+
+## [11.6.0] - 2026-07-14
+
+A personal backup now carries all of your own data, not just the core. The previous backup covered a fixed handful of tables, projects, estimates and BOQ, schedules, cost data, documents, tenders and change records, and silently left out everything else you had built: your contacts, daily diaries, takeoff measurements, inspections and safety records, labor rates, custom cost catalogs, saved templates, notifications and the rest. The backup is now derived from the whole data model, so every table that belongs to you is included, and the promise from the last release, that fuller coverage was on the way, is delivered here.
+
+The records come out in dependency order, so a restore always writes a parent before the rows that reference it and clears in the reverse order. That keeps a transfer between machines consistent even across the hundreds of tables now covered. Reference and catalog data shared by everyone, the global cost catalogs, exchange rates and language data, stays out of a personal backup exactly as before, because none of it belongs to a single account.
+
+Everything that made the previous restore safe still holds. Merge is the default and only adds what is missing, replace is refused into an account that already has data, ownership on every restored row is pinned to the account doing the restore rather than trusted from the file, embedded drawings, documents and photos are written back to storage, provider keys never travel in a backup, and a single record that cannot come across is skipped with a note instead of failing the whole restore.
+
+## [11.5.0] - 2026-07-14
+
+Backups now move cleanly between machines. Restoring a backup on a second computer used to fail, because the backup carried the exporter's own account row with its password stripped and an email that was usually already taken on the target install, and re-inserting that row broke a required field and rolled the whole restore back. Restore no longer re-creates accounts. The computer you restore onto already has your account, so the projects, estimates and BOQ, schedules, cost data, documents, tenders and change records in the backup are repointed to the account doing the restore, which is what makes them appear under your login on the new machine. Site records such as daily diaries, takeoff measurements, inspections and safety data are not part of the backup yet, and the backup screen now says so plainly. Fuller coverage is on the way.
+
+Restore now adds to what you already have instead of wiping it. Merge is the default: it brings in the records a backup holds that are not already present and removes nothing, which is the safe way to carry a backup onto another machine or into an account that already has data. Replace, which clears your own data first, is only allowed into an empty account, because clearing a populated one would remove far more than a backup can bring back, so it is refused with a clear message that points you to merge.
+
+Files travel with the data now too. Drawings, documents and photos embedded in a backup are written back to storage on restore, instead of leaving the records that reference them without a file. Backup files no longer carry AI provider keys, so a backup copied between machines never holds a secret in plain text, and a restore never overwrites the account you restore into or its AI settings.
+
+The restore is steadier and safer as well. A single record that cannot come across, for example a cost recipe whose code already exists on the target, is now skipped with a note instead of failing the whole restore, so one odd row no longer sinks the entire transfer. A restore only ever writes into the account doing it and only fills in files that are missing, never overwriting a file already in storage, and an oversized or malformed archive is rejected before it can strain the machine.
+
+## [11.4.0] - 2026-07-13
+
+Scheduling gains work calendars. You can define named work weeks for a project (a standard five-day week, a six-day trade week, or any custom set of working days), each with its own hours per day and its own list of public holidays, and assign one to any activity from the schedule table. Rescheduling then measures each activity's duration on its own calendar, so a six-day trade finishes sooner than a five-day one over the same work, and a crew that keeps its own holidays finishes later, while the dates, float and critical path stay consistent. Activities left on the project default reschedule exactly as before, so existing schedules do not move.
+
+## [11.3.0] - 2026-07-13
+
+This release makes PDF takeoff reliable and hardens the whole platform against out-of-memory crashes. Opening a PDF from Project Files no longer floods the console with 404s, because takeoff opens against a real takeoff document instead of a file id it could not resolve. Uploading a large or drawing-heavy file can no longer take the container down: every document, revision, PDF-split and photo upload now streams to disk under a size cap instead of reading the whole body into memory, and PDF parsing runs in an isolated, memory-capped subprocess with a page cap, so a heavy file degrades gracefully instead of triggering a silent out-of-memory kill. The same care already runs across element matching, reporting, BIM, the point cloud and file search, with a global request-size limit above all of it. The Alembic warning that filled container logs is resolved, it was only the health check resolving the migrations path from the wrong directory and never a sign of a real problem.
+
+The desktop app parses takeoff PDFs again. The packaged build runs as a single frozen binary that could not launch the isolated parser, so uploads there had started coming back with no pages; it now parses in-process with the same safeguards. The published container is secure by default: it runs a production posture out of the box, so the interactive API docs are hidden and a wildcard CORS origin is stripped, and it still starts with zero configuration by generating a strong signing secret on first boot and keeping it on the data volume so sessions survive a restart. A plain pip install now ships every interface language, where before a clean install quietly dropped six of them.
+
+Scheduling is more capable and more correct. The module gains a dependency editor and an editable activity grid, and rescheduling now anchors each chain at its own start date, so a project with several independent chains no longer places later work before the task it depends on. The 3D model viewer loads noticeably faster, serving compressed geometry tiles and moving the parse off the main thread while keeping every element and its properties intact. Bill of Quantities paste tells you which rows it skipped instead of dropping them silently, quick takeoff links exactly the elements you isolated, and a quantity can be driven by a per-element formula.
+
+## [11.2.0] - 2026-07-12
+
+The point cloud viewer turns into a proper measurement workspace for a reality-capture scan. On top of the slice, distance and box tools it already had, you can trace a polyline to read a running length and perimeter, draw a polygon to read plan area, estimate a volume against a reference plane, jump to preset top, front and side views, thin a very dense cloud so it stays responsive, and export every measurement to CSV. Once a scan is loaded the viewer takes the top of the page as the primary element, the way the BIM hub works, and the uploader steps back to a collapsed panel below.
+
+The architecture map now shows what connects to what. Click or hover a module and the modules it links to light up while the rest fade back, so a large map reads as one relationship at a time. On each module in your project journey the case count is now a link that opens the list of cases attached to that module, the cost base import screen uses one consistent country picker with the local China base first and the global CWICR set next, and the guided case pages are reworked to read more clearly.
+
+This release also fixes a placed drawing that anchored at the wrong spot instead of the project location, and a takeoff viewer that did not fill the available height.
+
+## [11.1.0] - 2026-07-12
+
+This release makes the cost bases the centre of the workspace. Every price base you can load now shows in one place with its own count of rates, so you can see all of them at a glance, the global set and each national base, and know how much sits in each one before you choose. The same picker appears in import, in the data setup step and in onboarding, and from it you can search across bases, load a base, set the one you want active, or simply pick a base to work with, without leaving the screen.
+
+The point cloud viewer gains a fuller set of professional tools for working a reality-capture scan, and the dashboard lets you set the width of each widget so the home screen lays out the way you read it. This release also fixes a drawing that could not be placed on the map, by serving document downloads on the right paths and filling in demo stubs, and it completes the line-art illustrations across the Cases hub. In PDF takeoff, switching to another tool in the middle of a two-click scale calibration now cancels the calibration instead of quietly consuming your next click.
+
+The interface is more complete in every language. Thousands more strings are translated in each of the twenty seven supported languages, so the newer screens read in your language instead of falling back to English.
+
+## [11.0.0] - 2026-07-11
+
+The point cloud viewer becomes a real review tool for reality-capture data on site. You can slice the cloud to a height band and read it as a top-down plan, measure point to point with the distance and its horizontal and vertical parts in millimetres, box off a region to isolate part of a scan, colour points by elevation with a legend and a pinnable height band, and save the current view as a PNG image. The geometry and formatting behind these tools are covered by unit tests.
+
+Onboarding now leads with the cost base. You choose the national price base first and the left menu is rebuilt to the company profile you pick, so the app opens already shaped to how you work. The Cases hub gains a start-here row of case tiles with a show-more card, clearer step visuals, a wider in and out flow on each step, and the full case library translated into every language. The dashboard packs more case tiles per row with the inbox below the map, and module pages share one full-width layout so every screen lines up.
+
+The founder note reads more plainly across the app and the marketing site, a guided case step splits its explanation and its data view into a 40/60 layout, and the README carries the platform message with tidied badge rows and a refreshed module catalogue and docs tree.
+
+## [10.10.0] - 2026-07-10
+
+This release opens the platform up to the wider world of cost data and adds a way to compare whole design options by what they cost.
+
+The cost side now works with many national price bases at once. Eight world cost bases are wired in for loading, and you can scope a search or a comparison across several of them together. A rate code can be compared across regional bases side by side, and search is more forgiving: a descriptive phrase returns the closest partial matches and a typo still finds the right work through fuzzy ranking, with semantic indexing behind it. Several bases ship as browsable resource catalogs, and a resource price sheet turns a coefficient base, one that carries labour, material and plant quantities but no money, into something you can price. Because bases can be priced in different currencies, a view in one currency toggle converts them for reading using live European Central Bank reference rates with a purchasing-power fallback, shown as a rough guide and never written into a bill.
+
+A new Design Options workspace compares competing designs for the same project. You attach a model to each option, generate its bill, and read the options side by side on total cost, the delta by trade and cost per square metre, with a transparent recommendation and a fairness banner that flags when two options are not being compared on equal terms. Every option is converted to one project base currency before it is summed, so a mixed-currency comparison stays honest.
+
+This release also gives builders the platform itself. A Module SDK package and a set of builder guides explain the module system, manifests, events, hooks and permissions, and walk through shipping your own module without editing the core. A full user documentation set covers the main workflows end to end, from takeoff and estimating through validation, tendering and the field.
+
+Three community-reported issues are fixed. Chat-connector notifications, for the supported messaging channels, now forward once connected, where before only the test button worked. The client portal shared model viewer no longer bounces a portal guest to the login screen. The property developer sales-target form lays out correctly. Alongside these, an administrator can now turn the public demo account login on or off from settings, which also closes a path that let the demo account in when it should have been disabled. You can hide whole sections of the left menu, not just single modules, and the project journey shows how many worked cases touch each module with a link into them.
+
+## [10.9.0] - 2026-07-10
+
+This release turns site issue management into one connected workflow, from a defect spotted on a drawing or in the 3D model through to its documented closure, and it deepens another wave of delivery modules.
+
+A punch list item now carries site photos, taken straight from a phone camera or uploaded, shown as a thumbnail gallery you can add to and prune. Instead of typing pin coordinates you place the pin visually on the drawing sheet, and every open item shows as a numbered pin over the page. The full status path, from open through assigned, in progress, resolved and verified to closed, is a closure stepper on the item so nothing is marked done without the trail behind it.
+
+Issues can now be raised on the 3D model. You open the model-issues register, file a coordination topic with a priority, an assignee and a due date, attach a captured viewpoint and snapshot, and discuss it in a comment thread, all held in the open BIM Collaboration Format so a topic and its viewpoint export and import as a standard file for any other tool in the coordination chain. A drawing markup is no longer only an annotation: give it a priority and a due date and convert it into a tracked issue in one click, so a cloud drawn on a plan becomes a photographed, assignable, closable item.
+
+Checklists join up with issues. A compact inspection or handover checklist can be filled in against an issue, and a failed check offers to raise the issue for you, so the fault and its evidence stay together. From the field shell a site worker can raise a defect with a photo even with no signal, and it syncs when the connection returns. A new Issues hub gathers every open item across drawings, punch lists, non-conformances, model coordination and clashes into one list, showing who owns each one and what is overdue, with a link back to where it lives.
+
+Alongside the issue work, several delivery modules were deepened. Site logistics gains a gate timeline that lays deliveries out hour by hour per gate and packs overlapping bookings into visible lanes, with per-gate occupancy against capacity and a day schedule you can export or print. Cost value reconciliation, management of change, off-site and prefabrication, systems commissioning and ESG site performance each surface more of their data with clearer views and export. The guided Cases process strip is more compact, with a small picture and a prominent numbered title so it reads as an ordered process.
+
+This release also fixes the PDF takeoff viewer, which now fills the available height through a flexible layout instead of fixed height constants, and adds a way to enter a linear measurement line width in real world units rather than pixels. A Files bug report raised from the in app menu is resolved. The community reporters who filed these are credited on the About page.
+
 ## [10.8.0] - 2026-07-08
 
 This release connects the estimating tools introduced in the last version into one working chain, from a resource-built rate through to a single defensible estimate total.

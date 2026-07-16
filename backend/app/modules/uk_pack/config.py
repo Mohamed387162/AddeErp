@@ -1,3 +1,5 @@
+# DDC-CWICR-OE: DataDrivenConstruction · OpenConstructionERP
+# Copyright (c) 2026 Artem Boiko / DataDrivenConstruction
 """Regional configuration for the United Kingdom."""
 
 from decimal import Decimal
@@ -207,8 +209,8 @@ PACK_CONFIG: dict[str, Any] = {
     # ── Cost database references ─────────────────────────────────────────────
     "cost_database_references": [
         {
-            "code": "BCIS",
-            "name": "BCIS - Building Cost Information Service",
+            "code": "UK_COST_INDEX",
+            "name": "UK construction cost index",
             "description": "RICS cost data with regional tender price indices",
         },
         {

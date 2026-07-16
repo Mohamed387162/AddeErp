@@ -1,3 +1,5 @@
+// DDC-CWICR-OE: DataDrivenConstruction · OpenConstructionERP
+// Copyright (c) 2026 Artem Boiko / DataDrivenConstruction
 /**
  * Route → lucide icon map for the top-bar page-title chip.
  *
@@ -64,6 +66,7 @@ import {
   ShieldCheck,
   ClipboardCheck,
   AlertOctagon,
+  CircleDot,
   ListChecks,
   Shield,
   BadgeCheck,
@@ -82,6 +85,7 @@ import {
   ScrollText,
   Plus,
   PackageCheck,
+  ScanEye,
   type LucideIcon,
 } from 'lucide-react';
 
@@ -118,6 +122,8 @@ const ROUTE_ICON_MAP: Record<string, LucideIcon> = {
   '/geo': Globe,
   // ── 5. Model Coordination ─────────────────────────────────────────
   '/coordination': LayoutDashboard,
+  '/model-review': ScanEye,
+  '/bcf': MessageSquare,
   '/bim/federations': Layers,
   '/clash': Radar,
   '/bim/rules': SlidersHorizontal,
@@ -161,6 +167,7 @@ const ROUTE_ICON_MAP: Record<string, LucideIcon> = {
   '/inspections': ClipboardCheck,
   '/ncr': AlertOctagon,
   '/punchlist': ListChecks,
+  '/issues': CircleDot,
   '/closeout': PackageCheck,
   // ── 13. Safety & ESG ──────────────────────────────────────────────
   '/safety': HardHat,
@@ -211,6 +218,7 @@ const ROUTE_ICON_MAP: Record<string, LucideIcon> = {
   // ── v10.6.0 modules ───────────────────────────────────────────────
   '/prefab': Factory,
   '/cvr': Scale,
+  '/design-options': Scale,
   '/site-logistics': Truck,
   '/commissioning': ClipboardCheck,
   '/esg': Leaf,

@@ -1,3 +1,5 @@
+// DDC-CWICR-OE: DataDrivenConstruction · OpenConstructionERP
+// Copyright (c) 2026 Artem Boiko / DataDrivenConstruction
 export { Button } from './Button';
 export type { ButtonProps } from './Button';
 
@@ -131,7 +133,7 @@ export { ErrorBoundary } from './ErrorBoundary';
 
 export { NotFoundPage } from './NotFoundPage';
 
-export { CountryFlag } from './CountryFlag';
+export { CountryFlag, originFlagCode, CIS_ISO } from './CountryFlag';
 export { CountryFlagBackdrop } from './CountryFlagBackdrop';
 
 export { CountryCombobox, CUSTOM_SENTINEL } from './CountryCombobox';
@@ -163,6 +165,28 @@ export type {
 
 export { ModuleGuideButton } from './ModuleGuideButton';
 export type { ModuleGuideButtonProps } from './ModuleGuideButton';
+
+// Shared spotlight primitives behind the anchored coach-marks.
+export {
+  useSpotlightTarget,
+  SpotlightScrim,
+  placeTooltip,
+  centerOfViewport,
+  measureSpotlight,
+  SPOTLIGHT_REVEAL_EVENT,
+  TOOLTIP_W,
+  TOOLTIP_H,
+} from './spotlight';
+export type {
+  SpotlightRect,
+  TooltipCoords,
+  TooltipPosition,
+  SpotlightStatus,
+  SpotlightTarget,
+  SpotlightAccent,
+  SpotlightScrimProps,
+  UseSpotlightTargetOptions,
+} from './spotlight';
 
 export { GlobalProgress, useProgressStore } from './GlobalProgress';
 

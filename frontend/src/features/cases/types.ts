@@ -15,6 +15,22 @@
 // in the data files - they are NEVER added to en.ts. Only the framework chrome
 // (page title, runner buttons, labels) is seeded into en.ts. Translators pick
 // the inline-default content keys up later.
+//
+// Internal ref: ddc-lineage:a17f93c4-cases-01
+
+/**
+ * One item on the in -> out flow of a step: a short label for a piece of data or
+ * an artifact the step consumes (input) or produces (output). Rendered in the
+ * stage as chips on either side of the action so the user sees, at a glance,
+ * what goes IN to the step and what comes OUT. `label` is the English fallback;
+ * pass `labelKey` to localize it (same key + fallback pattern as `moduleLabel`).
+ */
+export interface StepFlowItem {
+  /** Short English label (the fallback). */
+  label: string;
+  /** Optional i18n key to localize the label. */
+  labelKey?: string;
+}
 
 /**
  * One step of a playbook: a single thing the user does, in one module.
@@ -63,6 +79,13 @@ export interface PlaybookStep {
    *  of the generic icon scene, and the case shows its step flow beside the
    *  title. A case opts in step by step; steps without it keep the icon scene. */
   scene?: string;
+  /** What this step starts from: the data / artifacts it consumes. Shown as the
+   *  "In" side of the in -> out flow on the stage, so the user sees what goes in.
+   *  Optional; when omitted the stage shows the action scene without the flow. */
+  inputs?: StepFlowItem[];
+  /** What this step produces: the data / artifacts it leaves behind. Shown as the
+   *  "Out" side of the flow, so the user sees what comes out of the step. */
+  outputs?: StepFlowItem[];
   /** Optional CSS selector for a future in-module spotlight highlight. */
   spotlightSelector?: string;
 }
@@ -173,6 +196,15 @@ export interface Playbook {
    *  only when the case happens at a different point than its discipline
    *  implies. */
   stage?: LifecycleStage;
+  /** Optional explicit ids of the case(s) to run NEXT after this one - its
+   *  outputs feed their first step. When omitted the successor is derived from
+   *  the in -> out chaining between cases (see `nextCasesFor` in
+   *  `relatedness.ts`), so a case is never a dead end. */
+  next?: string[];
+  /** Optional explicit ids of RELATED cases: siblings that touch the same work
+   *  but are not the linear next step. When omitted they are derived from shared
+   *  discipline, stage, modules and company types (see `relatedCasesFor`). */
+  related?: string[];
   /** i18n key for the case title. */
   titleKey: string;
   /** Inline English default for the case title. */
@@ -181,6 +213,13 @@ export interface Playbook {
   descKey: string;
   /** Inline English default for the case description. */
   descDefault: string;
+  /** Optional i18n key for a richer, multi-sentence description shown in the
+   *  stepper hero under the one-line `desc`. */
+  longDescKey?: string;
+  /** Inline English default for the richer description. When omitted (with
+   *  `longDescKey`) the hero shows only the one-line `desc`. Same key + inline
+   *  default pattern as `descKey`/`descDefault`; keep it ASCII-clean. */
+  longDescDefault?: string;
   /** Rough time-to-complete in minutes, shown on the card. */
   estMinutes: number;
   /** Optional lucide-react icon name for the case card (resolved by the page). */

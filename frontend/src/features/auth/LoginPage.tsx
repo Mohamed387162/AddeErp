@@ -1,3 +1,5 @@
+// DDC-CWICR-OE: DataDrivenConstruction · OpenConstructionERP
+// Copyright (c) 2026 Artem Boiko / DataDrivenConstruction
 import { useState, useRef, useEffect, type FormEvent } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useNavigate, Link, useLocation } from 'react-router-dom';
@@ -306,7 +308,7 @@ export function LoginPage() {
   const benefits = [
     { icon: HardDrive, color: 'text-emerald-500 bg-emerald-500/10', title: t('login.benefit.local', 'Your data stays on your computer'), desc: t('login.benefit.local_desc', 'No cloud. No third-party servers. Full control.') },
     { icon: ShieldCheck, color: 'text-blue-500 bg-blue-500/10', title: t('login.benefit.open_source', '100% open source'), desc: t('login.benefit.open_source_desc', 'Transparent code. No vendor lock-in.') },
-    { icon: Globe2, color: 'text-violet-500 bg-violet-500/10', title: t('login.benefit.standards', 'International standards'), desc: t('login.benefit.standards_desc', '55,000+ cost items across 48 regional databases worldwide.') },
+    { icon: Globe2, color: 'text-violet-500 bg-violet-500/10', title: t('login.benefit.standards', 'International standards'), desc: t('login.benefit.standards_desc', '120,000+ cost items across 9 cost bases worldwide.') },
     { icon: Brain, color: 'text-amber-500 bg-amber-500/10', title: t('login.benefit.ai', 'AI-assisted estimation'), desc: t('login.benefit.ai_desc', 'Smart suggestions. You decide, AI assists.') },
     { icon: Zap, color: 'text-rose-500 bg-rose-500/10', title: t('login.benefit.allinone', 'BOQ + 4D + 5D + Tendering'), desc: t('login.benefit.allinone_desc', 'Full workflow in one tool.') },
     { icon: Users, color: 'text-cyan-500 bg-cyan-500/10', title: t('login.benefit.free', 'Free for everyone'), desc: t('login.benefit.free_desc', 'No fees. No limits. By estimators.') },
@@ -535,11 +537,11 @@ export function LoginPage() {
         {/* Stats row */}
         <div className="mt-5 flex items-center gap-5 animate-stagger-in" style={{ animationDelay: '180ms' }}>
           {[
-            { value: '55K+', label: t('login.stat_costs', { defaultValue: 'cost items' }) },
-            { value: '24', label: t('login.stat_langs', { defaultValue: 'languages' }) },
+            { value: '120K+', label: t('login.stat_costs', { defaultValue: 'cost items' }) },
+            { value: '27', label: t('login.stat_langs', { defaultValue: 'languages' }) },
             { value: '48', label: t('login.stat_regions', { defaultValue: 'regions' }) },
             { value: '6', label: t('login.stat_cad', { defaultValue: 'CAD formats' }) },
-            { value: '100+', label: t('login.stat_modules', { defaultValue: 'modules' }) },
+            { value: '161', label: t('login.stat_modules', { defaultValue: 'modules' }) },
             { value: '12', label: t('login.stat_sections', { defaultValue: 'sections' }) },
           ].map((s) => (
             <div key={s.label} className="text-center">
@@ -858,7 +860,7 @@ export function LoginPage() {
           {/* Demo Access - shown only when the server confirms demo accounts
               exist (SEED_DEMO on). Production installs hide it entirely. */}
           {demoEnabled === true && (
-          <div className="mt-3 animate-stagger-in" style={{ animationDelay: '500ms' }}>
+          <div className="relative mt-3 animate-stagger-in" style={{ animationDelay: '500ms' }}>
             <div className="login-glass-pro relative rounded-2xl overflow-hidden">
               <div
                 aria-hidden
@@ -879,30 +881,6 @@ export function LoginPage() {
                   <span>{t('auth.try_demo', { defaultValue: 'Try demo (no signup)' })}</span>
                   <ChevronDown size={14} className={`text-oe-blue/70 transition-transform duration-200 ${demoOpen ? 'rotate-180' : ''}`} />
                 </button>
-                {/* Info affordance: the demo sign-in is optional and can be shown
-                    or hidden from Settings. Hover reveals the hint; click pins it
-                    (touch / keyboard). Kept OUTSIDE the toggle button so it is not
-                    a nested interactive control, and absolutely placed to the
-                    right so the "Try demo" label stays centred. */}
-                <div className="group absolute right-2 top-1/2 -translate-y-1/2">
-                  <button
-                    type="button"
-                    aria-label={t('auth.demo_hint_aria', { defaultValue: 'About the demo sign-in block' })}
-                    onClick={() => setDemoHint((v) => !v)}
-                    className="flex h-6 w-6 items-center justify-center rounded-full text-oe-blue/50 hover:text-oe-blue hover:bg-oe-blue/[0.08] transition-colors"
-                  >
-                    <Info size={14} />
-                  </button>
-                  <div
-                    role="tooltip"
-                    className={`pointer-events-none absolute right-0 top-full z-20 mt-1.5 w-60 rounded-lg border border-border-light bg-surface-elevated px-3 py-2 text-left text-xs leading-relaxed text-content-secondary shadow-lg transition-opacity duration-150 ${demoHint ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'}`}
-                  >
-                    {t('auth.demo_hint', {
-                      defaultValue:
-                        'Optional demo sign-in. It only appears while demo accounts are enabled, so an administrator can turn it off.',
-                    })}
-                  </div>
-                </div>
               </div>
 
               {demoOpen && (
@@ -931,6 +909,31 @@ export function LoginPage() {
                   ))}
                 </div>
               )}
+            </div>
+            {/* Info affordance - kept OUTSIDE the overflow-hidden card above so
+                the hint popover is never clipped and always paints on top of the
+                demo accounts and the links below. Hover reveals it; click pins it
+                (touch / keyboard). Anchored to this relative wrapper at a fixed
+                top offset so it stays on the header row whether the demo list is
+                open or closed. */}
+            <div className="group absolute right-2 top-2 z-40">
+              <button
+                type="button"
+                aria-label={t('auth.demo_hint_aria', { defaultValue: 'About the demo sign-in block' })}
+                onClick={() => setDemoHint((v) => !v)}
+                className="flex h-6 w-6 items-center justify-center rounded-full text-oe-blue/50 hover:text-oe-blue hover:bg-oe-blue/[0.08] transition-colors"
+              >
+                <Info size={14} />
+              </button>
+              <div
+                role="tooltip"
+                className={`pointer-events-none absolute right-0 top-full mt-2 w-64 rounded-xl border border-border bg-surface-elevated backdrop-blur-md px-3.5 py-2.5 text-left text-xs leading-relaxed text-content-primary shadow-2xl transition-opacity duration-150 ${demoHint ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'}`}
+              >
+                {t('auth.demo_hint', {
+                  defaultValue:
+                    'Optional demo sign-in. It only appears while demo accounts are enabled, so an administrator can turn it off.',
+                })}
+              </div>
             </div>
           </div>
           )}
@@ -1107,9 +1110,9 @@ export function LoginPage() {
               </h3>
               <div className="grid grid-cols-4 gap-3 text-center">
                 {[
-                  { value: '55,719', label: t('about.stat.costs', 'Cost items') },
+                  { value: '120,441', label: t('about.stat.costs', 'Cost items') },
                   { value: '48', label: t('about.stat.regions', 'Regional databases') },
-                  { value: '24', label: t('about.stat.languages', 'Languages') },
+                  { value: '27', label: t('about.stat.languages', 'Languages') },
                   { value: '100%', label: t('about.stat.free', 'Free & open source') },
                 ].map((stat) => (
                   <div key={stat.label} className="rounded-lg bg-surface-secondary/50 py-2.5">

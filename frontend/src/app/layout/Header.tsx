@@ -1,10 +1,12 @@
+// DDC-CWICR-OE: DataDrivenConstruction · OpenConstructionERP
+// Copyright (c) 2026 Artem Boiko / DataDrivenConstruction
 import { useState, useRef, useEffect, useCallback } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useNavigate, useLocation } from 'react-router-dom';
 import { useQuery } from '@tanstack/react-query';
 import { Search, ChevronDown, ChevronRight, LogOut, User, Settings, Menu, MessageSquarePlus, FolderOpen, CheckCircle2, XCircle, Bug, BookOpen, Loader2, Upload, HelpCircle, GraduationCap, Mail, ExternalLink, Github, Sun, Moon, Monitor, Info, Globe } from 'lucide-react';
 import clsx from 'clsx';
-import { SUPPORTED_LANGUAGES, getLanguageByCode } from '../i18n';
+import { SUPPORTED_LANGUAGES, getLanguageByCode, changeLanguage } from '../i18n';
 import { useAuthStore } from '@/stores/useAuthStore';
 import { useUploadQueueStore } from '@/stores/useUploadQueueStore';
 import { useProjectContextStore } from '@/stores/useProjectContextStore';
@@ -373,7 +375,10 @@ export function Header({ title, onMenuClick }: HeaderProps) {
         <UploadQueueIndicator />
         <LanguageSwitcher
           currentLang={currentLang}
-          onSelect={(code) => i18n.changeLanguage(code)}
+          // Load the target locale's lazy chunk BEFORE switching so every
+          // string flips to the new language immediately, with no English
+          // flash and no reload. See ``changeLanguage`` in app/i18n.
+          onSelect={(code) => void changeLanguage(code)}
         />
         <ThemeToggle />
         <UserMenu />

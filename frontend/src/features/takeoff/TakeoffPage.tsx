@@ -1,3 +1,5 @@
+// DDC-CWICR-OE: DataDrivenConstruction · OpenConstructionERP
+// Copyright (c) 2026 Artem Boiko / DataDrivenConstruction
 import { useState, useCallback, useRef, useMemo, useEffect, useId, lazy, Suspense } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useSearchParams, useNavigate, Link } from 'react-router-dom';
@@ -34,6 +36,7 @@ import { PdfCompareDrawer } from './PdfCompareDrawer';
 import { takeoffGuide } from './takeoffGuide';
 import { apiGet, apiPost } from '@/shared/lib/api';
 import { formatFileSize } from '@/shared/lib/formatters';
+import { isTauri } from '@/shared/lib/desktop';
 import { useAuthStore } from '@/stores/useAuthStore';
 import { useToastStore } from '@/stores/useToastStore';
 import { useProjectContextStore } from '@/stores/useProjectContextStore';
@@ -1348,11 +1351,14 @@ export function TakeoffPage() {
 
   /* ── Cross-module open: ?doc=X&source=document ─────────────────────────
    * The unified /files page links a documents-module PDF here so the user
-   * can start measuring without re-uploading. The id namespace is the
-   * documents table, not takeoff_documents — so we fetch metadata from
-   * /v1/documents/{id} and point the viewer at that download URL. The
-   * fallback display name is read from the optional `?name=` param so
-   * the viewer header isn't empty during the metadata fetch.            */
+   * can start measuring without re-uploading. The `doc` id is the documents
+   * table PK, NOT a takeoff_document id - so the viewer's own calls
+   * (detect-scale, page-scales, measurements) used to 404 against it and
+   * measurements got filed under the wrong id. We now ask the backend to
+   * find-or-create a REAL takeoff_document for this source (idempotent, so a
+   * second open reuses the same row) and drive the viewer entirely off THAT
+   * takeoff id. The fallback display name is read from the optional `?name=`
+   * param so the header isn't empty during the fetch.                    */
   useEffect(() => {
     const docId = searchParams.get('doc');
     const source = searchParams.get('source');
@@ -1361,29 +1367,28 @@ export function TakeoffPage() {
     let cancelled = false;
     (async () => {
       try {
-        const meta = await apiGet<{ id: string; name: string; filename?: string }>(
-          `/v1/documents/${encodeURIComponent(docId)}`,
+        const takeoff = await apiPost<{ id: string; filename?: string; status?: string }>(
+          `/v1/takeoff/documents/from-source/${encodeURIComponent(docId)}`,
         );
         if (cancelled) return;
         const displayName =
-          meta.filename ||
-          meta.name ||
+          takeoff.filename ||
           searchParams.get('name') ||
           t('takeoff.document_placeholder', { defaultValue: 'Document' });
-        setActiveDocId(docId);
+        // Use the takeoff_document id everywhere from here on so scale-detect,
+        // page-scales and measurements all resolve against takeoff_documents.
+        setActiveDocId(takeoff.id);
         setViewerDoc({
-          url: `/api/v1/documents/${encodeURIComponent(docId)}/download/`,
+          url: `/api/v1/takeoff/documents/${encodeURIComponent(takeoff.id)}/download/`,
           name: displayName,
-          // Project Files document PK (oe_documents_document). The backend
-          // accepts a document_id from either table in the same project.
-          id: docId,
+          id: takeoff.id,
         });
         setActiveTab('measurements');
       } catch {
         if (cancelled) return;
-        // The documents-module metadata fetch failed (e.g. the id belongs to
-        // another table, or access was denied). Surface it instead of leaving
-        // a silently empty page.
+        // The find-or-create failed (e.g. access denied, the source blob is
+        // missing, or the file is not a PDF). Surface it instead of leaving a
+        // silently empty page.
         useToastStore.getState().addToast({
           type: 'error',
           title: t('takeoff.open_failed_title', { defaultValue: 'Could not open file' }),
@@ -1926,7 +1931,19 @@ export function TakeoffPage() {
   /* ── Render ─────────────────────────────────────────────────────────── */
 
   return (
-    <div className="relative w-full overflow-x-hidden animate-fade-in">
+    <div
+      className={clsx(
+        'relative flex min-h-0 w-full flex-col overflow-x-hidden animate-fade-in',
+        // Definite-height column so each tab panel fills the space with flex
+        // instead of a hardcoded height (#341). Budget = viewport minus the
+        // sticky app header (--oe-header-height) and the <main> vertical
+        // padding (pt-6 + pb-4 = 2.5rem). In the desktop (Tauri) shell a 36px
+        // DesktopToolbar (h-9) sits above the header, so subtract it there too.
+        isTauri
+          ? 'h-[calc(100vh-2.25rem-var(--oe-header-height,52px)-2.5rem)]'
+          : 'h-[calc(100vh-var(--oe-header-height,52px)-2.5rem)]',
+      )}
+    >
       {/* Barely-visible field-surveyor geometry — rectangles, irregular
           polygons, distance dimension lines, vertex pins — the kind of
           marks an estimator drags across a drawing to measure area or
@@ -1998,7 +2015,7 @@ export function TakeoffPage() {
       {/* Header zone — full-bleed viewer keeps its own SVG chrome on the root,
           so the canonical breadcrumb > header > info > tabs block carries its
           own space-y-5 rhythm here (style guide §1 viewer exception). */}
-      <div className="space-y-5">
+      <div className="shrink-0 space-y-5">
       {/* Breadcrumb and the "How it works" guide button share one row so the
           guide action sits level with the project / page trail and the blocks
           below move up (founder layout request). The module name + icon still
@@ -2136,7 +2153,7 @@ export function TakeoffPage() {
           role="tabpanel"
           id="takeoff-tabpanel-documents"
           aria-labelledby="takeoff-tab-documents"
-          className="mt-5"
+          className="mt-5 flex-1 min-h-0 overflow-y-auto overflow-x-hidden"
         >
           {/* AI provider setup notice — explains that AI takeoff needs a
               provider connected and links to AI settings. Hidden while the
@@ -2309,26 +2326,18 @@ export function TakeoffPage() {
 
         </div>
       ) : (
-        // Viewport-bounded column so the bottom file panel is always
-        // visible without scrolling the page: the viewer takes the
-        // remaining height and scrolls internally; the filmstrip is a
-        // shrink-0 footer pinned in view.
-        //
-        // Height budget: the column already sits below the sticky header
-        // (--oe-header-height, 52px), the <main> pt-6 (1.5rem) and the
-        // takeoff tabs bar (~3.25rem incl. its mb-3) — all of which the
-        // 100vh calc must NOT count again. Empirically, 7rem total is the
-        // smallest reservation that keeps the column fully inside the
-        // viewport (no page-level scrollbar) while giving the viewer the
-        // most internal height — 8rem wasted ~1rem that was shrinking the
-        // viewer enough to force an internal scrollbar on laptop screens.
+        // Measurements tab panel. The page root is already a definite-height
+        // flex column, so this panel just claims the leftover height with
+        // `flex-1 min-h-0` and lays its own children out as a flex column: the
+        // viewer fills and scrolls internally, and the Documents filmstrip is a
+        // shrink-0 footer pinned in view, no hardcoded viewport math (#341).
         <div
-          className="mt-5 flex flex-col h-[calc(100vh-var(--oe-header-height,52px)-7rem)] min-h-0 overflow-x-hidden"
+          className="mt-5 flex flex-1 min-h-0 flex-col overflow-x-hidden"
           role="tabpanel"
           id="takeoff-tabpanel-measurements"
           aria-labelledby="takeoff-tab-measurements"
         >
-          <div className="flex-1 min-h-0 overflow-y-auto overflow-x-hidden">
+          <div className="flex flex-1 min-h-0 flex-col overflow-y-auto overflow-x-hidden">
             {deepLinkNotFound && !viewerDoc ? (
               <div
                 className="mx-auto my-8 max-w-md rounded-xl border border-amber-200 dark:border-amber-800/40 bg-amber-50 dark:bg-amber-900/20 px-6 py-8 text-center"

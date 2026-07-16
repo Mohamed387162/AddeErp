@@ -1,3 +1,5 @@
+// DDC-CWICR-OE: DataDrivenConstruction · OpenConstructionERP
+// Copyright (c) 2026 Artem Boiko / DataDrivenConstruction
 /**
  * AboutPage — Application info, author, license, consulting services.
  */
@@ -291,11 +293,11 @@ export function AboutPage() {
               shorter tile readable at narrower widths. */}
           <div className="grid grid-cols-3 sm:grid-cols-6 gap-2.5">
             {[
-              { value: '55K+', label: t('about.stat_costs', { defaultValue: 'Cost Items (CWICR)' }) },
-              { value: '24', label: t('about.stat_langs', { defaultValue: 'Languages' }) },
+              { value: '120K+', label: t('about.stat_costs', { defaultValue: 'Cost Items' }) },
+              { value: '27', label: t('about.stat_langs', { defaultValue: 'Languages' }) },
               { value: '48', label: t('about.stat_regions', { defaultValue: 'Regional Databases' }) },
               { value: '6', label: t('about.stat_cad_formats', { defaultValue: 'CAD/BIM formats supported' }) },
-              { value: '100+', label: t('about.stat_modules', { defaultValue: 'Backend modules' }) },
+              { value: '161', label: t('about.stat_modules', { defaultValue: 'Backend modules' }) },
               { value: '12', label: t('about.stat_sections', { defaultValue: 'Menu sections' }) },
             ].map((s, i) => (
               <div key={i} className="text-center rounded-xl bg-surface-secondary/50 px-2 py-3">
@@ -443,7 +445,7 @@ export function AboutPage() {
             </h2>
           </div>
           <p className="mb-5 text-sm text-content-secondary">
-            {t('about.story_subtitle', { defaultValue: 'Why OpenConstructionERP exists and where it is heading.' })}
+            {t('about.story_subtitle', { defaultValue: 'Why OpenConstructionERP exists, and where it\'s going.' })}
           </p>
           {/* Bio — line length now governed by the col width itself. */}
           <div>
@@ -452,13 +454,13 @@ export function AboutPage() {
                 <p>
                   {t('about.founder_bio_p1', {
                     defaultValue:
-                      'Over the past ten years, I have been deeply involved in resource management for construction projects. This journey inevitably led me to study the history of the technologies that have shaped the industry - from the earliest attempts at design automation to modern ERP platforms (the series of articles "The Lobbyists\' Wars and the Development of BIM" and "The History of the BIM Map"). Without understanding where we came from, it is impossible to see where we are going.',
+                      'For the past ten years I\'ve worked on resource management for construction projects. Along the way I got curious about how the industry\'s tools came to be - from the first attempts at design automation to today\'s ERP platforms - and that turned into a couple of longer pieces ("The Lobbyists\' Wars and the Development of BIM" and "The History of the BIM Map"). It\'s hard to see where things are heading without a sense of how we got here.',
                   })}
                 </p>
                 <p>
                   <Trans
                     i18nKey="about.founder_bio_p2"
-                    defaults='Over the years, dozens of articles have come off my desk, read by millions of professionals around the world. At the same time, I&rsquo;ve consulted with major construction and consulting firms, developers, and software vendors themselves on data management in projects - helping them navigate processes where data is not a byproduct but the foundation for decision-making. This work gave me a rare opportunity to see the industry from both sides: through the eyes of those who create the tools and through the eyes of those who use them in real projects every day. Many of these observations and reflections are collected in my book <book>Data-Driven Construction</book>, which is now available in 16 languages - <books>datadrivenconstruction.io/books</books>.'
+                    defaults='I&rsquo;ve written a fair amount on these topics over the years, and some of it found a wide readership. Alongside the writing, I&rsquo;ve consulted for construction and consulting firms, developers, and software vendors on how they handle project data - treating it as the basis for decisions rather than a byproduct of them. That work let me see the industry from both sides: the people who build the tools, and the people who use them every day. A lot of those observations ended up in my book <book>Data-Driven Construction</book>, now available in 16 languages (<books>datadrivenconstruction.io/books</books>).'
                     components={{
                       book: (
                         <a
@@ -482,7 +484,7 @@ export function AboutPage() {
                 <p>
                   <Trans
                     i18nKey="about.founder_bio_p3"
-                    defaults='Two other things have kept me busy: helping non-developers get into proprietary formats that were never meant to be opened, and finding a cleaner way to describe construction work through a resource model. These efforts have resulted in free tools - <cad>DDC CAD/BIM data converters</cad> (Revit, IFC, DWG, DGN → structured data), <gh>available on GitHub</gh>, and the multilingual <cwicr>CWICR database</cwicr> of construction works and resources - over 55,000 items in 11 languages, published as <cwicr>OpenConstructionEstimate-DDC-CWICR</cwicr>. All of this was a necessary step toward an idea I&rsquo;ve been pursuing for the past decade - an open-source modular ERP for the construction industry.'
+                    defaults='Two other problems kept me busy. One was helping non-developers get into proprietary file formats that were never meant to be opened. The other was finding a cleaner way to describe construction work through a resource model. Both produced free tools: the <cad>DDC CAD/BIM converters</cad> (Revit, IFC, DWG, DGN → structured data) <gh>on GitHub</gh>, and <cwicr>CWICR</cwicr>, a multilingual database of construction works and resources - over 55,000 items in 11 languages, published as <cwicr>OpenConstructionEstimate-DDC-CWICR</cwicr>.'
                     components={{
                       cad: (
                         <a
@@ -514,13 +516,13 @@ export function AboutPage() {
                 <blockquote className="my-4 rounded-r-lg border-l-4 border-oe-blue bg-oe-blue/[0.04] py-3 px-4 text-[15px] italic text-content-primary leading-relaxed">
                   {t('about.founder_bio_p4', {
                     defaultValue:
-                      "The recent generation of AI tooling finally made it feasible to consolidate that work - methodology, data models, and prior implementations - into a single platform. It's now public and open source.",
+                      "All of it was groundwork for something I'd wanted to build for a long time: an open, modular ERP for construction. The latest generation of tooling finally made it practical to pull the methodology, data models, and earlier implementations together into one platform. It's now public and open source.",
                   })}
                 </blockquote>
                 <p className="border-l-2 border-oe-blue/40 pl-3 italic text-content-primary">
                   {t('about.founder_bio_p5', {
                     defaultValue:
-                      'Progress is born from dialogue - from the clash of perspectives and openness to new approaches. I would be grateful if you would be willing to participate in this conversation on the inevitable Uberization of the construction industry and the transparency of cost and time estimation processes for construction projects.',
+                      'In my experience the best ideas tend to come out of conversation - and out of disagreement. If the questions around construction\'s move toward "Uberization," and toward more transparent cost and time estimation, are interesting to you, I\'d be glad to have you in that discussion.',
                   })}
                 </p>
               </div>
@@ -580,7 +582,7 @@ export function AboutPage() {
             <p className="mb-2 text-2xs font-semibold uppercase tracking-wider text-content-tertiary">
               {t('about.ddc_flagship_label', { defaultValue: 'Flagship products · datadrivenconstruction.io' })}
             </p>
-            <ul className="mb-6 space-y-2.5">
+            <ul className="mb-6 grid grid-cols-1 sm:grid-cols-2 gap-2.5">
               {[
                 { href: 'https://datadrivenconstruction.io', label: 'DataDrivenConstruction', desc: t('about.ddc_link_lab', { defaultValue: 'Lab homepage - research & consulting' }) },
                 { href: 'https://datadrivenconstruction.io/books/', label: 'DDC Guidebook', desc: t('about.ddc_link_book', { defaultValue: 'Reference reading, free, 16 languages' }) },
@@ -612,10 +614,10 @@ export function AboutPage() {
             <p className="mb-2 text-2xs font-semibold uppercase tracking-wider text-content-tertiary">
               {t('about.ddc_oss_label', { defaultValue: 'Open source on GitHub · @datadrivenconstruction' })}
             </p>
-            <ul className="mb-6 space-y-2.5">
+            <ul className="mb-6 grid grid-cols-1 sm:grid-cols-2 gap-2.5">
               {[
                 { href: 'https://github.com/datadrivenconstruction/cad2data-Revit-IFC-DWG-DGN-pipeline-with-conversion-validation-qto', label: 'cad2data Pipeline', desc: t('about.ddc_gh_cad2data', { defaultValue: 'Revit · IFC · DWG · DGN → structured quantities' }) },
-                { href: 'https://github.com/datadrivenconstruction/OpenConstructionEstimate-DDC-CWICR', label: 'OpenConstructionEstimate', desc: t('about.ddc_gh_cwicr', { defaultValue: '55,000+ cost items · 24 languages · 48 regions' }) },
+                { href: 'https://github.com/datadrivenconstruction/OpenConstructionEstimate-DDC-CWICR', label: 'OpenConstructionEstimate', desc: t('about.ddc_gh_cwicr', { defaultValue: '55,000+ cost items · 27 languages · 48 regions' }) },
                 { href: 'https://github.com/datadrivenconstruction', label: 'DDC Skills for AI Agents', desc: t('about.ddc_gh_skills', { defaultValue: 'Tool definitions & prompts for LLM agents' }) },
               ].map(item => (
                 <li key={item.href}>
@@ -949,9 +951,9 @@ export function AboutPage() {
               </p>
               <div className="grid grid-cols-2 gap-2.5 mb-4">
                 {[
-                  { value: '24', label: t('about.support_kpi_langs', { defaultValue: 'Languages translated' }) },
+                  { value: '27', label: t('about.support_kpi_langs', { defaultValue: 'Languages translated' }) },
                   { value: '48', label: t('about.support_kpi_regions', { defaultValue: 'Regional cost packs' }) },
-                  { value: '100+', label: t('about.support_kpi_modules', { defaultValue: 'Backend modules' }) },
+                  { value: '161', label: t('about.support_kpi_modules', { defaultValue: 'Backend modules' }) },
                   { value: '55K+', label: t('about.support_kpi_cwicr', { defaultValue: 'CWICR positions' }) },
                 ].map((kpi, i) => (
                   <div key={i} className="rounded-lg bg-surface-primary/60 backdrop-blur-sm border border-border-light px-3 py-2.5">

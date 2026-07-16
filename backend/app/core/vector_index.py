@@ -1,3 +1,5 @@
+# DDC-CWICR-OE: DataDrivenConstruction · OpenConstructionERP
+# Copyright (c) 2026 Artem Boiko / DataDrivenConstruction
 """Multi-collection embedding layer​‌‍⁠​‌‍⁠​‌‍⁠​‌‍⁠ - the cross-module semantic memory.
 
 This is the foundation that lets every business module (BOQ, documents,
@@ -82,7 +84,7 @@ COLLECTION_BIM_ELEMENTS = "oe_bim_elements"
 COLLECTION_VALIDATION = "oe_validation"
 COLLECTION_CHAT = "oe_chat"
 COLLECTION_REQUIREMENTS = "oe_requirements"
-# Cost catalog (CWICR / RSMeans / custom) - feeds the element→catalog
+# Cost catalog (CWICR / regional-index / custom) - feeds the element→catalog
 # match feature.  Embeds with the multilingual-e5-small ``passage:``
 # prefix so cross-language recall stays high; queries are issued via
 # the cost adapter's ``search`` method which applies the matching

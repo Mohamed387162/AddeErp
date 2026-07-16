@@ -1,3 +1,5 @@
+# DDC-CWICR-OE: DataDrivenConstruction · OpenConstructionERP
+# Copyright (c) 2026 Artem Boiko / DataDrivenConstruction
 """Users & authentication API routes.
 
 Endpoints:
@@ -38,6 +40,7 @@ from app.core.rate_limiter import client_identifier, login_limiter
 from app.dependencies import (
     CurrentUserId,
     RequirePermission,
+    RequireRole,
     SessionDep,
     SettingsDep,
 )
@@ -237,7 +240,19 @@ async def demo_login(
         * Rate-limited per source IP (``demo_{ip}`` bucket) - the same
           login_limiter so repeated taps don't bypass throttling.
     """
+    from app.core.demo_login import demo_login_enabled
     from app.core.demo_seed import seed_demo_enabled
+
+    # Admin switch (Settings screen) takes precedence and gets its own clear
+    # 403 so the user understands it was turned off deliberately, distinct from
+    # a server that simply never seeded demo data (404 below). The service-layer
+    # sink re-checks this, so this early guard is a clean message, not the only
+    # line of defence.
+    if not demo_login_enabled():
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Demo login is currently switched off by the administrator.",
+        )
 
     if not seed_demo_enabled():
         raise HTTPException(
@@ -264,6 +279,82 @@ async def demo_login(
         )
 
     return await service.demo_login(email)
+
+
+# ── Admin: public demo-login switch ─────────────────────────────────────────
+
+
+class DemoLoginSettingResponse(BaseModel):
+    """Admin view of the public demo-login switch.
+
+    * ``enabled`` - the admin's explicit on/off choice, persisted server-side
+      (a small JSON file in the data dir, so no database migration).
+    * ``seeded`` - whether demo accounts exist on this server at all
+      (``seed_demo_enabled()``). When ``False`` the demo login stays
+      unavailable even with ``enabled`` on, so the UI can explain why.
+    * ``effective`` - what the sign-in screen actually honours:
+      ``enabled AND seeded``.
+    """
+
+    enabled: bool
+    seeded: bool
+    effective: bool
+
+
+class DemoLoginSettingUpdate(BaseModel):
+    """Admin payload to switch the public demo login on or off."""
+
+    enabled: bool
+
+
+def _demo_login_setting_state() -> DemoLoginSettingResponse:
+    """Assemble the current demo-login switch state for the admin API."""
+    from app.core.demo_login import demo_login_enabled
+    from app.core.demo_seed import seed_demo_enabled
+
+    enabled = demo_login_enabled()
+    seeded = seed_demo_enabled()
+    return DemoLoginSettingResponse(enabled=enabled, seeded=seeded, effective=enabled and seeded)
+
+
+@router.get(
+    "/auth/demo-login/settings/",
+    response_model=DemoLoginSettingResponse,
+    dependencies=[Depends(RequireRole("admin"))],
+)
+@router.get(
+    "/auth/demo-login/settings",
+    response_model=DemoLoginSettingResponse,
+    include_in_schema=False,
+    dependencies=[Depends(RequireRole("admin"))],
+)
+async def get_demo_login_setting() -> DemoLoginSettingResponse:
+    """Admin only: read whether the public demo login is currently enabled."""
+    return _demo_login_setting_state()
+
+
+@router.put(
+    "/auth/demo-login/settings/",
+    response_model=DemoLoginSettingResponse,
+    dependencies=[Depends(RequireRole("admin"))],
+)
+@router.put(
+    "/auth/demo-login/settings",
+    response_model=DemoLoginSettingResponse,
+    include_in_schema=False,
+    dependencies=[Depends(RequireRole("admin"))],
+)
+async def put_demo_login_setting(body: DemoLoginSettingUpdate) -> DemoLoginSettingResponse:
+    """Admin only: switch the public demo login on or off.
+
+    Persisted immediately (no restart). The sign-in screen re-reads the state
+    on its next load, and the demo-login code path refuses new demo sign-ins as
+    soon as this is turned off.
+    """
+    from app.core.demo_login import set_demo_login_enabled
+
+    set_demo_login_enabled(body.enabled)
+    return _demo_login_setting_state()
 
 
 @router.post("/auth/login/", response_model=TokenResponse)
@@ -359,9 +450,10 @@ async def first_run(
         return await service.first_run_status(is_desktop=is_desktop)
     except Exception:  # noqa: BLE001 - this endpoint must never error
         try:
+            from app.core.demo_login import demo_login_enabled
             from app.core.demo_seed import seed_demo_enabled
 
-            demo_enabled = seed_demo_enabled()
+            demo_enabled = seed_demo_enabled() and demo_login_enabled()
         except Exception:  # noqa: BLE001 - degrade to the safe default
             demo_enabled = True
         return FirstRunResponse(
@@ -933,6 +1025,7 @@ async def get_onboarding(
     return OnboardingResponse(
         completed=onboarding.get("completed", False),
         company_type=onboarding.get("company_type"),
+        company_size=onboarding.get("company_size"),
         enabled_modules=onboarding.get("enabled_modules", []),
         interface_mode=onboarding.get("interface_mode"),
     )
@@ -961,16 +1054,24 @@ async def save_onboarding(
     # and ``modules_for`` would write an explicit False for them, silently
     # hiding live sidebar routes (BIM, Finance, CRM and the rest). Making the
     # server authoritative here closes that drift for good.
-    from app.core.onboarding_presets import get_preset, modules_for
+    from app.core.onboarding_presets import get_preset, get_size_preset, modules_for
 
     effective_modules = data.enabled_modules
     if data.company_type == "full_enterprise":
         full_enterprise = get_preset("full_enterprise")
         if full_enterprise is not None:
             effective_modules = list(full_enterprise.enabled_modules)
+    elif data.company_type == "size_large":
+        # "Large Enterprise" is the size-dimension twin of Full Enterprise: it
+        # means the whole platform, so pin it to the server's authoritative
+        # functional-module list for the same anti-drift reason as above.
+        size_large = get_size_preset("size_large")
+        if size_large is not None:
+            effective_modules = list(size_large.enabled_modules)
 
     metadata["onboarding"] = {
         "company_type": data.company_type,
+        "company_size": data.company_size,
         "enabled_modules": effective_modules,
         "interface_mode": data.interface_mode,
         "completed": data.completed,
@@ -986,6 +1087,7 @@ async def save_onboarding(
     return OnboardingResponse(
         completed=data.completed,
         company_type=data.company_type,
+        company_size=data.company_size,
         enabled_modules=effective_modules,
         interface_mode=data.interface_mode,
     )
@@ -1016,6 +1118,7 @@ async def complete_onboarding(
     return OnboardingResponse(
         completed=True,
         company_type=onboarding.get("company_type"),
+        company_size=onboarding.get("company_size"),
         enabled_modules=onboarding.get("enabled_modules", []),
         interface_mode=onboarding.get("interface_mode"),
     )
@@ -1030,6 +1133,20 @@ async def get_onboarding_presets() -> list[dict[str, Any]]:
     from app.core.onboarding_presets import get_all_presets
 
     return get_all_presets()
+
+
+@router.get("/onboarding-presets/sizes/")
+async def get_onboarding_size_presets() -> list[dict[str, Any]]:
+    """Return all company-size presets for the onboarding wizard.
+
+    Public endpoint (no auth required) - the presets are non-sensitive. A
+    parallel dimension to ``/onboarding-presets/`` (company role): the size the
+    user picks maps to the same ``module_preferences`` machinery, so the two
+    endpoints share one response shape.
+    """
+    from app.core.onboarding_presets import get_all_size_presets
+
+    return get_all_size_presets()
 
 
 # ── Admin: User management ─────────────────────────────────────────────────

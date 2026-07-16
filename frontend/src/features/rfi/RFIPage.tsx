@@ -1,3 +1,5 @@
+// DDC-CWICR-OE: DataDrivenConstruction · OpenConstructionERP
+// Copyright (c) 2026 Artem Boiko / DataDrivenConstruction
 import React, { useState, useMemo, useCallback, useEffect, useRef } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
@@ -20,6 +22,7 @@ import {
   UploadCloud,
   Check,
   Pencil,
+  Network,
 } from 'lucide-react';
 import {
   Button,
@@ -1588,6 +1591,102 @@ async function downloadExcelExport(url: string, fallbackFilename: string): Promi
 
 /* ── Main Page ─────────────────────────────────────────────────────────── */
 
+/** Compact inline link to a sibling module (keeps the connects row readable). */
+function ModLink({ to, children }: { to: string; children: React.ReactNode }) {
+  return (
+    <Link to={to} className="font-medium text-oe-blue-text hover:underline">
+      {children}
+    </Link>
+  );
+}
+
+/**
+ * One-glance orientation card: what an RFI is for, the stages of using it, and
+ * the neighbouring modules it feeds or draws from. Every module the RFI
+ * connects to is a real, clickable route so the workflow is obvious.
+ */
+function RFIHowItWorks() {
+  const { t } = useTranslation();
+
+  const steps: { icon: React.ReactNode; title: string; desc: string }[] = [
+    {
+      icon: <HelpCircle size={14} className="text-oe-blue" />,
+      title: t('rfi.flow_1_title', { defaultValue: 'Raise' }),
+      desc: t('rfi.flow_1_desc', {
+        defaultValue: 'Log a query with its priority, discipline and the drawings in question.',
+      }),
+    },
+    {
+      icon: <CalendarClock size={14} className="text-oe-blue" />,
+      title: t('rfi.flow_2_title', { defaultValue: 'Set ball-in-court' }),
+      desc: t('rfi.flow_2_desc', {
+        defaultValue: 'Choose who owns the answer and a response due date.',
+      }),
+    },
+    {
+      icon: <Check size={14} className="text-oe-blue" />,
+      title: t('rfi.flow_3_title', { defaultValue: 'Answer on the record' }),
+      desc: t('rfi.flow_3_desc', {
+        defaultValue: 'The design team posts the official response and the status moves to Answered.',
+      }),
+    },
+    {
+      icon: <DollarSign size={14} className="text-oe-blue" />,
+      title: t('rfi.flow_4_title', { defaultValue: 'Escalate impact' }),
+      desc: t('rfi.flow_4_desc', {
+        defaultValue: 'When an answer carries cost or delay, turn it straight into a Variation.',
+      }),
+    },
+  ];
+
+  return (
+    <div className="rounded-xl border border-border-light bg-surface-secondary/40 p-4">
+      <h2 className="flex items-center gap-1.5 text-sm font-semibold text-content-primary">
+        <Network size={15} className="text-oe-blue" />
+        {t('rfi.flow_title', { defaultValue: 'How RFIs work and connect' })}
+      </h2>
+      <p className="mt-1 text-xs text-content-tertiary">
+        {t('rfi.flow_intro', {
+          defaultValue:
+            'An RFI turns an open question into a documented answer you can build on. The quickest start is to raise one and set who owns the next move.',
+        })}
+      </p>
+
+      <ol className="mt-3 grid gap-2 sm:grid-cols-2 lg:grid-cols-4">
+        {steps.map((s) => (
+          <li
+            key={s.title}
+            className="rounded-lg border border-border-light bg-surface-primary/60 p-3"
+          >
+            <div className="flex items-center gap-2">
+              <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-lg bg-oe-blue-subtle">
+                {s.icon}
+              </span>
+              <span className="text-xs font-semibold text-content-primary">{s.title}</span>
+            </div>
+            <p className="mt-1.5 text-2xs leading-relaxed text-content-tertiary">{s.desc}</p>
+          </li>
+        ))}
+      </ol>
+
+      <div className="mt-3 flex flex-wrap items-center gap-x-2 gap-y-1 border-t border-border-light pt-3 text-2xs text-content-tertiary">
+        <span className="font-medium text-content-secondary">
+          {t('rfi.flow_connects', { defaultValue: 'Connects with' })}
+        </span>
+        <ModLink to="/submittals">{t('submittals.title', { defaultValue: 'Submittals' })}</ModLink>
+        <span aria-hidden="true">·</span>
+        <ModLink to="/correspondence">
+          {t('correspondence.title', { defaultValue: 'Correspondence' })}
+        </ModLink>
+        <span aria-hidden="true">·</span>
+        <ModLink to="/bim">{t('rfi.link_bim', { defaultValue: 'BIM viewer' })}</ModLink>
+        <span aria-hidden="true">·</span>
+        <ModLink to="/contracts">{t('rfi.link_contracts', { defaultValue: 'Contracts' })}</ModLink>
+      </div>
+    </div>
+  );
+}
+
 export function RFIPage() {
   const { t } = useTranslation();
   const navigate = useNavigate();
@@ -2003,6 +2102,7 @@ export function RFIPage() {
               }
               onClick={() => exportMut.mutate()}
               disabled={exportMut.isPending || !projectId}
+              data-guide="rfi-export"
             >
               {t('rfi.export_rfi_log', { defaultValue: 'Export RFI Log' })}
             </Button>
@@ -2013,6 +2113,7 @@ export function RFIPage() {
               disabled={!projectId}
               title={!projectId ? t('common.select_project_first', { defaultValue: 'Please select a project first' }) : undefined}
               icon={<Plus size={14} />}
+              data-guide="rfi-new"
             >
               {t('rfi.new_rfi', { defaultValue: 'New RFI' })}
             </Button>
@@ -2050,10 +2151,12 @@ export function RFIPage() {
         })}
       </DismissibleInfo>
 
+      <RFIHowItWorks />
+
       {projectId ? (
       <>
       {/* Stats */}
-      <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+      <div className="grid grid-cols-2 sm:grid-cols-4 gap-3" data-guide="rfi-stats">
         <div className="rounded-xl border border-border-light bg-surface-elevated/90 p-4 shadow-xs transition-shadow duration-normal ease-oe hover:shadow-sm animate-card-in">
           <p className="text-2xs font-medium text-content-tertiary uppercase tracking-wide">
             {t('rfi.stat_total', { defaultValue: 'Total RFIs' })}
@@ -2094,7 +2197,7 @@ export function RFIPage() {
       {/* Quick-view chips — saved-view shortcuts for the most common
           "what's on my plate?" slices. Mutually exclusive, kept above
           the dropdown toolbar so the eye can land on them first. */}
-      <div className="flex flex-wrap gap-1.5" role="tablist" aria-label={t('rfi.quick_views_aria', { defaultValue: 'Quick views' })}>
+      <div className="flex flex-wrap gap-1.5" role="tablist" aria-label={t('rfi.quick_views_aria', { defaultValue: 'Quick views' })} data-guide="rfi-quickviews">
         {(
           [
             { key: 'all', label: t('rfi.quick_all', { defaultValue: 'All' }) },

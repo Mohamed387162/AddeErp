@@ -4,22 +4,23 @@
 
 ### A leading open-source workspace for construction project management
 
-Professional BOQ, 4D scheduling, 5D cost model, and tendering - all in one open-source platform.
+Professional BOQ, CAD and BIM takeoff, 4D scheduling, 5D cost model, and tendering - all in one self-hosted platform.
 
 **Like WordPress for construction companies** - pick modules from the marketplace, drop in your own, or replace ours with custom-built ones. Same plug-and-play model, but for BOQ, scheduling, cost control, BIM, and tendering.
+
+**A platform companies build any construction app on.** Use OpenConstructionERP as the base to assemble the exact software a project needs and to build your own modules on top, from estimating and BIM to scheduling and site delivery. One open, powerful foundation for anything you run in construction.
 
 [▶ Watch the 12-min walkthrough](https://www.youtube.com/watch?v=X06cIaroAeI) · [Demo](https://openconstructionerp.com) · [Documentation](https://openconstructionerp.com/docs) · [Discussions](https://t.me/datadrivenconstruction) · [Report Bug](https://github.com/datadrivenconstruction/OpenConstructionERP/issues)
 
 [![License](https://img.shields.io/badge/license-AGPL--3.0-blue)](LICENSE)
-[![Version](https://img.shields.io/github/v/release/datadrivenconstruction/OpenConstructionERP?label=version&color=green&v=7.3.0)](https://github.com/datadrivenconstruction/OpenConstructionERP/releases/latest)
-[![PyPI](https://img.shields.io/pypi/v/openconstructionerp?color=informational&label=pypi&v=7.3.0)](https://pypi.org/project/openconstructionerp/)
+[![Version](https://img.shields.io/github/v/release/datadrivenconstruction/OpenConstructionERP?label=version&color=green&v=10.10.0)](https://github.com/datadrivenconstruction/OpenConstructionERP/releases/latest)
+[![PyPI](https://img.shields.io/pypi/v/openconstructionerp?color=informational&label=pypi&v=10.10.0)](https://pypi.org/project/openconstructionerp/)
 [![Downloads (pepy · per month)](https://static.pepy.tech/personalized-badge/openconstructionerp?period=month&units=international_system&left_color=grey&right_color=blue&left_text=downloads%20(pepy%20%C2%B7%20per%20month))](https://pepy.tech/project/openconstructionerp)
 [![Stars](https://img.shields.io/github/stars/datadrivenconstruction/OpenConstructionERP?style=flat&logo=github)](https://github.com/datadrivenconstruction/OpenConstructionERP/stargazers)
-<br/>
 [![Last commit](https://img.shields.io/github/last-commit/datadrivenconstruction/OpenConstructionERP?color=informational)](https://github.com/datadrivenconstruction/OpenConstructionERP/commits/main)
+<br/>
 ![Languages](https://img.shields.io/badge/languages-27-orange)
 ![Cost Items](https://img.shields.io/badge/cost_items-55%2C000%2B-red)
-<br/>
 [![OpenSSF Scorecard](https://api.securityscorecards.dev/projects/github.com/datadrivenconstruction/OpenConstructionERP/badge)](https://securityscorecards.dev/viewer/?uri=github.com/datadrivenconstruction/OpenConstructionERP)
 [![CodeQL](https://github.com/datadrivenconstruction/OpenConstructionERP/actions/workflows/codeql.yml/badge.svg)](https://github.com/datadrivenconstruction/OpenConstructionERP/actions/workflows/codeql.yml)
 [![Signed releases](https://img.shields.io/badge/releases-Sigstore_signed-8250df)](SECURITY.md)
@@ -50,11 +51,11 @@ Professional BOQ, 4D scheduling, 5D cost model, and tendering - all in one open-
 
 <table>
 <tr>
-<td align="center" width="16.66%"><b>55K+</b><br/><sub>cost&nbsp;items</sub></td>
-<td align="center" width="16.66%"><b>24</b><br/><sub>languages</sub></td>
+<td align="center" width="16.66%"><b>120K+</b><br/><sub>cost&nbsp;items</sub></td>
+<td align="center" width="16.66%"><b>27</b><br/><sub>languages</sub></td>
 <td align="center" width="16.66%"><b>48</b><br/><sub>regions</sub></td>
 <td align="center" width="16.66%"><b>6</b><br/><sub>CAD&nbsp;formats</sub></td>
-<td align="center" width="16.66%"><b>100+</b><br/><sub>modules</sub></td>
+<td align="center" width="16.66%"><b>161</b><br/><sub>modules</sub></td>
 <td align="center" width="16.66%"><b>12</b><br/><sub>sections</sub></td>
 </tr>
 </table>
@@ -180,7 +181,7 @@ Construction cost estimation software is expensive, closed-source, and locked to
 | **27 languages** | Full UI translation: English, German, French, Spanish, Portuguese, Russian, Chinese, Arabic, Hindi, Japanese, Korean, and 16 more. |
 | **30+ regional standards** | DIN 276, NRM 1/2, CSI MasterFormat, GAEB, ГЭСН, DPGF, GB/T 50500, CPWD, ÖNORM, Birim Fiyat, Sekisan, SINAPI, and more. |
 | **AI-powered** | Connect any LLM provider (Anthropic, OpenAI, Gemini, Mistral, Groq, DeepSeek) for smart estimation. |
-| **55,000+ cost items** | CWICR database with 11 regional pricing databases (DACH, UK, US, France, Spain, Brazil, Russia, UAE, China, India, Canada). |
+| **120,000+ cost items** | Nine cost bases - global CWICR (repriced across 30 markets) plus eight national bases (China, Turkey, Brazil, Spain, Italy, Greece, Vietnam, Indonesia). |
 
 ### How It Compares
 
@@ -213,7 +214,7 @@ Construction cost estimation software is expensive, closed-source, and locked to
 <tr><td><b>BOQ editor</b></td><td align="center">&#10004;</td><td align="center">&#10004;</td><td align="center">&#10004;</td><td align="center">&#10004;</td><td align="center">&#10006;</td></tr>
 <tr><td><b>CAD/BIM takeoff</b></td><td align="center">&#10004; RVT IFC DWG DGN</td><td align="center">&#10004;</td><td align="center">&#10004;</td><td align="center">&#10006;</td><td align="center">PDF only</td></tr>
 <tr><td><b>4D/5D planning</b></td><td align="center">&#10004;</td><td align="center">&#10004;</td><td align="center">&#10006;</td><td align="center">&#10006;</td><td align="center">&#10006;</td></tr>
-<tr><td><b>Cost database included</b></td><td align="center">&#10004; 55K+ rates</td><td align="center">&#10006; extra</td><td align="center">&#10006; extra</td><td align="center">&#10006; extra</td><td align="center">&#10006;</td></tr>
+<tr><td><b>Cost database included</b></td><td align="center">&#10004; 120K+ rates</td><td align="center">&#10006; extra</td><td align="center">&#10006; extra</td><td align="center">&#10006; extra</td><td align="center">&#10006;</td></tr>
 <tr><td><b>Resource catalog</b></td><td align="center">&#10004; 7K+ priced</td><td align="center">&#10006; extra</td><td align="center">&#10006;</td><td align="center">&#10006;</td><td align="center">&#10006;</td></tr>
 <tr><td><b>Validation engine</b></td><td align="center">&#10004; 42 rules</td><td align="center">&#9888; limited</td><td align="center">&#10006;</td><td align="center">&#10006;</td><td align="center">&#10006;</td></tr>
 <tr><td><b>REST API</b></td><td align="center">&#10004; full</td><td align="center">&#9888; limited</td><td align="center">&#10006;</td><td align="center">&#10006;</td><td align="center">&#10006;</td></tr>
@@ -237,7 +238,7 @@ Each block below is a short GIF cut from the full walkthrough above - same order
 <tr>
 <td align="center" width="50%">
 <strong><picture><source media="(prefers-color-scheme: dark)" srcset="docs/readme-icons/person-dark.svg"><img src="docs/readme-icons/person-light.svg" width="14" align="center" alt=""></picture> 1 · Role-Based Onboarding</strong><br/>
-<em>Sign in as Admin / Estimator / Manager - the wizard pre-selects the right 17 of 46 modules for your role</em><br/><br/>
+<em>Sign in as Admin / Estimator / Manager - the wizard pre-selects the right 17 of 161 modules for your role</em><br/><br/>
 <img src="docs/gifs/07_Role_Based_Onboarding.gif" alt="Role-Based Onboarding" width="400" />
 </td>
 <td align="center" width="50%">
@@ -249,7 +250,7 @@ Each block below is a short GIF cut from the full walkthrough above - same order
 <tr>
 <td align="center">
 <strong><picture><source media="(prefers-color-scheme: dark)" srcset="docs/readme-icons/zap-dark.svg"><img src="docs/readme-icons/zap-light.svg" width="14" align="center" alt=""></picture> 3 · Build the Bill of Quantities</strong><br/>
-<em>Keyboard-first editor, 55K+ priced items, AI cost finder & Smart AI - quality score updates live</em><br/><br/>
+<em>Keyboard-first editor, 120K+ priced items, AI cost finder & Smart AI - quality score updates live</em><br/><br/>
 <img src="docs/gifs/15_BoQ_Editor.gif" alt="BoQ Editor" width="400" />
 </td>
 <td align="center">
@@ -302,7 +303,7 @@ Each block below is a short GIF cut from the full walkthrough above - same order
 </td>
 <td align="center">
 <strong><picture><source media="(prefers-color-scheme: dark)" srcset="docs/readme-icons/search-dark.svg"><img src="docs/readme-icons/search-light.svg" width="14" align="center" alt=""></picture> Bonus · Instant Search</strong><br/>
-<em>Find any of 55K+ cost items across 11 regional databases by keyword, unit or classification</em><br/><br/>
+<em>Find any of 120K+ cost items across 9 cost bases by keyword, unit or classification</em><br/><br/>
 <img src="docs/gifs/05_Instant_Search.gif" alt="Instant Search" width="400" />
 </td>
 </tr>
@@ -335,7 +336,7 @@ A quick tour of the main workspaces. Every screen is the real application runnin
 </td>
 <td align="center">
 <strong>Cost Database</strong><br/>
-<em>55,000+ priced items across 11 regional databases, bilingual, searchable by code, unit or class.</em><br/><br/>
+<em>120,000+ priced items across 9 cost bases, bilingual, searchable by code, unit or class.</em><br/><br/>
 <img src="docs/screenshots/gallery/cost-database.jpg" alt="Regional cost databases" width="420" />
 </td>
 </tr>
@@ -420,11 +421,11 @@ Build professional cost estimates with a powerful BOQ editor. The full lifecycle
 
 ### <picture><source media="(prefers-color-scheme: dark)" srcset="docs/readme-icons/database-dark.svg"><img src="docs/readme-icons/database-light.svg" width="14" align="center" alt=""></picture> Cost Databases & Resource Catalog
 
-<img src="docs/screenshots/feature-databases.jpg" alt="Cost Database - 55,000+ items across 11 regions" width="800" />
+<img src="docs/screenshots/feature-databases.jpg" alt="Cost Database - 120,000+ items across 9 cost bases" width="800" />
 
 Access the world's construction pricing data:
 
-- **CWICR database** - 55,000+ cost items covering all major construction trades. Available in 9 languages with 11 regional price sets
+- **Cost bases** - 120,000+ cost items across 9 bases: the global CWICR database (55,000+ items covering all major construction trades, repriced across 30 regional markets) plus 8 national bases built on each country's own norm system (China, Turkey, Brazil, Spain, Italy, Greece, Vietnam, Indonesia)
 - **Smart search** - Find items by description, code, or classification. AI-powered semantic search matches meaning, not just keywords ("concrete wall" finds "reinforced partition C30/37")
 - **Resource catalog** - 7,000+ materials, equipment, labor rates, and operators. Build custom assemblies from catalog items
 - **Regional pricing** - Automatic price adjustment based on project location. Compare rates across regions
@@ -576,7 +577,7 @@ Bottom-right floating chat on every page - talks to the entire ERP database thro
  └────────┘        └──────────────┘     └──────────────┘     └──────────┘
 ```
 
-- **Always-on** - Mounted in `AppLayout`, available on every route (Dashboard, BOQ, BIM, Geo, PropDev, Accommodation, all 111 modules)
+- **Always-on** - Mounted in `AppLayout`, available on every route (Dashboard, BOQ, BIM, Geo, PropDev, Accommodation, all 161 modules)
 - **Real ERP access** - Reads/writes through tools, not LLM guesswork: `get_all_projects`, `get_project_summary`, `get_boq_items`, `get_schedule`, `get_validation_results`, `get_risk_register`, `search_cwicr_database`, `get_cost_model`, `compare_projects`, `run_validation`, `create_boq_item`, `search_boq_positions`, `search_documents`, `search_tasks`, `search_risks`, `search_bim_elements`, `search_anything`
 - **Streamed responses** - Tool-call cards (risk register table, BOQ summary, etc.) render inline as the model produces them
 - **Provider-agnostic** - Anthropic / OpenAI / Gemini / Mistral / Groq / DeepSeek behind the same tool interface
@@ -929,7 +930,7 @@ env vars **before the first boot**:
 |-------|-----------|---------|
 | Backend | Python 3.12+ / FastAPI | Async API, Pydantic v2 validation, modular architecture |
 | Frontend | React 18 / TypeScript / Vite | SPA with code splitting, 27 language bundles |
-| Database | PostgreSQL 16+ / SQLite (dev) | OLTP with JSON columns, zero-config SQLite for development |
+| Database | PostgreSQL 16+ (only) | OLTP with JSON columns; an embedded PostgreSQL starts automatically for local dev, so there is no Docker, no separate database, and nothing to configure |
 | UI | Tailwind CSS / AG Grid | Professional data grid, responsive design, dark mode |
 | AI | Any LLM via REST API | Anthropic, OpenAI, Gemini, Mistral, Groq, DeepSeek |
 | Vector Search | LanceDB (embedded) / Qdrant | Semantic cost item search, 384d or 3072d embeddings |
@@ -962,7 +963,7 @@ This pipeline is the reason OpenConstructionERP can replace several commercial p
 flowchart TB
     UI["Frontend SPA<br>React 18, TypeScript, Vite<br>AG Grid, Tailwind, PDF.js"]
 
-    subgraph Backend ["FastAPI Backend, 111 modules"]
+    subgraph Backend ["FastAPI Backend, 161 modules"]
         CORE["Core<br>Module loader, Event bus, Hooks, RBAC<br>Validation, FSM + audit log"]
         ESTIM["Estimating<br>BOQ, Costs, Catalog, Assemblies<br>Takeoff, BIM Hub, Match-Elements, 5D"]
         FIELD["Field Operations<br>Service, Equipment, Daily Diary<br>Portal, Resources & Crew"]
@@ -977,7 +978,7 @@ flowchart TB
     end
 
     subgraph Data ["Data layer"]
-        PG[("PostgreSQL 16<br>SQLite in dev")]
+        PG[("PostgreSQL 16<br>embedded in dev")]
         VEC[("Vector DB<br>LanceDB / Qdrant")]
         S3[("MinIO / S3<br>files, CAD, PDFs")]
     end
@@ -1015,7 +1016,7 @@ flowchart TB
                    │ REST + SSE
 ┌──────────────────┴───────────────────────────────┐
 │  Backend (FastAPI)                               │
-│  111 auto-discovered modules · Plugin system     │
+│  161 auto-discovered modules · Plugin system     │
 ├──────────────────────────────────────────────────┤
 │  BOQ · Costs · Schedule · 5D · Validation · AI   │
 │  Takeoff · Tendering · Risk · Reports · Catalog  │
@@ -1023,7 +1024,7 @@ flowchart TB
 │  PropDev · Geo Hub · Coordination · Clash AI     │
 │  Accommodation · Floating Chat · 10 widgets      │
 ├──────────────────────────────────────────────────┤
-│  Database (PostgreSQL / SQLite)                  │
+│  Database (PostgreSQL, embedded in dev)          │
 │  Vector DB (LanceDB / Qdrant)                    │
 │  CAD Converters (DDC cad2data)                   │
 │  CV Pipeline (PaddleOCR + YOLOv11)               │
@@ -1088,12 +1089,13 @@ by any third-party trademark owners. Full attributions in [NOTICE](NOTICE).
 
 ## Export control
 
-This software contains cryptographic functionality (bcrypt password
-hashing, JWT signing). Export is classified under **US EAR 740.17** (TSU
-mass-market exemption) and **EU Regulation 2021/821** (dual-use). The
-Software is **not authorised** for download, use, or re-export to
-jurisdictions subject to comprehensive OFAC sanctions. See [NOTICE](NOTICE)
-for the full notice.
+OpenConstructionERP is open-source software, available worldwide. It uses
+only standard cryptography for sign-in (bcrypt password hashing and signed
+JSON Web Tokens) and no bulk data encryption, so it needs no special export
+licence. As with any software, it may not be exported to or used in
+comprehensively sanctioned destinations or by sanctioned parties, and you
+remain responsible for the export and sanctions laws that apply to you. See
+[NOTICE](NOTICE) for details.
 
 ## License
 

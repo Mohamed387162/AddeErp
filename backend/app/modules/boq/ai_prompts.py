@@ -1,3 +1,5 @@
+# DDC-CWICR-OE: DataDrivenConstruction · OpenConstructionERP
+# Copyright (c) 2026 Artem Boiko / DataDrivenConstruction
 """LLM prompt templates for BOQ AI features.
 
 Each prompt is designed for construction cost estimation domain.
@@ -158,9 +160,9 @@ Region: {region}
 
 Consider:
 1. Construction cost index changes - pick the one that fits the region:
-   - BKI / Statistisches Bundesamt (DACH / Germany / Austria)
-   - BCIS (UK / Ireland / Australia / NZ - RICS heritage)
-   - ENR / RSMeans (US / Canada)
+   - Statistisches Bundesamt (DACH / Germany / Austria)
+   - a UK construction cost index (UK / Ireland / Australia / NZ - RICS heritage)
+   - national construction cost indices (US / Canada)
    - SINAPI / FGV / IPCA-construção (Brazil)
    - INDEC ICC (Argentina) / DANE (Colombia) / INEGI (Mexico)
    - GESN / FER / Rosstat-construction (Russia / CIS)

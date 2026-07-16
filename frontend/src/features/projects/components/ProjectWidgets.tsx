@@ -1,3 +1,5 @@
+// DDC-CWICR-OE: DataDrivenConstruction · OpenConstructionERP
+// Copyright (c) 2026 Artem Boiko / DataDrivenConstruction
 /**
  * ProjectWidgets — the new wave-1 widgets for /projects/:id.
  *
@@ -533,7 +535,7 @@ export function HSEIncidentsWidget({ projectId }: { projectId: string }) {
   const rollup = useRollupSlice('project_hse_incidents');
   const fallback = useGracefulQuery<HSEInvestigation[]>(
     ['proj-widget-hse', projectId],
-    `/v1/hse/investigations/?project_id=${projectId}&limit=20`,
+    `/v1/hse_advanced/investigations/?project_id=${projectId}&limit=20`,
     !rollup.hasProvider,
   );
   const data: HSEInvestigation[] | null | undefined = rollup.hasProvider
@@ -1136,7 +1138,7 @@ export function QualityNCRWidget({ projectId }: { projectId: string }) {
   const rollup = useRollupSlice('project_quality_ncr');
   const fallback = useGracefulQuery<NCRItem[]>(
     ['proj-widget-ncr', projectId],
-    `/v1/qms/ncrs/?project_id=${projectId}&limit=50`,
+    `/v1/qms/ncrs?project_id=${projectId}&limit=50`,
     !rollup.hasProvider,
   );
   const data: NCRItem[] | null | undefined = rollup.hasProvider

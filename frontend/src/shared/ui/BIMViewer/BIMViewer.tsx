@@ -1,3 +1,5 @@
+// DDC-CWICR-OE: DataDrivenConstruction · OpenConstructionERP
+// Copyright (c) 2026 Artem Boiko / DataDrivenConstruction
 /**
  * BIMViewer — Three.js-based 3D BIM viewer component.
  *
@@ -49,10 +51,12 @@ import {
   PencilRuler,
   RotateCcw,
   Move3d,
+  LocateFixed,
 } from 'lucide-react';
-import { fetchBIMElementProperties } from '@/features/bim/api';
+import { fetchBIMElementContext, fetchBIMElementProperties } from '@/features/bim/api';
 import { SceneManager } from './SceneManager';
 import { ElementManager } from './ElementManager';
+import { DeferredTeardown } from './deferredTeardown';
 import {
   applySmartView,
   revertSmartView,
@@ -68,6 +72,7 @@ import { ClipManager } from './ClipManager';
 // existing managers so they coexist without disrupting current flows.
 import { SectionBox } from './SectionBox';
 import { WalkMode } from './WalkMode';
+import { WalkJoystick } from './WalkJoystick';
 import { MeasureTool } from './MeasureTool';
 import {
   deriveGeometry,
@@ -85,7 +90,10 @@ import {
 } from './color5d';
 import { TimelineScrubber } from './TimelineScrubber';
 import { use4dTimeline } from './use4dTimeline';
-import { resolveElementStatus } from './4dStatus';
+import { resolveElementStatus, type FourDStatus } from './4dStatus';
+import { INSTALL_STATUS_HEX, resolveInstallStatus } from './installStatus';
+import { YouAreHereMarker } from './YouAreHereMarker';
+import { isWithinBounds, modelPointFromGeo } from './geoLocate';
 import SimilarItemsPanel from '@/shared/ui/SimilarItemsPanel';
 import { Slider } from '@/shared/ui/Slider';
 import { useBIMViewerStore } from '@/stores/useBIMViewerStore';
@@ -94,6 +102,7 @@ import { useBIMMeasurementsStore } from '@/stores/useBIMMeasurementsStore';
 import { useToastStore } from '@/stores/useToastStore';
 import { copyToClipboard } from '@/shared/lib/browser';
 import { useDisplayQuantity } from '@/shared/hooks/useDisplayQuantity';
+import { useIsTouch } from '@/shared/hooks/useIsTouch';
 
 /* ── Types ─────────────────────────────────────────────────────────────── */
 
@@ -125,6 +134,16 @@ export interface BIMViewerProps {
   ) => void;
   /** Callback when an element is hovered. */
   onElementHover?: (elementId: string | null) => void;
+  /** Hands the live SceneManager up to the parent (and null on teardown) so a
+   *  parent can drive the viewer directly - e.g. build a BCF capture bridge
+   *  that snapshots the camera and canvas. */
+  onSceneReady?: (scene: SceneManager | null) => void;
+  /** Project WGS84 anchor. When present, a "locate me" control appears that
+   *  drops a device-GPS pin into the model relative to this point. */
+  geoAnchor?: { lat: number; lon: number } | null;
+  /** Model linear units per metre (1 metres, 1000 mm, 3.28084 feet). Used to
+   *  scale the GPS offset into model units for the locate-me pin. */
+  metresToModelUnits?: number;
   /** View mode coloring scheme. */
   viewMode?: BIMViewMode;
   /** Show measurement tools. */
@@ -173,7 +192,8 @@ export interface BIMViewerProps {
     | 'document_coverage'
     | '5d_cost'
     | '4d_schedule'
-    | 'by_progress';
+    | 'by_progress'
+    | 'install_status';
   /** Latest BOQ percent-complete (0-100) per element id, used by the
    *  ``by_progress`` colour mode and surfaced in the element info panel /
    *  hover tooltip as "BOQ Progress: XX%". The viewer's element list is
@@ -225,6 +245,11 @@ export interface BIMViewerProps {
   onOpenActivity?: (activityId: string) => void;
   /** User clicked a linked requirement in the properties panel. */
   onOpenRequirement?: (requirementId: string) => void;
+  /** User clicked "Ask AI" in the element quick-action bar. The parent builds
+   *  an element-context prompt and seeds the AI assistant with it. Passing
+   *  this prop is what makes the button appear (and it is hidden in portal
+   *  mode, where the internal AI assistant is not reachable). */
+  onAskAiAboutElement?: (element: BIMElementData) => void;
   /** User clicked "+ New" in the Linked Tasks section — parent opens
    *  CreateTaskFromBIMModal pre-filled with this element. */
   onCreateTask?: (element: BIMElementData) => void;
@@ -308,6 +333,24 @@ export interface BIMViewerProps {
    * unaffected.
    */
   readOnly?: boolean;
+  /**
+   * Portal mode - the viewer is embedded in the external client portal, where
+   * the caller authenticates with a magic-link SESSION token (NOT the internal
+   * JWT) and can only reach the token-scoped `/api/v1/portal/me/bim-models/*`
+   * endpoints. In this mode every panel/overlay that reads from an
+   * internal-JWT-gated endpoint is suppressed, because such a request carries
+   * no usable credential, returns 401, and the shared API client would react to
+   * that 401 by tearing down the (non-existent) internal session and hard-
+   * redirecting the whole page to `/login` - i.e. bouncing the client out of
+   * their own portal. Suppressed here: the scan-vs-design DeviationOverlay
+   * (`/v1/pointcloud/deviation`), the CWICR Match tab (`/v1/match/*`,
+   * `/v1/costs/*`) and the on-demand "all properties" Parquet fetch
+   * (`/v1/bim_hub/*`). Geometry and the skeleton element list still load,
+   * because those ride the portal token (geometry via a `?token=` query param,
+   * elements via the portal API client). Defaults to `false` so the internal
+   * BIM page is completely unaffected.
+   */
+  portal?: boolean;
 }
 
 /* ── Properties Table ──────────────────────────────────────────────────── */
@@ -641,6 +684,16 @@ function resolveElementQuantity(el: BIMElementData, dim: QuantityDimension): num
 
 /* ── BIM Viewer Component ──────────────────────────────────────────────── */
 
+/** What the scene-setup effect builds and later needs to dispose. Held in a
+ *  ref so a deferred teardown can dispose it after the fact, or a fast remount
+ *  can cancel that teardown and reuse it. See the DeferredTeardown wiring in
+ *  the scene-setup effect. */
+interface BuiltViewer {
+  canvas: HTMLCanvasElement;
+  scene: SceneManager;
+  disposeNow: () => void;
+}
+
 export function BIMViewer({
   modelId,
   projectId,
@@ -648,6 +701,9 @@ export function BIMViewer({
   onElementSelect,
   onSelectionChange,
   onElementHover,
+  onSceneReady,
+  geoAnchor = null,
+  metresToModelUnits = 1,
   viewMode: _viewMode = 'default',
   showMeasureTools: _showMeasureTools = false,
   className,
@@ -670,6 +726,7 @@ export function BIMViewer({
   onOpenTask,
   onOpenActivity,
   onOpenRequirement,
+  onAskAiAboutElement,
   onCreateTask,
   onLinkDocument,
   onLinkActivity,
@@ -684,6 +741,7 @@ export function BIMViewer({
   focusPoint = null,
   smartViewEvalResult = null,
   readOnly = false,
+  portal = false,
 }: BIMViewerProps) {
   // View-only mode (portal shared-model viewer): every authoring callback is
   // treated as absent so the properties panel and context menu render their
@@ -714,7 +772,28 @@ export function BIMViewer({
   const sectionBoxRef = useRef<SectionBox | null>(null);
   const walkModeRef = useRef<WalkMode | null>(null);
   const measureToolRef = useRef<MeasureTool | null>(null);
+  // React StrictMode (and any unmount-then-immediately-remount) would otherwise
+  // dispose the live WebGL scene in the cleanup and rebuild it on the next
+  // mount. The rebuild lands on a just-force-lost GL context (black canvas /
+  // "WebGL unavailable"), and it hands a fresh, empty ElementManager a modelId
+  // the element effect still records as loaded - so a bbox-only model renders
+  // nothing. We defer the teardown by one task and, if the effect re-runs
+  // first, cancel it and REUSE the live scene + managers. See the scene-setup
+  // effect below.
+  const teardownRef = useRef<DeferredTeardown | null>(null);
+  teardownRef.current ??= new DeferredTeardown();
+  const viewerTeardown = teardownRef.current;
+  const builtViewerRef = useRef<BuiltViewer | null>(null);
   const [viewerToolsReady, setViewerToolsReady] = useState(false);
+  /** "Locate me" pin (device GPS -> project anchor -> scene point). Created
+   *  when the scene is ready and the project has a geo anchor. */
+  const youAreHereRef = useRef<YouAreHereMarker | null>(null);
+  /** Locate-me lifecycle for button state and honest user feedback:
+   *  idle -> locating -> located | outside (GPS is outside the model
+   *  footprint) | denied (permission) | error (no fix / unsupported). */
+  const [locateState, setLocateState] = useState<
+    'idle' | 'locating' | 'located' | 'outside' | 'denied' | 'error'
+  >('idle');
   /** True while WalkMode currently owns the pointer lock — drives the
    *  on-screen "Mouse: look · WASD: move" hint overlay. */
   const [walkLocked, setWalkLocked] = useState(false);
@@ -724,6 +803,10 @@ export function BIMViewer({
    *  (browser releases via Esc) while the toolbar button stays armed
    *  until the user explicitly disables it. */
   const [walkActive, setWalkActive] = useState(false);
+  /** Coarse-pointer (touch) device. Gates the on-screen walk joystick, which
+   *  fills the one Site-mode gap: walk-mode look works on touch, but there is
+   *  no keyboard to drive WASD locomotion. */
+  const isTouch = useIsTouch();
   /** True only when walk mode is running in true pointer-lock (FPS) mode —
    *  the only mode that hides the cursor. Gates the centred crosshair so the
    *  default drag-to-look (cursor visible) doesn't show a redundant reticle. */
@@ -790,6 +873,13 @@ export function BIMViewer({
   useEffect(() => {
     onIsolationChangeRef.current = onIsolationChange;
   }, [onIsolationChange]);
+
+  // Latest onSceneReady callback, kept in a ref so the emit effect (which is
+  // keyed only on the SceneManager) never captures a stale closure.
+  const onSceneReadyRef = useRef(onSceneReady);
+  useEffect(() => {
+    onSceneReadyRef.current = onSceneReady;
+  }, [onSceneReady]);
 
   const [wireframe, setWireframe] = useState(false);
   const [gridVisible, setGridVisible] = useState(false);
@@ -960,7 +1050,10 @@ export function BIMViewer({
    *  activates 4D mode so we don't hit the schedule API on every page
    *  visit.  When the project has no schedule, `isAvailable` is false
    *  and the scrubber renders nothing. */
-  const fourD = use4dTimeline(projectId, colorByMode === '4d_schedule');
+  const fourD = use4dTimeline(
+    projectId,
+    colorByMode === '4d_schedule' || colorByMode === 'install_status',
+  );
 
   /** 5D cost rate stats — min / max unit_rate across all linked BOQ
    *  positions on the loaded elements.  Drives the legend strip in the
@@ -1050,6 +1143,21 @@ export function BIMViewer({
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
+
+    // If a teardown from a just-unmounted pass is still pending on THIS canvas,
+    // React re-mounted us faster than the deferred dispose could run - almost
+    // always React's StrictMode double-mount in development. Nothing was torn
+    // down yet, so cancel the pending dispose and reuse the live scene +
+    // managers instead of force-losing the GL context and rebuilding on top of
+    // it. The React-state mirrors (sceneManagerReady / viewerToolsReady) were
+    // never cleared - the clearing lives inside the deferred dispose we are
+    // cancelling - so they already reflect the live scene. Re-arm the same
+    // deferred teardown for the next unmount and return.
+    const pendingBuilt = builtViewerRef.current;
+    if (viewerTeardown.pending && pendingBuilt && pendingBuilt.canvas === canvas) {
+      viewerTeardown.cancel();
+      return () => viewerTeardown.schedule(pendingBuilt.disposeNow);
+    }
 
     // Creating the WebGLRenderer can throw from deep inside three.js when the
     // browser cannot give us a GL context (WebGL disabled, GPU driver
@@ -1326,7 +1434,16 @@ export function BIMViewer({
     };
     canvas.addEventListener('mousemove', handleMouseMoveForTooltip);
 
-    return () => {
+    // The actual teardown. It is DEFERRED (see the return below), not run
+    // inline, so React's StrictMode double-mount can cancel it and reuse this
+    // scene.
+    const disposeNow = () => {
+      // A fast re-mount may already have installed a NEW scene into the shared
+      // refs before this (deferred) teardown of the OLD one runs. Only clear
+      // the refs / state mirrors while they still point at THIS scene, so we
+      // never null out the successor's wiring. The resource disposal below
+      // always runs - the old scene's GPU memory must be freed regardless.
+      const isActive = sceneRef.current === scene;
       canvas.removeEventListener('mousemove', handleMouseMoveForTooltip);
       unsubscribeHiddenCount();
       unsubWalkLock?.();
@@ -1340,17 +1457,28 @@ export function BIMViewer({
       selectionMgr.dispose();
       elementMgr.dispose();
       scene.dispose();
-      sceneRef.current = null;
-      elementMgrRef.current = null;
-      selectionMgrRef.current = null;
-      measureMgrRef.current = null;
-      clipMgrRef.current = null;
-      sectionBoxRef.current = null;
-      walkModeRef.current = null;
-      measureToolRef.current = null;
-      setViewerToolsReady(false);
-      setSceneManagerReady(null);
+      if (isActive) {
+        sceneRef.current = null;
+        elementMgrRef.current = null;
+        selectionMgrRef.current = null;
+        measureMgrRef.current = null;
+        clipMgrRef.current = null;
+        sectionBoxRef.current = null;
+        walkModeRef.current = null;
+        measureToolRef.current = null;
+        builtViewerRef.current = null;
+        setViewerToolsReady(false);
+        setSceneManagerReady(null);
+      }
     };
+    builtViewerRef.current = { canvas, scene, disposeNow };
+
+    // Defer the teardown by one task. A synchronous re-mount (StrictMode) runs
+    // the reuse guard at the top of this effect first and cancels it; a genuine
+    // unmount has no matching re-mount, so the timer fires and disposes for
+    // real. Disposing one task late, on a canvas React has already detached, is
+    // safe.
+    return () => viewerTeardown.schedule(disposeNow);
     // Intentionally only run on mount — stable refs
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -1939,6 +2067,33 @@ export function BIMViewer({
           (el) => (pctMap[el.id] != null ? 1 : NO_LINK_OPACITY),
         );
       });
+    } else if (colorByMode === 'install_status') {
+      // Install-status overlay - a discrete green / amber / grey bucket per
+      // element: installed, being installed, or still to come. The schedule
+      // (4D) wins when the element is scheduled; otherwise BOQ progress
+      // decides. Elements with neither are left in their neutral colour.
+      const pctMap = progressByElementId ?? {};
+      const schedFor = (id: string): FourDStatus | null =>
+        fourD.isAvailable
+          ? resolveElementStatus(
+              id,
+              fourD.currentMs,
+              fourD.elementToActivities,
+              fourD.activitiesById,
+            )
+          : null;
+      import('three').then((THREE) => {
+        mgr.colorByDirect(
+          (el) => {
+            const status = resolveInstallStatus(schedFor(el.id), pctMap[el.id] ?? null);
+            return status === 'none' ? null : new THREE.Color(INSTALL_STATUS_HEX[status]);
+          },
+          (el) =>
+            resolveInstallStatus(schedFor(el.id), pctMap[el.id] ?? null) === 'none'
+              ? NO_LINK_OPACITY
+              : 1,
+        );
+      });
     } else {
       mgr.resetColors();
     }
@@ -1974,6 +2129,31 @@ export function BIMViewer({
     sceneManagerReady?.applyQualityMode(qualityMode);
     elementMgrRef.current?.applyQualityMode(qualityMode);
   }, [qualityMode, sceneManagerReady, elements]);
+
+  // Adaptive render resolution. Two profiles, one per device class:
+  //  - Touch: while WALKING the model on a phone/tablet, trim the pixel ratio
+  //    down to 0.5x to hold the frame rate on weaker mobile GPUs, and hold it
+  //    (long first-person sessions); off outside walk mode.
+  //  - Desktop: a standing, conservative profile that only bites while the
+  //    camera is actually moving on a heavy model - it trims no lower than
+  //    0.75x and snaps straight back to full the instant the camera settles, so
+  //    a still frame is always crisp. A fast model never triggers it (frames
+  //    stay quick), so it is invisible there. Keyed on the ready scene so a
+  //    freshly (re)created model picks up the right profile.
+  useEffect(() => {
+    if (!sceneManagerReady) return;
+    if (isTouch) {
+      sceneManagerReady.setAdaptiveResolution(walkActive, { floor: 0.5 });
+    } else {
+      sceneManagerReady.setAdaptiveResolution(true, {
+        floor: 0.75,
+        snapToFullOnIdle: true,
+        warmupFrames: 4,
+        cooldownFrames: 10,
+        step: 0.25,
+      });
+    }
+  }, [walkActive, isTouch, sceneManagerReady]);
 
   // Sync hidden-category toggles from the Layers tab.
   //
@@ -2203,6 +2383,110 @@ export function BIMViewer({
     };
   }, [setClipBox, setClipPlane, setClipMode, sceneManagerReady]);
 
+  // Publish the live SceneManager to a parent that opts in via onSceneReady:
+  // fires with the manager once the scene mounts and with null when it tears
+  // down, so the parent can build a capture bridge and drop it cleanly.
+  useEffect(() => {
+    onSceneReadyRef.current?.(sceneManagerReady);
+    return () => {
+      onSceneReadyRef.current?.(null);
+    };
+  }, [sceneManagerReady]);
+
+  // Own a "you are here" marker for the lifetime of the scene. Recreated when
+  // the scene remounts; disposed (removing its meshes) on teardown so it never
+  // outlives the SceneManager it draws into.
+  useEffect(() => {
+    if (!sceneManagerReady) {
+      youAreHereRef.current = null;
+      return;
+    }
+    const marker = new YouAreHereMarker(sceneManagerReady);
+    youAreHereRef.current = marker;
+    setLocateState('idle');
+    return () => {
+      marker.dispose();
+      youAreHereRef.current = null;
+    };
+  }, [sceneManagerReady]);
+
+  // "Locate me": read the device GPS, project it against the model anchor and
+  // drop a pin. Honest about its limits - it refuses when the fix lands well
+  // outside the model footprint and always sizes the ring to GPS accuracy,
+  // rather than pretending to survey-grade precision. Clicking again hides it.
+  const handleLocateMe = useCallback(() => {
+    const marker = youAreHereRef.current;
+    const scene = sceneRef.current;
+    if (!marker || !scene || !geoAnchor) return;
+    if (marker.isVisible) {
+      marker.hide();
+      setLocateState('idle');
+      return;
+    }
+    if (typeof navigator === 'undefined' || !navigator.geolocation) {
+      setLocateState('error');
+      return;
+    }
+    setLocateState('locating');
+    navigator.geolocation.getCurrentPosition(
+      (pos) => {
+        const bounds = scene.getContentBounds();
+        const groundY = bounds ? bounds.min.y : 0;
+        const point = modelPointFromGeo(
+          geoAnchor,
+          { lat: pos.coords.latitude, lon: pos.coords.longitude },
+          { metresToModelUnits, groundY },
+        );
+        if (bounds) {
+          const spanX = bounds.max.x - bounds.min.x;
+          const spanZ = bounds.max.z - bounds.min.z;
+          // Allow up to one model span of slack so standing just outside the
+          // walls still resolves; refuse only when clearly off this site.
+          const margin = Math.max(spanX, spanZ);
+          const inside = isWithinBounds(
+            point,
+            {
+              min: { x: bounds.min.x, y: bounds.min.y, z: bounds.min.z },
+              max: { x: bounds.max.x, y: bounds.max.y, z: bounds.max.z },
+            },
+            margin,
+          );
+          if (!inside) {
+            marker.hide();
+            setLocateState('outside');
+            return;
+          }
+        }
+        const accuracyM = Number.isFinite(pos.coords.accuracy)
+          ? pos.coords.accuracy
+          : 8;
+        const accuracyRadius = Math.max(accuracyM * metresToModelUnits, 0.5);
+        const poleHeight = 1.7 * metresToModelUnits;
+        marker.show(point, accuracyRadius, { poleHeight });
+        scene.focusOnPoint(point, Math.max(accuracyRadius * 2, poleHeight * 3));
+        setLocateState('located');
+      },
+      (err) => {
+        setLocateState(err.code === err.PERMISSION_DENIED ? 'denied' : 'error');
+      },
+      { enableHighAccuracy: true, timeout: 10_000, maximumAge: 60_000 },
+    );
+  }, [geoAnchor, metresToModelUnits]);
+
+  // Auto-clear the transient locate outcomes so a one-off "outside" or "denied"
+  // banner does not linger. The steady 'located'/'idle' states are left alone.
+  useEffect(() => {
+    if (
+      locateState !== 'outside' &&
+      locateState !== 'denied' &&
+      locateState !== 'error'
+    ) {
+      return;
+    }
+    const id = window.setTimeout(() => setLocateState('idle'), 5000);
+    return () => window.clearTimeout(id);
+  }, [locateState]);
+
   // Sync selection from parent — ONLY when the parent explicitly changes
   // selection (e.g. clicking a row in the filter panel). Skip when the
   // selection originated from the viewer's own SelectionManager (Ctrl+Click)
@@ -2264,6 +2548,14 @@ export function BIMViewer({
   // so a slow query for element A never overwrites fresh data for element B.
   const parquetAbortRef = useRef<AbortController | null>(null);
 
+  // Per-element ERP context (BOQ / docs / tasks / activities / requirements /
+  // validation / progress) is fetched on demand when an element is selected -
+  // the bulk element load is skeleton-only for speed. The fetched-once-per-id
+  // guard stops a re-fetch loop after we merge the enriched arrays back into
+  // `selectedElement` (same id, new object identity).
+  const linkCtxAbortRef = useRef<AbortController | null>(null);
+  const linkCtxFetchedIdRef = useRef<string | null>(null);
+
   /** Resolve the RVT ElementId of the currently-selected element. The
    *  Parquet's primary key column is `id` and contains this value — it is
    *  exposed on the BIMElement row as `mesh_ref`. Unmatched stubs use the
@@ -2291,6 +2583,15 @@ export function BIMViewer({
   // per revitId in `parquetCacheRef` — re-clicking the same element is
   // instant and shows no skeleton flash.
   useEffect(() => {
+    // Portal mode has no internal JWT, so the `/v1/bim_hub/.../dataframe/query`
+    // properties fetch would always 401. Skip it entirely: the read-only key
+    // panel renders from the skeleton element already loaded with the portal
+    // token, and no wasted always-failing request is fired.
+    if (portal) {
+      setParquetProps(null);
+      setParquetLoading(false);
+      return;
+    }
     if (!selectedElement || !modelId) {
       setParquetProps(null);
       setParquetLoading(false);
@@ -2342,11 +2643,72 @@ export function BIMViewer({
     return () => {
       ac.abort();
     };
-  }, [selectedElement, modelId, revitIdOf]);
+  }, [selectedElement, modelId, revitIdOf, portal]);
+
+  // On selection, pull the element's full ERP context (linked BOQ positions
+  // with cost, documents, tasks, schedule activities, requirements and
+  // validation) and merge it into `selectedElement` so the element panel's
+  // link sections populate. The bulk element load is skeleton-only for speed,
+  // so this is where a clicked element gains its real links - lazily.
+  useEffect(() => {
+    // Portal mode has no internal JWT, so the context endpoint would 401.
+    if (portal) return;
+    const el = selectedElement;
+    if (!el || !el.id) {
+      linkCtxFetchedIdRef.current = null;
+      return;
+    }
+    // Only real DB elements carry a UUID id; viewer stubs (unmatched meshes)
+    // use a synthetic id with no context row - skip them to avoid a 404.
+    const isUuid =
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(el.id);
+    if (!isUuid) return;
+    // Fetch once per element id: merging the arrays back re-runs this effect
+    // (new object identity, same id) and must not trigger a re-fetch loop.
+    if (linkCtxFetchedIdRef.current === el.id) return;
+    linkCtxFetchedIdRef.current = el.id;
+
+    linkCtxAbortRef.current?.abort();
+    const ac = new AbortController();
+    linkCtxAbortRef.current = ac;
+
+    void (async () => {
+      try {
+        const ctx = await fetchBIMElementContext(el.id, ac.signal);
+        if (ac.signal.aborted) return;
+        setSelectedElement((prev) =>
+          prev && prev.id === ctx.id
+            ? {
+                ...prev,
+                boq_links: ctx.boq_links,
+                linked_documents: ctx.linked_documents,
+                linked_tasks: ctx.linked_tasks,
+                linked_activities: ctx.linked_activities,
+                linked_requirements: ctx.linked_requirements,
+                validation_results: ctx.validation_results,
+                validation_status: ctx.validation_status,
+              }
+            : prev,
+        );
+      } catch (err) {
+        if (err instanceof DOMException && err.name === 'AbortError') return;
+        // Non-fatal: keep the skeleton arrays. Clear the guard so reselecting
+        // the same element can retry the fetch.
+        if (!ac.signal.aborted) linkCtxFetchedIdRef.current = null;
+      }
+    })();
+
+    return () => {
+      ac.abort();
+    };
+  }, [selectedElement, portal]);
 
   /** Kept for the legacy "All properties" refresh button so it still
    *  force-refetches on demand, bypassing the cache. */
   const handleFetchAllProperties = useCallback(async () => {
+    // Portal mode cannot reach the internal `/v1/bim_hub` properties endpoint
+    // (no internal JWT); skip the always-401 fetch.
+    if (portal) return;
     if (!selectedElement || !modelId) return;
     const revitId = revitIdOf(selectedElement);
     if (!revitId) {
@@ -2372,7 +2734,7 @@ export function BIMViewer({
         setParquetExpanded(true);
       }
     }
-  }, [selectedElement, modelId, revitIdOf]);
+  }, [selectedElement, modelId, revitIdOf, portal]);
 
   const handleToggleGrid = useCallback(() => {
     sceneRef.current?.toggleGrid();
@@ -3655,6 +4017,32 @@ export function BIMViewer({
             testId="bim-walk-toggle"
           />
         )}
+        {geoAnchor && (
+          <ToolbarButton
+            icon={LocateFixed}
+            label={
+              locateState === 'locating'
+                ? t('viewerTools.locating', { defaultValue: 'Locating...' })
+                : locateState === 'outside'
+                  ? t('viewerTools.locate_outside', {
+                      defaultValue: 'Your GPS position is outside this model',
+                    })
+                  : locateState === 'denied'
+                    ? t('viewerTools.locate_denied', {
+                        defaultValue: 'Location permission denied',
+                      })
+                    : locateState === 'error'
+                      ? t('viewerTools.locate_error', {
+                          defaultValue: 'No location fix available',
+                        })
+                      : t('viewerTools.locate', { defaultValue: 'Locate me' })
+            }
+            onClick={handleLocateMe}
+            active={locateState === 'located'}
+            variant="group"
+            testId="bim-locate-me"
+          />
+        )}
         <ToolbarButton
           icon={EyeOffIcon}
           label={t('bim.ghost_toggle', {
@@ -3675,6 +4063,52 @@ export function BIMViewer({
           FederatedViewer / future re-use, and the SectionBox / WalkMode /
           MeasureTool helpers stay wired so the top-toolbar Walk button
           and any future re-introduction can grab them. */}
+
+      {/* Locate-me status pill — surfaces the transient outcomes (searching,
+          off-site, permission denied, no fix) plainly instead of hiding them
+          in a tooltip. Auto-clears after a few seconds. */}
+      {(locateState === 'locating' ||
+        locateState === 'outside' ||
+        locateState === 'denied' ||
+        locateState === 'error') && (
+        <div
+          className={clsx(
+            'absolute top-14 start-1/2 -translate-x-1/2 z-30 flex items-center gap-2 px-3 py-1.5 rounded-lg backdrop-blur text-[11px] font-medium shadow-lg select-none',
+            locateState === 'locating'
+              ? 'bg-slate-900/85 text-white'
+              : 'bg-amber-100/95 text-amber-900 border border-amber-300',
+          )}
+          data-testid="bim-locate-status"
+          role="status"
+          aria-live="polite"
+        >
+          {locateState === 'locating' ? (
+            <>
+              <Loader2 className="w-3.5 h-3.5 animate-spin" />
+              <span>
+                {t('viewerTools.locating', { defaultValue: 'Locating...' })}
+              </span>
+            </>
+          ) : (
+            <>
+              <AlertTriangle className="w-3.5 h-3.5" />
+              <span>
+                {locateState === 'outside'
+                  ? t('viewerTools.locate_outside', {
+                      defaultValue: 'Your GPS position is outside this model',
+                    })
+                  : locateState === 'denied'
+                    ? t('viewerTools.locate_denied', {
+                        defaultValue: 'Location permission denied',
+                      })
+                    : t('viewerTools.locate_error', {
+                        defaultValue: 'No location fix available',
+                      })}
+              </span>
+            </>
+          )}
+        </div>
+      )}
 
       {/* Walk mode on-screen hint — visible the whole time walk mode is
           armed so the drag-to-look instruction is always discoverable
@@ -3716,6 +4150,20 @@ export function BIMViewer({
               ? t('viewerTools.walk_mode_drag', { defaultValue: 'Drag to look' })
               : t('viewerTools.walk_mode_fps', { defaultValue: 'Mouse-look (FPS)' })}
           </button>
+        </div>
+      )}
+
+      {/* On-screen walk joystick - touch site mode only. Walk-mode look
+          already works by dragging the view; this thumb-stick drives
+          locomotion, which is otherwise keyboard-only (WASD). Bottom-start so
+          it sits under the left thumb and clear of the right-hand panel. */}
+      {walkActive && isTouch && (
+        <div className="absolute bottom-6 start-6 z-30" data-testid="bim-walk-joystick">
+          <WalkJoystick
+            ariaLabel={t('viewerTools.walk_joystick', { defaultValue: 'Walk joystick' })}
+            onMove={(strafe, forward) => walkModeRef.current?.setMoveAxis(strafe, forward)}
+            onEnd={() => walkModeRef.current?.setMoveAxis(0, 0)}
+          />
         </div>
       )}
 
@@ -4045,6 +4493,37 @@ export function BIMViewer({
         </div>
       )}
 
+      {/* Install-status legend - three fixed swatches (green / amber / grey)
+          for installed / in-progress / pending, mirroring the mesh colours. */}
+      {colorByMode === 'install_status' && (
+        <div className="absolute bottom-3 end-3 z-20 flex flex-col gap-1 rounded-lg bg-surface-primary border border-border-light shadow-sm px-3 py-2 min-w-[150px]">
+          <span className="text-[10px] font-semibold uppercase tracking-wide text-content-tertiary">
+            {t('bim.install_status_legend_title', { defaultValue: 'Install status' })}
+          </span>
+          {(
+            [
+              ['installed', t('bim.install_status_installed', { defaultValue: 'Installed' })],
+              [
+                'in_progress',
+                t('bim.install_status_in_progress', { defaultValue: 'In progress' }),
+              ],
+              ['pending', t('bim.install_status_pending', { defaultValue: 'Pending' })],
+            ] as const
+          ).map(([key, label]) => (
+            <span
+              key={key}
+              className="flex items-center gap-1.5 text-[10px] text-content-secondary"
+            >
+              <span
+                className="inline-block h-2 w-2 rounded-full"
+                style={{ background: INSTALL_STATUS_HEX[key] }}
+              />
+              {label}
+            </span>
+          ))}
+        </div>
+      )}
+
       {/* Color-mode legend (storey / category / validation / coverage).
           Matches the active palette one-for-one so the user can decode the
           3D scene at a glance. The 5D-cost gradient legend is rendered
@@ -4061,8 +4540,11 @@ export function BIMViewer({
       {/* Scan-vs-design deviation overlay (bottom-left). Self-gating: renders
           nothing unless a laser scan has been aligned to this model, so it is
           safe to always mount. Surfaces the already-computed as-built-vs-
-          design deviation verdict as a colour legend + headline. */}
-      {projectId && modelId && (
+          design deviation verdict as a colour legend + headline. Skipped in
+          `portal` mode: its `/v1/pointcloud/deviation` fetch rides the internal
+          JWT (which a portal client does not have), so it would 401 and hard-
+          redirect the whole page to /login the instant a shared model opens. */}
+      {!portal && projectId && modelId && (
         <DeviationOverlay projectId={projectId} modelId={modelId} />
       )}
 
@@ -4739,8 +5221,30 @@ export function BIMViewer({
           </div>
 
           {/* Quick-action bar — always visible, not buried in a tab */}
-          {(onAddToBOQ || onCreateTask || onLinkDocument || onLinkActivity || onLinkRequirement) && (
+          {(onAddToBOQ ||
+            onCreateTask ||
+            onLinkDocument ||
+            onLinkActivity ||
+            onLinkRequirement ||
+            (!portal && onAskAiAboutElement)) && (
             <div className="px-3 py-1.5 border-b border-border-light shrink-0 flex flex-wrap gap-1">
+              {/* Ask AI about this element - the "ask the model" moat. Seeds the
+                  shared assistant with a full-context prompt (BOQ, docs, tasks,
+                  schedule, requirements, validation). Hidden in portal mode: the
+                  internal AI assistant is not reachable for portal clients. */}
+              {!portal && onAskAiAboutElement && (
+                <button
+                  type="button"
+                  onClick={() => onAskAiAboutElement(selectedElement)}
+                  className="inline-flex items-center gap-1 px-2 py-1 rounded-md text-[10px] font-medium bg-indigo-500/10 text-indigo-700 dark:text-indigo-400 hover:bg-indigo-500/20 border border-indigo-500/20 transition-colors"
+                  title={t('bim.quick_ask_ai_title', {
+                    defaultValue: 'Ask the AI assistant about this element',
+                  })}
+                >
+                  <Sparkles size={10} />
+                  {t('bim.quick_ask_ai', { defaultValue: 'Ask AI' })}
+                </button>
+              )}
               {onAddToBOQ && (
                 <button
                   type="button"
@@ -4794,7 +5298,14 @@ export function BIMViewer({
             </div>
           )}
 
-          {/* Tab bar */}
+          {/* Tab bar. Hidden in portal mode: the Links / Check / Match tabs all
+              surface internal-JWT-gated data a portal client cannot reach, and
+              the Match tab in particular auto-fetches `/v1/match/*` +
+              `/v1/costs/loaded-databases/` through the shared API client, whose
+              401 handler would hard-redirect the whole page to /login. Only the
+              read-only Properties (key) panel is shown; it renders entirely
+              from the skeleton element already loaded with the portal token. */}
+          {!portal && (
           <div className="flex border-b border-border-light shrink-0">
             {([
               ['key', t('bim.tab_properties', { defaultValue: 'Properties' })] as const,
@@ -4830,6 +5341,7 @@ export function BIMViewer({
               </button>
             ))}
           </div>
+          )}
 
           <div className="overflow-y-auto p-3 space-y-3 bg-white/40 dark:bg-white/5">
             {/* ── Tab: Properties (merged Key + All) ──────────────────── */}
@@ -5196,6 +5708,35 @@ export function BIMViewer({
                         <div className="text-[11px] text-content-secondary truncate" title={link.boq_position_description || ''}>
                           {link.boq_position_description || '—'}
                         </div>
+                        {(() => {
+                          // Money is serialised as a string over the wire even
+                          // though the type says number, so coerce defensively.
+                          const num = (v: number | null): number | null => {
+                            if (v == null) return null;
+                            const n = Number(v);
+                            return Number.isFinite(n) ? n : null;
+                          };
+                          const qty = num(link.boq_position_quantity);
+                          const rate = num(link.boq_position_unit_rate);
+                          const total = num(link.boq_position_total);
+                          if (rate == null && total == null) return null;
+                          return (
+                            <div className="mt-0.5 flex items-center gap-1.5 text-[10px] text-content-tertiary tabular-nums">
+                              {qty != null && (
+                                <span>
+                                  {qty}
+                                  {link.boq_position_unit ? ` ${link.boq_position_unit}` : ''}
+                                </span>
+                              )}
+                              {rate != null && <span>@ {rate.toLocaleString()}</span>}
+                              {total != null && (
+                                <span className="font-semibold text-content-secondary">
+                                  = {total.toLocaleString()}
+                                </span>
+                              )}
+                            </div>
+                          );
+                        })()}
                       </div>
                       {onUnlinkBOQ && (
                         <button

@@ -57,9 +57,9 @@ jobs:
       - name: Build frontend
         # The macOS arm64 runner OOMs the Vite/Rollup build with Node's
         # default heap (exit 134, "JavaScript heap out of memory"). Give it
-        # a 6 GB old-space ceiling; harmless on the roomier Linux/Windows runners.
+        # an 8 GB old-space ceiling; harmless on the roomier Linux/Windows runners.
         env:
-          NODE_OPTIONS: --max-old-space-size=6144
+          NODE_OPTIONS: --max-old-space-size=8192
         run: |
           cd frontend
           npm ci
@@ -89,8 +89,8 @@ jobs:
           mkdir -p desktop/src-tauri/binaries
           # onefile build: PyInstaller writes a single executable directly into
           # distpath, not a onedir subfolder.
-          cp "desktop/dist/openestimate-server${{ matrix.ext }}" \
-             "desktop/src-tauri/binaries/openestimate-server-${{ matrix.target }}${{ matrix.ext }}"
+          cp "desktop/dist/openconstructionerp-server${{ matrix.ext }}" \
+             "desktop/src-tauri/binaries/openconstructionerp-server-${{ matrix.target }}${{ matrix.ext }}"
 
       - name: Upload sidecar artifact
         uses: actions/upload-artifact@v4
@@ -128,9 +128,9 @@ jobs:
       - name: Build frontend
         # The macOS arm64 runner OOMs the Vite/Rollup build with Node's
         # default heap (exit 134, "JavaScript heap out of memory"). Give it
-        # a 6 GB old-space ceiling; harmless on the roomier Linux/Windows runners.
+        # an 8 GB old-space ceiling; harmless on the roomier Linux/Windows runners.
         env:
-          NODE_OPTIONS: --max-old-space-size=6144
+          NODE_OPTIONS: --max-old-space-size=8192
         run: |
           cd frontend
           npm ci

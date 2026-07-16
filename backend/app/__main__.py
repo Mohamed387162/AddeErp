@@ -1,8 +1,10 @@
+# DDC-CWICR-OE: DataDrivenConstruction · OpenConstructionERP
+# Copyright (c) 2026 Artem Boiko / DataDrivenConstruction
 """Entry point for PyInstaller / standalone execution.
 
 Usage:
     python -m app                    # Dev mode
-    openestimate-server.exe          # Production (PyInstaller bundle)
+    openconstructionerp-server.exe   # Production (PyInstaller bundle)
 """
 
 import multiprocessing

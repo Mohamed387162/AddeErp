@@ -1,3 +1,5 @@
+# DDC-CWICR-OE: DataDrivenConstruction · OpenConstructionERP
+# Copyright (c) 2026 Artem Boiko / DataDrivenConstruction
 """Cost-catalog vector adapter - feeds the ``oe_cost_items`` collection.
 
 Each :class:`~app.modules.costs.models.CostItem` row is embedded with the
@@ -264,7 +266,7 @@ async def _sql_lexical_search(
 
 
 class CostItemVectorAdapter:
-    """Embed CWICR / RSMeans / custom cost items into the unified store.
+    """Embed CWICR / regional-index / custom cost items into the unified store.
 
     Implements :class:`~app.core.vector_index.EmbeddingAdapter` so the
     generic helpers can use this adapter for cross-collection unified

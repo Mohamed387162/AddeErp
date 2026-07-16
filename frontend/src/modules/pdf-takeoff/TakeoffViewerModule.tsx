@@ -26,6 +26,7 @@ import {
   Trash2,
   Settings2,
   Info,
+  HelpCircle,
   Undo2,
   Redo2,
   Pencil,
@@ -91,6 +92,7 @@ import {
   presetScale,
   formatScaleRatio,
   toMeters,
+  fromMeters,
 } from './data/scale-helpers';
 import {
   type PageScales,
@@ -123,6 +125,7 @@ import {
   zoomAtCursorScroll,
   wheelZoomStep,
   orthoSnap,
+  orthoSnapVertexDrag,
   dropTrailingDuplicateVertex,
   snapToVertex,
   VERTEX_SNAP_SCREEN_PX,
@@ -157,6 +160,8 @@ import { replicateMeasurementsToPages } from '../../features/takeoff/lib/takeoff
 import { CalibrationDialog } from '../../features/takeoff/components/CalibrationDialog';
 import { ScaleAutoDetect } from '../../features/takeoff/components/ScaleAutoDetect';
 import { MeasurementLedger } from '../../features/takeoff/components/MeasurementLedger';
+import { CreateRfiFromMeasurementDialog } from '../../features/takeoff/components/CreateRfiFromMeasurementDialog';
+import { ReferencedInPanel } from '../../features/file-references/ReferencedInPanel';
 import {
   buildExportFilename,
   buildTakeoffPdf,
@@ -266,6 +271,12 @@ interface Measurement {
   height?: number; // Height for rectangle/highlight
   fillAlpha?: number; // Per-measurement fill opacity 0..1 (issue #311)
   strokeWidth?: number; // Per-measurement stroke width in CSS px (issue #312)
+  /** Per-measurement stroke width in canonical METRES (issue #339). When set
+   *  (and the page is calibrated) the band renders at the element's true width
+   *  via strokeWidthReal * pixelsPerUnit, so it stays consistent across pages at
+   *  different scales. Mutually exclusive with `strokeWidth`; round-trips via
+   *  metadata as ``stroke_width_real``. */
+  strokeWidthReal?: number;
   strokeAlpha?: number; // Per-measurement LINE opacity 0..1 for linear types (issue #332)
   /** True-surface slope / pitch factor for an AREA measurement (roofs, ramps):
    *  true surface qty = plan area x slopeFactor (>= 1). Undefined = 1 (flat). */
@@ -400,6 +411,11 @@ interface TakeoffViewerModuleProps {
   /** Open one of the recent documents in the viewer (parent owns navigation). */
   onOpenRecentDocument?: (docId: string) => void;
 }
+
+/** localStorage key for the dragged legend position (#358). A workspace
+ *  preference, like a panel size - kept out of the document so it never follows
+ *  the file to another user. */
+const LEGEND_POS_KEY = 'oe.takeoff.legend-pos';
 
 export default function TakeoffViewerModule({
   initialPdfUrl,
@@ -628,6 +644,16 @@ export default function TakeoffViewerModule({
    *  only flips the cursor + suppresses click-to-place. */
   const panRef = useRef<{ startX: number; startY: number; scrollLeft: number; scrollTop: number } | null>(null);
   const [panning, setPanning] = useState(false);
+  /** Primary-button canvas press in flight (down, not yet released). Scoped to
+   *  button 0: a non-primary press fires auxclick, never click, so keying this
+   *  on any button would let a middle-click disarm a guard a tool switch armed
+   *  (#356). */
+  const pressActiveRef = useRef(false);
+  /** The trailing click of the current press must not be treated as a
+   *  placement - armed when the tool changes mid-press, consumed by the next
+   *  handleCanvasClick (#356). Keyed on the press, not on dragRef, since Escape
+   *  can null dragRef mid-press while the click is still coming. */
+  const suppressNextClickRef = useRef(false);
   /** True while the Space bar is held - arms pan on the next mousedown and
    *  shows the grab cursor. Cleared on keyup / blur. */
   const [spaceHeld, setSpaceHeld] = useState(false);
@@ -672,6 +698,13 @@ export default function TakeoffViewerModule({
   // Measurement groups
   const [activeGroup, setActiveGroup] = useState('General');
   const [hiddenGroups, setHiddenGroups] = useState<Set<string>>(new Set());
+  // Per-measurement visibility (issue #359), keyed by measurement id. Parallel
+  // to hiddenGroups and honoured at every site group visibility is: a hidden
+  // measurement leaves the canvas, the snap pool, the hit-test, the legend
+  // count and the annotated PDF, but stays listed (dimmed) so it can be
+  // restored. View concern only - it never affects CSV/XLSX/BOQ or totals.
+  // Session-scoped, like hiddenGroups (not persisted).
+  const [hiddenMeasurements, setHiddenMeasurements] = useState<Set<string>>(new Set());
   const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(new Set());
   // Custom per-group colours (issue #313). Merged over the built-in colours so a
   // user-defined group paints in its chosen colour on the canvas, in the legend
@@ -730,6 +763,19 @@ export default function TakeoffViewerModule({
   // panel will replicate the selected measurement / its group onto. Cleared
   // after a copy and whenever the selection changes.
   const [copyTargetPages, setCopyTargetPages] = useState<Set<number>>(new Set());
+  // Line-width unit mode + edit buffer (issue #339). ``widthMode`` toggles the
+  // Line-width control between screen pixels and the drawing's real-world unit;
+  // ``widthDraft`` holds the in-progress text for the real-mode fields so typing
+  // is not renormalised on every keystroke (the canonical value stays in
+  // ``strokeWidthReal``, in metres). Seeded from the selection by an effect keyed
+  // only on the selection id, so re-selecting re-seeds but an unrelated edit does
+  // not clobber a half-typed value.
+  const [widthMode, setWidthMode] = useState<'px' | 'real'>('px');
+  const [widthDraft, setWidthDraft] = useState<{ m: string; ft: string; in: string }>({
+    m: '',
+    ft: '',
+    in: '',
+  });
 
   /* ── In-canvas editing (#194 Feature 1) ──────────────────────────────
    * Drag transient lives in a ref so mid-drag mousemove never triggers a
@@ -756,7 +802,18 @@ export default function TakeoffViewerModule({
     lastPoints: Point[];
   } | null>(null);
   const [dragPreview, setDragPreview] = useState<
-    { measurementId: string; points: Point[]; label: string; selfIntersecting: boolean } | null
+    {
+      measurementId: string;
+      points: Point[];
+      label: string;
+      selfIntersecting: boolean;
+      // The live recompute result (value / unit / area / width / height), so the
+      // completed-measurements pass can repoint the dragged band to the cursor
+      // and its value label stays in sync (#357). selfIntersecting also lives on
+      // this object (above), where the bowtie warning already reads it, so the
+      // patch is projected field-by-field into the render, never spread whole.
+      patch: ReturnType<typeof recomputeMeasurement>;
+    } | null
   >(null);
   /** The vertex most recently grabbed / hovered on the selected
    *  measurement, so Delete can remove a vertex (when valid) instead of
@@ -765,6 +822,27 @@ export default function TakeoffViewerModule({
 
   // Legend overlay visibility (bottom-left of canvas).
   const [showLegend, setShowLegend] = useState(true);
+  // Dragged legend position (#358), in px from the pinned wrapper's top-left;
+  // null keeps the default bottom-2 left-2 corner. Seeded from localStorage.
+  const [legendPos, setLegendPos] = useState<{ x: number; y: number } | null>(() => {
+    if (typeof window === 'undefined') return null;
+    try {
+      const raw = window.localStorage.getItem(LEGEND_POS_KEY);
+      if (raw) {
+        const p = JSON.parse(raw) as { x?: unknown; y?: unknown };
+        if (typeof p.x === 'number' && typeof p.y === 'number') return { x: p.x, y: p.y };
+      }
+    } catch {
+      /* ignore malformed / unavailable storage */
+    }
+    return null;
+  });
+  /** The pinned, non-scrolling wrapper the legend is positioned against (#358):
+   *  every drag coordinate and clamp bound is measured relative to it. */
+  const legendViewportRef = useRef<HTMLDivElement | null>(null);
+  const legendElRef = useRef<HTMLDivElement | null>(null);
+  const legendResizeObsRef = useRef<ResizeObserver | null>(null);
+  const legendDragRef = useRef<{ onMove: (e: MouseEvent) => void; onUp: () => void } | null>(null);
 
   // Export to BOQ state
   const [showExportDialog, setShowExportDialog] = useState(false);
@@ -793,6 +871,11 @@ export default function TakeoffViewerModule({
   // measurable, human-confirmed) measurements awaiting a target BOQ pick.
   // null = panel closed. Reuses the link-picker project/BOQ state above.
   const [bulkAddMeasurements, setBulkAddMeasurements] = useState<Measurement[] | null>(null);
+
+  // Cross-module linking (issue: takeoff -> Issue/RFI): the measurement the
+  // "Create RFI" dialog is open for, or null when closed. A measurement must
+  // be synced (have a serverId) to be linkable, so the openers gate on that.
+  const [rfiMeasurement, setRfiMeasurement] = useState<Measurement | null>(null);
 
   // Document persistence + server sync
   const [fileName, setFileName] = useState<string | null>(null);
@@ -1007,11 +1090,28 @@ export default function TakeoffViewerModule({
   // banner hidden rather than blocking the drawing.
   useEffect(() => {
     setNoTextLayer(null);
-    setNoTextBannerDismissed(false);
-    if (!initialPdfUrl) return;
+    if (!initialPdfUrl) {
+      setNoTextBannerDismissed(false);
+      return;
+    }
     const match = initialPdfUrl.match(/\/documents\/([^/?#]+)/);
     const docId = match?.[1];
-    if (!docId) return;
+    if (!docId) {
+      setNoTextBannerDismissed(false);
+      return;
+    }
+    // Restore a per-document dismissal (issue #346): a banner the user already
+    // closed for this drawing stays closed when the document is reopened,
+    // instead of resetting on every mount. Keyed by the stable document id,
+    // following the takeoff.groupColors.<id> idiom used in this component.
+    let dismissed = false;
+    try {
+      dismissed =
+        localStorage.getItem(`takeoff.ocrBannerDismissed.${decodeURIComponent(docId)}`) === 'true';
+    } catch {
+      /* ignore private-mode / quota read failures */
+    }
+    setNoTextBannerDismissed(dismissed);
     let cancelled = false;
     (async () => {
       try {
@@ -1188,42 +1288,55 @@ export default function TakeoffViewerModule({
     let activeTask: { cancel: () => void } | null = null;
 
     (async () => {
-      const page = await pdfDoc.getPage(currentPage);
-      if (cancelled) return;
-
-      const viewport = page.getViewport({ scale: zoom * window.devicePixelRatio });
-      const canvas = canvasRef.current!;
-      const ctx = canvas.getContext('2d')!;
-
-      canvas.width = viewport.width;
-      canvas.height = viewport.height;
-      canvas.style.width = `${viewport.width / window.devicePixelRatio}px`;
-      canvas.style.height = `${viewport.height / window.devicePixelRatio}px`;
-
-      if (overlayRef.current) {
-        overlayRef.current.width = viewport.width;
-        overlayRef.current.height = viewport.height;
-        overlayRef.current.style.width = canvas.style.width;
-        overlayRef.current.style.height = canvas.style.height;
-        overlayRef.current.getContext('2d')?.clearRect(0, 0, viewport.width, viewport.height);
-      }
-
-      const task = page.render({ canvasContext: ctx, viewport });
-      activeTask = task;
+      // Guard the whole render (getPage + page.render) in one try/catch.
+      // A rapid zoom or page-flip supersedes an in-flight render - pdf.js
+      // throws RenderingCancelledException, or "Cannot use the same canvas
+      // during multiple render() operations" - a page-flip mid-getPage
+      // rejects, and teardown aborts the worker. None of these are
+      // actionable. The old code rethrew every non-cancellation error out of
+      // this fire-and-forget IIFE, surfacing as "Uncaught (in promise)" in the
+      // console (and getPage at the top was unguarded entirely). The sibling
+      // PDF viewers (InlinePdfAnnotator / PunchPinBoard / PdfCompare) all
+      // swallow this; do the same - swallow, dev-only warn.
       try {
+        const page = await pdfDoc.getPage(currentPage);
+        if (cancelled) return;
+
+        const viewport = page.getViewport({ scale: zoom * window.devicePixelRatio });
+        const canvas = canvasRef.current!;
+        const ctx = canvas.getContext('2d')!;
+
+        canvas.width = viewport.width;
+        canvas.height = viewport.height;
+        canvas.style.width = `${viewport.width / window.devicePixelRatio}px`;
+        canvas.style.height = `${viewport.height / window.devicePixelRatio}px`;
+
+        if (overlayRef.current) {
+          overlayRef.current.width = viewport.width;
+          overlayRef.current.height = viewport.height;
+          overlayRef.current.style.width = canvas.style.width;
+          overlayRef.current.style.height = canvas.style.height;
+          overlayRef.current.getContext('2d')?.clearRect(0, 0, viewport.width, viewport.height);
+        }
+
+        const task = page.render({ canvasContext: ctx, viewport });
+        activeTask = task;
         await task.promise;
+        if (cancelled) return;
+        // Setting overlayRef.width/height above reset the overlay bitmap, wiping
+        // any measurements the draw effect painted while this render was
+        // suspended on getPage. Bump a nonce the draw effect depends on so it
+        // repaints over the freshly rendered page (issue #297); record that the
+        // main canvas now holds this page for the thumbnail downscale (#301).
+        mainRenderedPageRef.current = currentPage;
+        setRenderNonce((n) => n + 1);
       } catch (err: any) {
-        if (err?.name !== 'RenderingCancelledException') throw err;
-        return; // superseded render: the follow-up effect run repaints.
+        // Superseded/cancelled render or a teardown abort - expected, silent.
+        if (err?.name === 'RenderingCancelledException' || cancelled) return;
+        if (import.meta.env.DEV) {
+          console.warn('[takeoff] page render skipped:', err);
+        }
       }
-      if (cancelled) return;
-      // Setting overlayRef.width/height above reset the overlay bitmap, wiping
-      // any measurements the draw effect painted while this render was
-      // suspended on getPage. Bump a nonce the draw effect depends on so it
-      // repaints over the freshly rendered page (issue #297); record that the
-      // main canvas now holds this page for the thumbnail downscale (#301).
-      mainRenderedPageRef.current = currentPage;
-      setRenderNonce((n) => n + 1);
     })();
 
     return () => {
@@ -1345,7 +1458,13 @@ export default function TakeoffViewerModule({
      * the label remains legible regardless of theme.
      */
     const isDark = document.documentElement.classList.contains('dark');
-    const drawAnnotationLabel = (text: string, lx: number, ly: number, color: string) => {
+    const drawAnnotationLabel = (
+      text: string,
+      lx: number,
+      ly: number,
+      color: string,
+      alignRight = false,
+    ) => {
       // Names view toggle: the name badges (and the count badge, which carries
       // the running total) are the names layer and hide together (#314).
       if (!showLabels) return;
@@ -1356,7 +1475,13 @@ export default function TakeoffViewerModule({
       const padY = 2 * dpr;
       const boxW = metrics.width + padX * 2;
       const boxH = fontSize + padY * 2;
-      const bx = lx - padX;
+      // alignRight anchors the badge by its RIGHT edge and grows it leftward, so
+      // a name stacked over a right-aligned value label (a near-vertical line
+      // whose value sits left of the band, #355) extends away from the band
+      // instead of back across it. The box stays left-aligned internally, so it
+      // does not depend on the global ctx.textAlign the caller has restored.
+      const tx = alignRight ? lx - metrics.width : lx;
+      const bx = tx - padX;
       const by = ly - fontSize - padY;
       // Semi-transparent background — white in light mode, dark-grey in dark mode
       ctx.globalAlpha = 0.82;
@@ -1369,25 +1494,117 @@ export default function TakeoffViewerModule({
       ctx.strokeRect(bx, by, boxW, boxH);
       // Text
       ctx.fillStyle = color;
-      ctx.fillText(text, lx, ly - padY);
+      ctx.fillText(text, tx, ly - padY);
       // Restore line width
       ctx.lineWidth = 2 * dpr;
     };
 
+    /** Anchor a value label off the line it measures (issue #355).
+     *
+     * A distance / polyline can carry a real-world width (strokeWidthReal) and
+     * paint as a band tens of device px wide, so a fixed straight-up offset lands
+     * the text inside the band, in the band's own colour. Offset along the
+     * segment's up-facing unit normal instead, by half the painted band plus the
+     * caller's gap, and derive the text alignment from that normal so the text
+     * runs away from the line rather than back across it. originX/Y is the point
+     * the label sits by (a segment midpoint, or the first vertex for a polyline
+     * total); segA/segB are that segment's endpoints; all are device coords.
+     */
+    const placeLabel = (
+      originX: number,
+      originY: number,
+      segAx: number,
+      segAy: number,
+      segBx: number,
+      segBy: number,
+      gapPx: number,
+      bandHalfPx: number,
+    ): { lx: number; ly: number; align: CanvasTextAlign; baseline: CanvasTextBaseline } => {
+      let nx = -(segBy - segAy);
+      let ny = segBx - segAx;
+      const len = Math.hypot(nx, ny);
+      if (len < 1e-6) {
+        // Zero-length segment (nothing dedupes coincident vertices): no
+        // direction, so fall back to straight up instead of dividing by zero.
+        nx = 0;
+        ny = -1;
+      } else {
+        nx /= len;
+        ny /= len;
+        // Pick whichever of the two normals points up on screen (smaller y) so
+        // labels sit above their lines as they did before. This flips the side
+        // as a segment crosses vertical; the invariant that holds is that the
+        // text ends up outside the band in every case.
+        if (ny > 0) {
+          nx = -nx;
+          ny = -ny;
+        }
+      }
+      const off = bandHalfPx + gapPx;
+      return {
+        lx: originX + nx * off,
+        ly: originY + ny * off,
+        // Canvas text runs rightward from its anchor on its baseline, so a label
+        // left of a near-vertical band still runs back across it unless aligned:
+        // align right when the normal points left, centre when it is vertical.
+        align: nx < -0.01 ? 'right' : nx > 0.01 ? 'left' : 'center',
+        baseline: ny < -0.01 ? 'bottom' : ny > 0.01 ? 'top' : 'middle',
+      };
+    };
+
+    // The measurement being dragged, repointed to the live preview geometry so
+    // its band, fills, value label, per-segment labels, vertex dots and
+    // annotation all follow the cursor and there is only ever one band on screen
+    // (#357). Project the recompute patch field-by-field exactly like
+    // commitGeometryEdit does on release - never spread it, since it also carries
+    // selfIntersecting, which is not a Measurement field.
+    const previewMeasurement: Measurement | null = (() => {
+      if (!dragPreview) return null;
+      const base = measurements.find((mm) => mm.id === dragPreview.measurementId);
+      if (!base || base.page !== currentPage) return null;
+      const patch = dragPreview.patch;
+      return {
+        ...base,
+        points: dragPreview.points,
+        value: patch.value,
+        label: patch.label,
+        unit: patch.unit ?? base.unit,
+        ...(patch.area !== undefined ? { area: patch.area } : {}),
+        ...(patch.width !== undefined ? { width: patch.width } : {}),
+        ...(patch.height !== undefined ? { height: patch.height } : {}),
+      };
+    })();
+
     // Draw completed measurements on current page (respecting group visibility)
-    for (const m of measurements.filter((m) => m.page === currentPage && !hiddenGroups.has(m.group) && !(isAnnotationType(m.type) && hiddenGroups.has('__annotations__')))) {
+    for (const rawM of measurements.filter((m) => m.page === currentPage && !hiddenGroups.has(m.group) && !hiddenMeasurements.has(m.id) && !(isAnnotationType(m.type) && hiddenGroups.has('__annotations__')))) {
+      // Repoint the dragged measurement to its live geometry (#357); the rest of
+      // the loop then draws the band / labels / dots from the cursor position.
+      const m = previewMeasurement && previewMeasurement.id === rawM.id ? previewMeasurement : rawM;
       // A per-measurement colour (set via the properties swatch) wins over the
       // group default so a recoloured measurement paints in its chosen colour
       // (issue #299); annotation markups already resolve `m.color` below.
       const color = m.color || groupColorMap[m.group] || '#3B82F6';
       ctx.strokeStyle = color;
       ctx.fillStyle = color;
-      // Optional per-measurement stroke width (issue #312). Linear types honour
-      // it directly; annotation markups reset their own width below. Defaults
-      // to the 2px hairline so unset measurements render exactly as before.
-      // The width scales with zoom (issue #321) so the outline stays fixed
-      // relative to the geometry as the user zooms, matching document space.
-      ctx.lineWidth = (m.strokeWidth ?? 2) * dpr * zoom;
+      // Optional per-measurement stroke width (issues #312/#339). A real-world
+      // width (issue #339, canonical metres) wins when set and the measurement's
+      // OWN page is calibrated (pixelsPerUnit > 0): the band then renders at the
+      // element's true width via strokeWidthReal * pixelsPerUnit and stays
+      // consistent across pages calibrated at different scales. Otherwise the
+      // pixel width (issue #312) is used, defaulting to the 2px hairline so unset
+      // measurements render exactly as before. Linear types honour it directly;
+      // annotation markups reset their own width below. The width scales with
+      // zoom (issue #321) so the outline stays fixed relative to the geometry as
+      // the user zooms, matching document space.
+      const ownPixelsPerUnit = scaleForPage(pageScales, m.page).pixelsPerUnit;
+      const baseStrokeWidth =
+        m.strokeWidthReal != null && m.strokeWidthReal > 0 && ownPixelsPerUnit > 0
+          ? m.strokeWidthReal * ownPixelsPerUnit
+          : (m.strokeWidth ?? 2);
+      ctx.lineWidth = baseStrokeWidth * dpr * zoom;
+      // Half the painted band, in device px, used to push value labels clear of
+      // a wide real-world line so they are not drawn on top of it (issue #355).
+      const bandHalfPx = (baseStrokeWidth * dpr * zoom) / 2;
       // AI suggestions (#194) render translucent + dashed until the user
       // confirms them, so they read as proposals rather than committed work.
       ctx.globalAlpha = m.suggested ? 0.5 : 1.0;
@@ -1408,15 +1625,28 @@ export default function TakeoffViewerModule({
         ctx.stroke();
         ctx.globalAlpha = m.suggested ? 0.5 : 1;
         // Measurement value label (converted to the user's system; stored
-        // metric per D-TKC-016).
-        const mx = ((p0.x + p1.x) / 2) * dpr * zoom;
-        const my = ((p0.y + p1.y) / 2) * dpr * zoom - 8 * dpr;
+        // metric per D-TKC-016). Offset perpendicular to the line so a wide
+        // real-world band does not paint over it (issue #355).
+        const ax = p0.x * dpr * zoom;
+        const ay = p0.y * dpr * zoom;
+        const bx = p1.x * dpr * zoom;
+        const by = p1.y * dpr * zoom;
+        const place = placeLabel((ax + bx) / 2, (ay + by) / 2, ax, ay, bx, by, 8 * dpr, bandHalfPx);
         ctx.font = `${12 * dpr}px sans-serif`;
         // Values view toggle: the computed dimension text is the values layer,
         // hidden independently of the name badges (#314).
-        if (showDimensions) ctx.fillText(measurementLabel(m, scale, measurementSystem), mx, my);
-        // Annotation near midpoint (offset above the value label)
-        drawAnnotationLabel(m.annotation, mx, my - 14 * dpr, color);
+        if (showDimensions) {
+          ctx.textAlign = place.align;
+          ctx.textBaseline = place.baseline;
+          ctx.fillText(measurementLabel(m, scale, measurementSystem), place.lx, place.ly);
+          // Canvas text state is global; restore it before drawAnnotationLabel
+          // and every later branch, which all assume left-aligned alphabetic.
+          ctx.textAlign = 'left';
+          ctx.textBaseline = 'alphabetic';
+        }
+        // Annotation stacked above the value label (screen space), anchored to
+        // its far edge so a long name does not grow back over the band.
+        drawAnnotationLabel(m.annotation, place.lx, place.ly - 14 * dpr, color, place.align === 'right');
       }
 
       if (m.type === 'polyline' && m.points.length >= 2) {
@@ -1442,10 +1672,19 @@ export default function TakeoffViewerModule({
             const pb = m.points[i + 1]!;
             const segDist = pixelDistance(pa.x, pa.y, pb.x, pb.y);
             const segReal = toRealDistance(segDist, scale);
-            const smx = ((pa.x + pb.x) / 2) * dpr * zoom;
-            const smy = ((pa.y + pb.y) / 2) * dpr * zoom - 6 * dpr;
+            // Offset each segment label perpendicular to its own segment so it
+            // clears the band rather than sitting inside it (issue #355).
+            const sax = pa.x * dpr * zoom;
+            const say = pa.y * dpr * zoom;
+            const sbx = pb.x * dpr * zoom;
+            const sby = pb.y * dpr * zoom;
+            const place = placeLabel((sax + sbx) / 2, (say + sby) / 2, sax, say, sbx, sby, 6 * dpr, bandHalfPx);
             ctx.font = `${10 * dpr}px sans-serif`;
-            ctx.fillText(formatQuantity(segReal, 'm', measurementSystem), smx, smy);
+            ctx.textAlign = place.align;
+            ctx.textBaseline = place.baseline;
+            ctx.fillText(formatQuantity(segReal, 'm', measurementSystem), place.lx, place.ly);
+            ctx.textAlign = 'left';
+            ctx.textBaseline = 'alphabetic';
           }
         }
         // Draw points
@@ -1454,13 +1693,24 @@ export default function TakeoffViewerModule({
           ctx.arc(p.x * dpr * zoom, p.y * dpr * zoom, 3 * dpr, 0, Math.PI * 2);
           ctx.fill();
         }
-        // Total label near first point
+        // Total label near first point, offset along the first segment's normal
+        // (exactly one segment is incident there) so it clears the band (#355).
         const fp = m.points[0]!;
-        const totalLx = fp.x * dpr * zoom;
-        const totalLy = fp.y * dpr * zoom - 12 * dpr;
+        const sp = m.points[1]!;
+        const fax = fp.x * dpr * zoom;
+        const fay = fp.y * dpr * zoom;
+        const fbx = sp.x * dpr * zoom;
+        const fby = sp.y * dpr * zoom;
+        const total = placeLabel(fax, fay, fax, fay, fbx, fby, 12 * dpr, bandHalfPx);
         ctx.font = `${12 * dpr}px sans-serif`;
-        if (showDimensions) ctx.fillText(measurementLabel(m, scale, measurementSystem), totalLx, totalLy);
-        drawAnnotationLabel(m.annotation, totalLx, totalLy - 14 * dpr, color);
+        if (showDimensions) {
+          ctx.textAlign = total.align;
+          ctx.textBaseline = total.baseline;
+          ctx.fillText(measurementLabel(m, scale, measurementSystem), total.lx, total.ly);
+          ctx.textAlign = 'left';
+          ctx.textBaseline = 'alphabetic';
+        }
+        drawAnnotationLabel(m.annotation, total.lx, total.ly - 14 * dpr, color, total.align === 'right');
       }
 
       if ((m.type === 'area' || m.type === 'volume') && m.points.length >= 3) {
@@ -1809,6 +2059,16 @@ export default function TakeoffViewerModule({
         ctx.moveTo(sp0.x * dpr * zoom, sp0.y * dpr * zoom);
         ctx.lineTo(sp1.x * dpr * zoom, sp1.y * dpr * zoom);
         ctx.stroke();
+      } else if (scalePoints.length === 1 && liveCursor) {
+        // Live rubber-band from the first calibration point to the (possibly
+        // ortho-snapped) cursor so the pick is WYSIWYG (issue #343).
+        const sp0 = scalePoints[0]!;
+        ctx.beginPath();
+        ctx.setLineDash([4 * dpr, 4 * dpr]);
+        ctx.moveTo(sp0.x * dpr * zoom, sp0.y * dpr * zoom);
+        ctx.lineTo(liveCursor.x * dpr * zoom, liveCursor.y * dpr * zoom);
+        ctx.stroke();
+        ctx.setLineDash([]);
       }
     }
 
@@ -1823,7 +2083,17 @@ export default function TakeoffViewerModule({
       const selected = measurements.find(
         (m) => m.id === selectedMeasurementId && m.page === currentPage,
       );
-      if (selected) {
+      // Do not draw the edit overlay for a hidden measurement (#359): a hidden
+      // group or an individually hidden measurement should show no outline or
+      // handles. The selection is also cleared on hide, but this guard covers
+      // the case where something already hidden gets selected another way, and
+      // it fixes the pre-existing group-level version of the same bug too.
+      const selectedHidden =
+        !!selected &&
+        (hiddenGroups.has(selected.group) ||
+          hiddenMeasurements.has(selected.id) ||
+          (isAnnotationType(selected.type) && hiddenGroups.has('__annotations__')));
+      if (selected && !selectedHidden) {
         const preview = dragPreview?.measurementId === selected.id ? dragPreview : null;
         const pts = preview ? preview.points : selected.points;
         const accent = '#2563EB';
@@ -1909,7 +2179,12 @@ export default function TakeoffViewerModule({
           const ly = last.y * dpr * zoom - 10 * dpr;
           if (preview.label) {
             ctx.font = `bold ${12 * dpr}px sans-serif`;
-            const txt = preview.label;
+            // Route through measurementLabel so the readout reads in the user's
+            // unit system, matching the committed label. preview.label is the raw
+            // metric string, which would show an imperial user metres (#357).
+            const txt = previewMeasurement
+              ? measurementLabel(previewMeasurement, scale, measurementSystem)
+              : preview.label;
             const w = ctx.measureText(txt).width + 8 * dpr;
             ctx.fillStyle = isDark ? '#1e293b' : '#ffffff';
             ctx.globalAlpha = 0.9;
@@ -1969,7 +2244,7 @@ export default function TakeoffViewerModule({
       ctx.stroke();
       ctx.restore();
     }
-  }, [measurements, activePoints, currentPage, zoom, settingScale, scalePoints, activeTool, hiddenGroups, scale, annotationColor, rectStartPoint, isDraggingRect, selectedMeasurementId, dragPreview, liveCursor, panning, searchMatches, activeMatchIdx, measurementSystem, snapPoint, showLabels, showDimensions, renderNonce, groupColorMap]);
+  }, [measurements, activePoints, currentPage, zoom, settingScale, scalePoints, activeTool, hiddenGroups, hiddenMeasurements, scale, pageScales, annotationColor, rectStartPoint, isDraggingRect, selectedMeasurementId, dragPreview, liveCursor, panning, searchMatches, activeMatchIdx, measurementSystem, snapPoint, showLabels, showDimensions, renderNonce, groupColorMap]);
 
   /* ── Canvas click handler ────────────────────────────────────────── */
 
@@ -2041,6 +2316,11 @@ export default function TakeoffViewerModule({
 
   const handleTouchStart = useCallback(
     (e: React.TouchEvent<HTMLCanvasElement>) => {
+      // A mouse press that ended off-canvas can leave suppressNextClick set, and
+      // handleTouchEnd calls the placement handler directly (not via a browser
+      // click), so clear it here too or the next tap's placement is swallowed
+      // (#356).
+      suppressNextClickRef.current = false;
       if (e.touches.length === 2) {
         // Pinch start
         const t0 = e.touches[0]!;
@@ -2120,11 +2400,14 @@ export default function TakeoffViewerModule({
     for (const m of measurements) {
       if (m.page !== currentPage || m.suggested) continue;
       if (hiddenGroups.has(m.group)) continue;
+      // A hidden measurement's corners are not snappable either (#359): you
+      // cannot connect to a corner you cannot see.
+      if (hiddenMeasurements.has(m.id)) continue;
       if (isAnnotationType(m.type) && hiddenGroups.has('__annotations__')) continue;
       for (const p of m.points) out.push(p);
     }
     return out;
-  }, [measurements, currentPage, hiddenGroups]);
+  }, [measurements, currentPage, hiddenGroups, hiddenMeasurements]);
   const snapVerticesRef = useRef(snapVertices);
   snapVerticesRef.current = snapVertices;
   // handleCanvasDblClick is defined below handleCanvasClick, so the click path
@@ -2135,6 +2418,13 @@ export default function TakeoffViewerModule({
 
   const handleCanvasClick = useCallback(
     (e: React.MouseEvent<HTMLCanvasElement>) => {
+      // A press that began before the tool changed (a mid-press shortcut switch)
+      // must not place a point in the tool that replaced it (#356). Consume its
+      // trailing click, in the same shape as the pan guard below.
+      if (suppressNextClickRef.current) {
+        suppressNextClickRef.current = false;
+        return;
+      }
       // A pan gesture that ended on this element must not also place a point,
       // and in sticky pan mode (#316) a click never places one either.
       if (panRef.current || spaceHeldRef.current || panLockRef.current) return;
@@ -2163,7 +2453,11 @@ export default function TakeoffViewerModule({
         canVertexSnap && activePoints.length > 1
           ? [...snapVerticesRef.current, ...activePoints.slice(0, -1)]
           : snapVerticesRef.current;
-      const vsnap = vertexSnapRef.current && canVertexSnap
+      // While calibrating (settingScale) neither draw-path snap applies: the
+      // calibration pick has its own ortho below, and letting an in-progress
+      // measurement's vertices or ortho anchor hijack the scale click would
+      // corrupt the calibration (issue #343).
+      const vsnap = !settingScale && vertexSnapRef.current && canVertexSnap
         ? snapToVertex(point, snapPool, zoom, VERTEX_SNAP_SCREEN_PX)
         : null;
       if (vsnap) {
@@ -2185,6 +2479,7 @@ export default function TakeoffViewerModule({
           return;
         }
       } else if (
+        !settingScale &&
         (orthoLock || shiftHeldRef.current) &&
         activePoints.length > 0 &&
         (activeTool === 'distance' ||
@@ -2199,7 +2494,14 @@ export default function TakeoffViewerModule({
 
       // Setting scale mode (legacy meters-only dialog OR new calibration).
       if (settingScale) {
-        const newPoints = [...scalePoints, point];
+        // Square the second calibration point against the first when the ortho
+        // lock is engaged, so calibrating along a known horizontal / vertical
+        // dimension line is exact (issue #343). Matches the live preview line.
+        const calPoint =
+          scalePoints.length === 1 && (orthoLock || shiftHeldRef.current)
+            ? orthoSnap(scalePoints[0]!, point)
+            : point;
+        const newPoints = [...scalePoints, calPoint];
         setScalePoints(newPoints);
         if (newPoints.length === 2) {
           const np0 = newPoints[0]!;
@@ -2613,6 +2915,8 @@ export default function TakeoffViewerModule({
   currentPageRef.current = currentPage;
   const hiddenGroupsRef = useRef(hiddenGroups);
   hiddenGroupsRef.current = hiddenGroups;
+  const hiddenMeasurementsRef = useRef(hiddenMeasurements);
+  hiddenMeasurementsRef.current = hiddenMeasurements;
   const selectedMeasurementIdRef = useRef(selectedMeasurementId);
   selectedMeasurementIdRef.current = selectedMeasurementId;
 
@@ -2633,11 +2937,14 @@ export default function TakeoffViewerModule({
   const editableOnPage = useCallback((): Measurement[] => {
     const page = currentPageRef.current;
     const hidden = hiddenGroupsRef.current;
+    const hiddenM = hiddenMeasurementsRef.current;
     return measurementsRef.current.filter(
       (m) =>
         m.page === page &&
         !m.suggested &&
         !hidden.has(m.group) &&
+        // A hidden measurement stops intercepting clicks too (#359).
+        !hiddenM.has(m.id) &&
         !(isAnnotationType(m.type) && hidden.has('__annotations__')),
     );
   }, []);
@@ -2710,6 +3017,13 @@ export default function TakeoffViewerModule({
    *  design. */
   const handleCanvasMouseDown = useCallback(
     (e: React.MouseEvent<HTMLCanvasElement>) => {
+      // Track the primary press for the duration it is held (#356). A fresh
+      // press also clears any suppression left set by a previous press that
+      // ended off-canvas, so it cannot swallow this press's own click.
+      if (e.button === 0) {
+        pressActiveRef.current = true;
+        suppressNextClickRef.current = false;
+      }
       // Pan gesture: middle mouse (button 1) anywhere, or left-drag while the
       // Space bar is held. Works in any tool and is captured before tool logic
       // so it never places a measurement. The actual move + release are driven
@@ -2751,6 +3065,15 @@ export default function TakeoffViewerModule({
         if (!hit) continue;
 
         if (m.id !== selId) setSelectedMeasurementId(m.id);
+
+        // A reshape is about to be armed below. Drop the hover card now, or it
+        // stays frozen on top of the vertex being dragged: handleCanvasMouseMove
+        // returns early while dragRef is set, so it never refreshes the card's
+        // position during the drag (issue #353). Clearing it here rather than in
+        // that move branch is deliberate: dragRef is armed on this mousedown, so
+        // a press held (or pressed and released) without moving never reaches the
+        // move handler and would otherwise leave the card stranded.
+        setHoverInfo(null);
 
         if (hit.kind === 'vertex') {
           activeVertexRef.current = { measurementId: m.id, index: hit.index };
@@ -2816,11 +3139,42 @@ export default function TakeoffViewerModule({
       if (!drag) return;
       const cur = pointerToPdf(e);
       if (!cur) return;
+      // The ortho lock constrains edits too, not only drawing (issue #343):
+      // squaring an existing edge on a vertex drag, or sliding a whole
+      // measurement onto a 0 / 45 / 90 axis. Same trigger as the draw path.
+      const ortho = orthoLock || shiftHeldRef.current;
       let next: Point[];
       if (drag.mode === 'vertex') {
-        next = drag.origPoints.map((p, i) => (i === drag.vertexIndex ? cur : p));
+        // Square the dragged vertex against its neighbour edge(s). Closed shapes
+        // (area / volume / cloud) wrap around; open runs and the arrow anchor on
+        // the adjacent vertex only. A count is a single point and the rectangle /
+        // highlight boxes are two-corner, so neither has a vertex chain to square
+        // and both stay freehand.
+        const dm = measurementsRef.current.find((x) => x.id === drag.measurementId);
+        const dt = dm?.type;
+        const orthoVertex =
+          dt === 'distance' ||
+          dt === 'polyline' ||
+          dt === 'area' ||
+          dt === 'volume' ||
+          dt === 'cloud' ||
+          dt === 'arrow';
+        const vpt =
+          ortho && orthoVertex
+            ? orthoSnapVertexDrag(
+                drag.origPoints,
+                drag.vertexIndex,
+                cur,
+                dt === 'area' || dt === 'volume' || dt === 'cloud',
+              )
+            : cur;
+        next = drag.origPoints.map((p, i) => (i === drag.vertexIndex ? vpt : p));
       } else {
-        next = translatePoints(drag.origPoints, cur.x - drag.startPt.x, cur.y - drag.startPt.y);
+        // Constrain the whole-measurement move by snapping the translation
+        // VECTOR (anchored at the drag start), so the shape slides along an axis
+        // without being reshaped.
+        const tip = ortho ? orthoSnap(drag.startPt, cur) : cur;
+        next = translatePoints(drag.origPoints, tip.x - drag.startPt.x, tip.y - drag.startPt.y);
       }
       drag.moved = true;
       drag.lastPoints = next;
@@ -2833,9 +3187,12 @@ export default function TakeoffViewerModule({
         points: next,
         label: patch.label,
         selfIntersecting: Boolean(patch.selfIntersecting),
+        // Carry the recompute result so the render can repoint the band and its
+        // value label to the live geometry (#357), instead of discarding it.
+        patch,
       });
     },
-    [pointerToPdf],
+    [pointerToPdf, orthoLock],
   );
 
   /* ── Mouse move: edit drag, rect preview, live readout, hover ─────── */
@@ -2849,6 +3206,21 @@ export default function TakeoffViewerModule({
         return;
       }
       const pt = pointerToPdf(e);
+
+      // Calibration live preview (issue #343): while placing the second scale
+      // point, track the cursor (ortho-snapped against the first point when the
+      // lock is engaged) so the render rubber-bands the scale line and the pick
+      // is WYSIWYG. Calibration owns the cursor, so skip the measure-tool
+      // readout and hover below.
+      if (settingScale) {
+        if (pt && scalePoints.length === 1) {
+          const a = scalePoints[0]!;
+          setLiveCursor(orthoLock || shiftHeldRef.current ? orthoSnap(a, pt) : pt);
+        } else if (liveCursor) {
+          setLiveCursor(null);
+        }
+        return;
+      }
 
       if ((activeTool === 'rectangle' || activeTool === 'highlight' || activeTool === 'rectarea') && rectStartPoint) {
         if (!pt) return;
@@ -2923,7 +3295,7 @@ export default function TakeoffViewerModule({
         setHoverInfo(null);
       }
     },
-    [activeTool, rectStartPoint, pointerToPdf, handleEditDragMove, activePoints, orthoLock, liveCursor, editableOnPage, hoverInfo],
+    [activeTool, rectStartPoint, pointerToPdf, handleEditDragMove, activePoints, orthoLock, liveCursor, editableOnPage, hoverInfo, settingScale, scalePoints],
   );
 
   /** Clear the transient HUD / hover state when the pointer leaves the canvas. */
@@ -2933,7 +3305,10 @@ export default function TakeoffViewerModule({
     setSnapPoint((cur) => (cur ? null : cur));
   }, [liveCursor, hoverInfo]);
 
-  const handleCanvasMouseUp = useCallback(() => {
+  const handleCanvasMouseUp = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
+    // The primary press ended (#356). A release outside the canvas is caught by
+    // the window mouseup listener below instead.
+    if (e.button === 0) pressActiveRef.current = false;
     if (dragRef.current) finishDrag(true);
   }, [finishDrag]);
 
@@ -2955,7 +3330,10 @@ export default function TakeoffViewerModule({
       }
       if (dragRef.current) handleEditDragMove(e);
     };
-    const onUp = () => {
+    const onUp = (e: MouseEvent) => {
+      // Catches a primary release outside the canvas, where no React mouseup or
+      // click fires (#356).
+      if (e.button === 0) pressActiveRef.current = false;
       if (panRef.current) {
         panRef.current = null;
         setPanning(false);
@@ -3449,11 +3827,115 @@ export default function TakeoffViewerModule({
   /** Summaries for the color-coded legend overlay (bottom-left of canvas). */
   const legendSummaries = useMemo(
     () => computeGroupSummaries(
-      pageMeasurements.filter((m) => !hiddenGroups.has(m.group)),
+      pageMeasurements.filter((m) => !hiddenGroups.has(m.group) && !hiddenMeasurements.has(m.id)),
       groupColorMap,
     ),
-    [pageMeasurements, hiddenGroups, groupColorMap],
+    [pageMeasurements, hiddenGroups, hiddenMeasurements, groupColorMap],
   );
+
+  /* ── Draggable legend (#358) ─────────────────────────────────────── */
+
+  // Persist the position as a workspace preference; clear it on reset.
+  useEffect(() => {
+    try {
+      if (legendPos) window.localStorage.setItem(LEGEND_POS_KEY, JSON.stringify(legendPos));
+      else window.localStorage.removeItem(LEGEND_POS_KEY);
+    } catch {
+      /* ignore unavailable storage */
+    }
+  }, [legendPos]);
+
+  /** Clamp a position so the legend stays fully inside the wrapper on BOTH
+   *  bounds (a stored value can be negative; the wrapper resizes with the
+   *  sidebar / thumbnail-strip toggles, which never resize the window). */
+  const clampLegend = useCallback((pos: { x: number; y: number }) => {
+    const vp = legendViewportRef.current;
+    const el = legendElRef.current;
+    if (!vp || !el) return pos;
+    const vpRect = vp.getBoundingClientRect();
+    const elRect = el.getBoundingClientRect();
+    const maxX = Math.max(0, vpRect.width - elRect.width);
+    const maxY = Math.max(0, vpRect.height - elRect.height);
+    return {
+      x: Math.min(Math.max(0, pos.x), maxX),
+      y: Math.min(Math.max(0, pos.y), maxY),
+    };
+  }, []);
+
+  /** Re-clamp the current position, bailing out when it does not move so a
+   *  resize does not spin re-renders. */
+  const reclampLegend = useCallback(() => {
+    setLegendPos((cur) => {
+      if (!cur) return cur;
+      const c = clampLegend(cur);
+      return c.x === cur.x && c.y === cur.y ? cur : c;
+    });
+  }, [clampLegend]);
+
+  /** Tear down an in-flight legend drag - shared by mouseup, window blur, and
+   *  the legend unmounting mid-drag. */
+  const endLegendDrag = useCallback(() => {
+    const d = legendDragRef.current;
+    if (!d) return;
+    window.removeEventListener('mousemove', d.onMove);
+    window.removeEventListener('mouseup', d.onUp);
+    window.removeEventListener('blur', d.onUp);
+    legendDragRef.current = null;
+  }, []);
+
+  /** Stable ref callback for the legend box. Clamps the stored position as the
+   *  element attaches (it only mounts once there is something to list, so a
+   *  clamp keyed on the position alone would run while the legend is still
+   *  absent), and observes both the viewport and the legend so a resize
+   *  re-clamps it. It MUST be a stable useCallback, not an inline arrow: React
+   *  calls an inline ref with null on every re-render, and the legend re-renders
+   *  on every drag mousemove, so an inline ref would fire the unmount teardown
+   *  on the first pixel of movement and the legend would be undraggable. */
+  const attachLegend = useCallback((el: HTMLDivElement | null) => {
+    if (legendResizeObsRef.current) {
+      legendResizeObsRef.current.disconnect();
+      legendResizeObsRef.current = null;
+    }
+    legendElRef.current = el;
+    if (!el) {
+      // Unmount mid-drag (toolbar toggle, page change, last measurement gone):
+      // the window listeners would otherwise position a detached element.
+      endLegendDrag();
+      return;
+    }
+    const ro = new ResizeObserver(() => reclampLegend());
+    ro.observe(el);
+    const vp = legendViewportRef.current;
+    if (vp) ro.observe(vp);
+    legendResizeObsRef.current = ro;
+    reclampLegend();
+  }, [endLegendDrag, reclampLegend]);
+
+  /** Begin dragging the legend by its header. Listeners live on the window so
+   *  the drag survives the cursor leaving the small legend rectangle. */
+  const startLegendDrag = useCallback((e: React.MouseEvent<HTMLDivElement>) => {
+    if (e.button !== 0) return;
+    const el = legendElRef.current;
+    if (!legendViewportRef.current || !el) return;
+    e.preventDefault();
+    const elRect = el.getBoundingClientRect();
+    const grabX = e.clientX - elRect.left;
+    const grabY = e.clientY - elRect.top;
+    endLegendDrag(); // drop any stale gesture first
+    const onMove = (ev: MouseEvent) => {
+      const rect = legendViewportRef.current?.getBoundingClientRect();
+      if (!rect) return;
+      setLegendPos(clampLegend({ x: ev.clientX - rect.left - grabX, y: ev.clientY - rect.top - grabY }));
+    };
+    const onUp = () => endLegendDrag();
+    legendDragRef.current = { onMove, onUp };
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+    window.addEventListener('blur', onUp);
+  }, [clampLegend, endLegendDrag]);
+
+  /** Double-click the header to send the legend back to the default corner. */
+  const resetLegendPos = useCallback(() => setLegendPos(null), []);
 
   /** Currently-selected measurement object (null if nothing selected / target deleted). */
   const selectedMeasurement = useMemo(() => {
@@ -3478,6 +3960,120 @@ export default function TakeoffViewerModule({
       );
     },
     [selectedMeasurementId],
+  );
+
+  // Latest selected measurement in a ref so the width-seed effect can read it
+  // while depending ONLY on the selection id (issue #339). Depending on the
+  // object itself would re-seed - and clobber a half-typed real-width value - on
+  // every unrelated measurement change.
+  const selectedMeasurementRef = useRef(selectedMeasurement);
+  selectedMeasurementRef.current = selectedMeasurement;
+
+  // Seed the Line-width mode + draft from the selection (issue #339). Keyed ONLY
+  // on the selection id so switching selection re-seeds, but typing (which
+  // changes the measurement object, not its id) never re-runs this and
+  // renormalises the buffer mid-keystroke. A real width is decomposed into BOTH
+  // metres and feet+inches (via fromMeters) so either measurement system shows a
+  // value.
+  useEffect(() => {
+    // Read the metres value off the freshly-selected measurement (via the ref so
+    // this depends only on the id). No selection -> reset to px / empty.
+    const real = selectedMeasurementId
+      ? selectedMeasurementRef.current?.strokeWidthReal
+      : undefined;
+    if (real != null && real > 0) {
+      const totalInches = fromMeters(real, 'in');
+      const feet = Math.floor(fromMeters(real, 'ft'));
+      const inches = totalInches - feet * 12;
+      setWidthMode('real');
+      setWidthDraft({
+        m: String(Number(fromMeters(real, 'm').toFixed(4))),
+        ft: String(feet),
+        in: String(Number(inches.toFixed(4))),
+      });
+    } else {
+      setWidthMode('px');
+      setWidthDraft({ m: '', ft: '', in: '' });
+    }
+  }, [selectedMeasurementId]);
+
+  // Write a real-width draft (issue #339) back to the canonical strokeWidthReal
+  // (metres). Empty fields mean "unset" (undefined), never 0; NaN is guarded.
+  // Every write clears the pixel strokeWidth so the two stay mutually exclusive.
+  // Reuses toMeters for the ft/in and metre maths (no new conversion code).
+  const applyRealWidthFromDraft = useCallback(
+    (draft: { m: string; ft: string; in: string }) => {
+      let meters: number | undefined;
+      if (measurementSystem === 'imperial') {
+        const ftEmpty = draft.ft.trim() === '';
+        const inEmpty = draft.in.trim() === '';
+        if (ftEmpty && inEmpty) {
+          meters = undefined;
+        } else {
+          const ft = parseFloat(draft.ft);
+          const inch = parseFloat(draft.in);
+          const combined =
+            toMeters(Number.isFinite(ft) ? ft : 0, 'ft') +
+            toMeters(Number.isFinite(inch) ? inch : 0, 'in');
+          meters = combined > 0 ? combined : undefined;
+        }
+      } else if (draft.m.trim() === '') {
+        meters = undefined;
+      } else {
+        const v = parseFloat(draft.m);
+        meters = Number.isFinite(v) && v > 0 ? toMeters(v, 'm') : undefined;
+      }
+      updateSelectedMeasurement(
+        meters === undefined
+          ? { strokeWidthReal: undefined }
+          : { strokeWidthReal: meters, strokeWidth: undefined },
+      );
+    },
+    [measurementSystem, updateSelectedMeasurement],
+  );
+
+  // Switch the Line-width control between px and the real unit (issue #339).
+  // Converts the current width across the boundary using the SELECTED
+  // measurement's own page scale so the band keeps its on-screen size:
+  // px -> metres divides by pixelsPerUnit; metres -> px multiplies (rounded,
+  // clamped 1..100). Guards an uncalibrated page (pixelsPerUnit <= 0) so there is
+  // no divide-by-zero. Writes stay mutually exclusive (one width clears the other).
+  const handleWidthUnitChange = useCallback(
+    (next: 'px' | 'real') => {
+      const m = selectedMeasurement;
+      if (!m) return;
+      const pixelsPerUnit = scaleForPage(pageScales, m.page).pixelsPerUnit;
+      if (next === 'real') {
+        if (pixelsPerUnit > 0) {
+          const meters = (m.strokeWidth ?? 2) / pixelsPerUnit;
+          const totalInches = fromMeters(meters, 'in');
+          const feet = Math.floor(fromMeters(meters, 'ft'));
+          const inches = totalInches - feet * 12;
+          setWidthDraft({
+            m: String(Number(fromMeters(meters, 'm').toFixed(4))),
+            ft: String(feet),
+            in: String(Number(inches.toFixed(4))),
+          });
+          updateSelectedMeasurement({ strokeWidthReal: meters, strokeWidth: undefined });
+        } else {
+          // Not calibrated: cannot derive metres from px. Enter real mode with an
+          // empty buffer; the "not calibrated" hint prompts the user to calibrate.
+          setWidthDraft({ m: '', ft: '', in: '' });
+        }
+        setWidthMode('real');
+      } else {
+        const meters = m.strokeWidthReal;
+        if (meters != null && meters > 0 && pixelsPerUnit > 0) {
+          const px = Math.min(100, Math.max(1, Math.round(meters * pixelsPerUnit)));
+          updateSelectedMeasurement({ strokeWidth: px, strokeWidthReal: undefined });
+        } else {
+          // No usable real width -> drop it and fall back to the default hairline.
+          updateSelectedMeasurement({ strokeWidthReal: undefined });
+        }
+        setWidthMode('px');
+      }
+    },
+    [selectedMeasurement, pageScales, updateSelectedMeasurement],
   );
 
   /** Rename the active custom group (issue #313): move its measurements and its
@@ -3534,6 +4130,26 @@ export default function TakeoffViewerModule({
       }
       return next;
     });
+  }, []);
+
+  /** Toggle visibility of a single measurement (issue #359). View-only, like
+   *  the group eye: it never touches quantities or exports to CSV/XLSX/BOQ. */
+  const toggleMeasurementVisibility = useCallback((id: string) => {
+    // Read the pre-toggle state before flipping it, so we know whether this is
+    // a hide (was visible) or a show (was hidden).
+    const wasHidden = hiddenMeasurementsRef.current.has(id);
+    setHiddenMeasurements((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) {
+        next.delete(id);
+      } else {
+        next.add(id);
+      }
+      return next;
+    });
+    // Hiding the selected measurement clears the selection, so the select-tool
+    // edit overlay stops drawing handles over a now-hidden shape.
+    if (!wasHidden) setSelectedMeasurementId((cur) => (cur === id ? null : cur));
   }, []);
 
   /** Toggle collapse of a measurement group in sidebar */
@@ -3668,6 +4284,7 @@ export default function TakeoffViewerModule({
         pdfDoc,
         measurements,
         hiddenGroups,
+        hiddenMeasurements,
         scale,
         groupColorMap,
         projectName: exportProjectName,
@@ -3693,7 +4310,7 @@ export default function TakeoffViewerModule({
     } finally {
       setIsExportingPdf(false);
     }
-  }, [pdfDoc, measurements, hiddenGroups, scale, exportProjectName, addToast, t, measurementSystem, groupColorMap]);
+  }, [pdfDoc, measurements, hiddenGroups, hiddenMeasurements, scale, exportProjectName, addToast, t, measurementSystem, groupColorMap]);
 
   /** Export measurements + summary to an .xlsx workbook. */
   const handleExportExcel = useCallback(async () => {
@@ -4753,6 +5370,31 @@ export default function TakeoffViewerModule({
     setSelectedMeasurementId(m.id);
   }, [currentPage, totalPages]);
 
+  /* ── Cross-module linking (takeoff -> RFI) ───────────────────────────
+   * Open the "Create RFI from measurement" dialog. A measurement can only
+   * be the "file" side of a cross-entity reference once it has synced (it
+   * needs a durable serverId), so an unsynced row is bounced with a hint to
+   * save first rather than silently failing. */
+  const openRfiForMeasurement = useCallback(
+    (m: Measurement) => {
+      if (!m.serverId) {
+        addToast({
+          type: 'info',
+          title: t('takeoff_crosslink.save_first', {
+            defaultValue: 'Save the measurement first',
+          }),
+          message: t('takeoff_crosslink.save_first_msg', {
+            defaultValue:
+              'This measurement has not synced yet. Save it, then create the RFI.',
+          }),
+        });
+        return;
+      }
+      setRfiMeasurement(m);
+    },
+    [addToast, t],
+  );
+
   /* ── Ledger → BOQ actions ─────────────────────────────────────────── */
 
   /** Per-row "Add to BOQ" from the Ledger tab. Reuses the inline link
@@ -5131,15 +5773,34 @@ export default function TakeoffViewerModule({
 
   /** Unified tool-switch logic (shared between toolbar buttons + shortcuts). */
   const selectTool = useCallback((tool: MeasureTool) => {
+    // Only react to an ACTUAL tool change (#356). V maps to select, so pressing
+    // it during a select-tool drag must not cancel the edit; and it is the
+    // change of tool that makes a trailing click land in a different tool.
+    if (tool !== activeTool) {
+      // Abandon an in-flight vertex/shape edit rather than committing it at a
+      // position the canvas stopped showing the instant the tool changed. Same
+      // no-undo-frame abandon path Escape uses.
+      if (dragRef.current) finishDrag(false);
+      // Suppress the click this held press will still emit on release, so it is
+      // not consumed as a placement by the tool just selected. Keyed on the
+      // live press, not on dragRef (Escape can null dragRef mid-press).
+      if (pressActiveRef.current) suppressNextClickRef.current = true;
+    }
     setActiveTool(tool);
     setActivePoints([]);
     setRectStartPoint(null);
     setIsDraggingRect(false);
     setShowTextInput(false);
+    // Switching tools also cancels an in-progress two-click calibration pick,
+    // mirroring the Escape handler. Without this the calibration stays armed
+    // and its click branch eats the next click on the newly selected tool (#344).
+    setSettingScale(false);
+    setCalibrationMode(false);
+    setScalePoints([]);
     if (isAnnotationTool(tool)) {
       setAnnotationColor(DEFAULT_ANNOTATION_COLORS[tool]);
     }
-  }, []);
+  }, [activeTool, finishDrag]);
 
   /** Keyboard shortcuts: per-tool letters, Ctrl+Z/Y redo/undo, Esc cancel,
    *  Space (pan), Shift (ortho lock), Shift+1/2/3 (fit width / page /
@@ -5351,6 +6012,17 @@ export default function TakeoffViewerModule({
       shiftHeldRef.current = false;
       spaceHeldRef.current = false;
       setSpaceHeld(false);
+      // A button released in another application delivers no mouseup to this
+      // window, so tear down every in-flight gesture keyed on a held button
+      // (#356). Each is independent and any of them can be armed at once, so do
+      // not return early between them.
+      if (dragRef.current) finishDrag(false); // abandon, no undo frame (like Escape)
+      if (panRef.current) {
+        panRef.current = null;
+        setPanning(false); // leave panLock alone: it is a mode, not a gesture
+      }
+      pressActiveRef.current = false;
+      suppressNextClickRef.current = false;
     };
     window.addEventListener('keydown', handler);
     window.addEventListener('keyup', upHandler);
@@ -5417,7 +6089,7 @@ export default function TakeoffViewerModule({
   ];
 
   return (
-    <div className="relative space-y-4">
+    <div className="relative flex flex-1 min-h-0 flex-col space-y-4">
       {/* Decorative field-surveyor geometry — rectangles and polylines
           like what an estimator drags across a drawing to measure
           area or perimeter.  Very low opacity, behind everything,
@@ -5707,14 +6379,13 @@ export default function TakeoffViewerModule({
 
       {/* Viewer + Sidebar (PDF on the left, Measurements panel on the right) */}
       {pdfDoc && (
-        <div className="flex gap-4 min-w-0">
+        <div className="flex flex-1 min-h-0 gap-4 min-w-0">
           {/* Page thumbnails strip - only for multi-page sets and when toggled
               on. Click a thumbnail to jump; the current page is ringed; a badge
               shows that page's measurement count. */}
           {totalPages > 1 && showThumbnails && (
             <div
-              className="w-32 shrink-0 overflow-y-auto rounded-lg border border-border bg-surface-primary p-2 space-y-2"
-              style={{ maxHeight: 'calc(100vh - 396px)' }}
+              className="w-32 shrink-0 min-h-0 overflow-y-auto rounded-lg border border-border bg-surface-primary p-2 space-y-2"
               data-testid="thumbnail-strip"
             >
               {Array.from({ length: totalPages }, (_, i) => i + 1).map((n) => (
@@ -5754,13 +6425,13 @@ export default function TakeoffViewerModule({
             </div>
           )}
           {/* Left: PDF + Toolbar */}
-          <div className="flex-1 min-w-0 space-y-2">
+          <div className="flex flex-1 min-w-0 min-h-0 flex-col space-y-2">
             {/* Toolbar - two grouped rows so every control stays visible
                 without a horizontal scrollbar. Row 1 = navigate + view +
                 document actions; row 2 = scale + drawing tools. Related
                 controls sit in soft "segmented" tracks instead of being
                 separated by hairline dividers. */}
-            <div className="flex flex-col gap-1.5 rounded-lg border border-border bg-surface-primary p-1.5 shadow-xs">
+            <div className="flex shrink-0 flex-col gap-1.5 rounded-lg border border-border bg-surface-primary p-1.5 shadow-xs">
               <div className="flex items-center gap-1 flex-wrap">
               {/* Page nav - prev / jump / next in one segmented track. */}
               <div className={TB_GROUP}>
@@ -6179,7 +6850,7 @@ export default function TakeoffViewerModule({
 
               {/* Measure tools - one segmented track, icon-only with tooltips
                   + shortcut letters; the armed tool gets the blue accent. */}
-              <div className={TB_GROUP} role="group" aria-label={t('takeoff_viewer.measure_tools', { defaultValue: 'Measure tools' })}>
+              <div className={TB_GROUP} role="group" aria-label={t('takeoff_viewer.measure_tools', { defaultValue: 'Measure tools' })} data-guide="takeoff-tools">
                 {([
                   { tool: 'select' as MeasureTool, icon: MousePointer2, label: t('takeoff_viewer.tool_select', { defaultValue: 'Select' }) },
                   { tool: 'distance' as MeasureTool, icon: Minus, label: t('takeoff_viewer.tool_distance', { defaultValue: 'Distance' }) },
@@ -6336,7 +7007,19 @@ export default function TakeoffViewerModule({
                 </div>
                 <button
                   type="button"
-                  onClick={() => setNoTextBannerDismissed(true)}
+                  onClick={() => {
+                    setNoTextBannerDismissed(true);
+                    // Remember the dismissal for this document so it does not
+                    // reappear on the next open (issue #346). Local-only files
+                    // (no document id) stay session-only.
+                    if (documentId) {
+                      try {
+                        localStorage.setItem(`takeoff.ocrBannerDismissed.${documentId}`, 'true');
+                      } catch {
+                        /* ignore quota / private-mode failures */
+                      }
+                    }
+                  }}
                   className="shrink-0 rounded p-0.5 text-amber-700 hover:bg-amber-100 dark:text-amber-300 dark:hover:bg-amber-900/40"
                   aria-label={t('takeoff.needs_ocr_banner_dismiss', { defaultValue: 'Dismiss' })}
                 >
@@ -6345,24 +7028,39 @@ export default function TakeoffViewerModule({
               </div>
             )}
 
+            {/* Non-scrolling positioning context for the canvas chrome (#354).
+                The legend, tool hints, calibration banner, suggestion pill and
+                draw readout are pinned here, to the visible canvas, instead of
+                inside the scroll container where they were children of the
+                scrolled content and rode the drawing off screen. The wrapper
+                takes the container's slot in the canvas column (flex-1 + the
+                fixed min-h-[320px] floor) and passes it straight through, so the
+                container's own classes stay untouched and the definite-height
+                chain fit-to-page depends on (#306/#341) is intact. The hover
+                card and the text-annotation input stay INSIDE the container:
+                both are placed in canvas coordinates and must track the drawing. */}
+            <div
+              ref={legendViewportRef}
+              className="relative flex flex-1 min-w-0 min-h-[320px] flex-col"
+            >
             {/* Canvas — the PDF render surface is a genuinely-needed internal
                 scroll region (drawings are far larger than any viewport).
-                The cap must match the height actually left over after the
-                page chrome the parent column does NOT subtract: header (52)
-                + main pt-6/pb-4 (40) + takeoff tabs bar (~56) + module
-                spacing + toolbar (~80, two rows) + bottom Documents
-                filmstrip (~175). The old `100vh - 280px` under-reserved by
-                ~80px, so the canvas + right sidebar pushed the workspace past
-                the fixed-height column and forced a second scrollbar. This is a
-                definite height, not a max-height: fit-to-page reads the
-                container clientHeight, so a content-sized box let every fit
-                measure the height the previous fit had just produced and zoom
-                out again on each click (#306). A minHeight keeps it usable on
-                very short viewports. */}
+                `flex-1` makes it claim the height left over in the canvas
+                column after the toolbar, so it grows and shrinks with the
+                viewport instead of the old hardcoded `100vh - 396px` math that
+                left the drawing boxed in when there was space to spare (#341).
+                The height stays DEFINITE because every ancestor up to the
+                page root is a flex item with `min-h-0`, so fit-to-page reads a
+                real clientHeight. The floor is a FIXED `min-h-[320px]` (not the
+                flex default `auto`): a fixed min-height still lets the box
+                shrink below its own canvas content, so the container never
+                grows with what it renders - that content-sized growth is what
+                made every fit re-measure the last fit's output and zoom out on
+                each click (#306) - and it keeps the surface usable on very
+                short viewports. */}
             <div
               ref={containerRef}
-              className="relative rounded-lg border border-border overflow-auto bg-gray-100 dark:bg-gray-900"
-              style={{ height: 'calc(100vh - 396px)', minHeight: '320px', maxWidth: '100%' }}
+              className="relative flex-1 min-h-[320px] max-w-full rounded-lg border border-border overflow-auto bg-gray-100 dark:bg-gray-900"
             >
               <canvas ref={canvasRef} className="block" />
               <canvas
@@ -6388,6 +7086,89 @@ export default function TakeoffViewerModule({
                 onTouchMove={handleTouchMove}
                 onTouchEnd={handleTouchEnd}
               />
+
+              {/* Hover tooltip and the text-annotation input STAY inside the
+                  scroll container: both are positioned in canvas coordinates and
+                  must travel with the drawing, unlike the pinned chrome below
+                  (#354). Hover tooltip on an existing measurement (select mode) -
+                  value, group and linked BOQ position. Offset from the cursor so
+                  it does not sit under the pointer; pointer-events disabled so it
+                  never eats the click. */}
+              {hoverInfo && hoverMeasurement && (
+                <div
+                  className="absolute z-20 max-w-[220px] rounded-md border border-border bg-surface-primary/95 dark:bg-gray-800/95 backdrop-blur-sm shadow-lg px-2.5 py-1.5 text-[11px] pointer-events-none"
+                  style={{ left: `${hoverInfo.x + 14}px`, top: `${hoverInfo.y + 14}px` }}
+                  data-testid="measurement-hover-tooltip"
+                >
+                  <div className="font-semibold text-content-primary truncate">
+                    {hoverMeasurement.annotation
+                      || (hoverMeasurement.label
+                        ? measurementLabel(hoverMeasurement, scale, measurementSystem)
+                        : hoverMeasurement.type)}
+                  </div>
+                  {hoverMeasurement.label && (
+                    <div className="tabular-nums text-content-secondary">
+                      {measurementLabel(hoverMeasurement, scale, measurementSystem)}
+                    </div>
+                  )}
+                  <div className="mt-0.5 flex items-center gap-1 text-content-tertiary">
+                    <span className="uppercase tracking-wide text-[10px]">
+                      {t('takeoff_viewer.tooltip_group', { defaultValue: 'Group' })}
+                    </span>
+                    <span>{hoverMeasurement.group || 'General'}</span>
+                  </div>
+                  <div className="mt-0.5 text-[10px]">
+                    {hoverMeasurement.linkedPositionOrdinal ? (
+                      <span className="text-emerald-600 dark:text-emerald-400 font-mono">
+                        {t('takeoff_viewer.tooltip_linked', {
+                          defaultValue: 'Linked to {{pos}}',
+                          pos: hoverMeasurement.linkedPositionOrdinal,
+                        })}
+                      </span>
+                    ) : (
+                      <span className="text-content-quaternary">
+                        {t('takeoff_viewer.tooltip_unlinked', { defaultValue: 'Not linked to a BOQ position' })}
+                      </span>
+                    )}
+                  </div>
+                </div>
+              )}
+              {/* Inline text input overlay for text annotation tool */}
+              {showTextInput && (
+                <div
+                  className="absolute z-10"
+                  style={{
+                    left: `${textInputPos.x * zoom}px`,
+                    top: `${textInputPos.y * zoom}px`,
+                  }}
+                >
+                  <input
+                    type="text"
+                    value={textInputValue}
+                    onChange={(e) => setTextInputValue(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') handleTextConfirm();
+                      if (e.key === 'Escape') {
+                        textInputCancellingRef.current = true;
+                        setShowTextInput(false);
+                        setTextInputValue('');
+                      }
+                    }}
+                    onBlur={() => {
+                      if (textInputCancellingRef.current) {
+                        textInputCancellingRef.current = false;
+                        return;
+                      }
+                      handleTextConfirm();
+                    }}
+                    autoFocus
+                    placeholder={t('takeoff_viewer.text_placeholder', { defaultValue: 'Type annotation text...' })}
+                    className="rounded border-2 bg-white/95 dark:bg-gray-800/95 px-2 py-1 text-sm font-medium outline-none shadow-lg min-w-[150px]"
+                    style={{ borderColor: annotationColor, color: annotationColor }}
+                  />
+                </div>
+              )}
+            </div>
 
               {/* Live drawing readout HUD - cursor coordinate + running
                   segment / cumulative length while a measure tool draws.
@@ -6430,49 +7211,6 @@ export default function TakeoffViewerModule({
                 </div>
               )}
 
-              {/* Hover tooltip on an existing measurement (select mode) -
-                  value, group and linked BOQ position. Offset from the cursor
-                  so it does not sit under the pointer; pointer-events disabled
-                  so it never eats the click. */}
-              {hoverInfo && hoverMeasurement && (
-                <div
-                  className="absolute z-20 max-w-[220px] rounded-md border border-border bg-surface-primary/95 dark:bg-gray-800/95 backdrop-blur-sm shadow-lg px-2.5 py-1.5 text-[11px] pointer-events-none"
-                  style={{ left: `${hoverInfo.x + 14}px`, top: `${hoverInfo.y + 14}px` }}
-                  data-testid="measurement-hover-tooltip"
-                >
-                  <div className="font-semibold text-content-primary truncate">
-                    {hoverMeasurement.annotation
-                      || (hoverMeasurement.label
-                        ? measurementLabel(hoverMeasurement, scale, measurementSystem)
-                        : hoverMeasurement.type)}
-                  </div>
-                  {hoverMeasurement.label && (
-                    <div className="tabular-nums text-content-secondary">
-                      {measurementLabel(hoverMeasurement, scale, measurementSystem)}
-                    </div>
-                  )}
-                  <div className="mt-0.5 flex items-center gap-1 text-content-tertiary">
-                    <span className="uppercase tracking-wide text-[10px]">
-                      {t('takeoff_viewer.tooltip_group', { defaultValue: 'Group' })}
-                    </span>
-                    <span>{hoverMeasurement.group || 'General'}</span>
-                  </div>
-                  <div className="mt-0.5 text-[10px]">
-                    {hoverMeasurement.linkedPositionOrdinal ? (
-                      <span className="text-emerald-600 dark:text-emerald-400 font-mono">
-                        {t('takeoff_viewer.tooltip_linked', {
-                          defaultValue: 'Linked to {{pos}}',
-                          pos: hoverMeasurement.linkedPositionOrdinal,
-                        })}
-                      </span>
-                    ) : (
-                      <span className="text-content-quaternary">
-                        {t('takeoff_viewer.tooltip_unlinked', { defaultValue: 'Not linked to a BOQ position' })}
-                      </span>
-                    )}
-                  </div>
-                </div>
-              )}
               {settingScale && (
                 <div
                   className="absolute top-2 left-2 bg-purple-500/90 text-white px-3 py-1.5 rounded-lg text-xs font-medium"
@@ -6547,41 +7285,6 @@ export default function TakeoffViewerModule({
                   )}
                 </div>
               )}
-              {/* Inline text input overlay for text annotation tool */}
-              {showTextInput && (
-                <div
-                  className="absolute z-10"
-                  style={{
-                    left: `${textInputPos.x * zoom}px`,
-                    top: `${textInputPos.y * zoom}px`,
-                  }}
-                >
-                  <input
-                    type="text"
-                    value={textInputValue}
-                    onChange={(e) => setTextInputValue(e.target.value)}
-                    onKeyDown={(e) => {
-                      if (e.key === 'Enter') handleTextConfirm();
-                      if (e.key === 'Escape') {
-                        textInputCancellingRef.current = true;
-                        setShowTextInput(false);
-                        setTextInputValue('');
-                      }
-                    }}
-                    onBlur={() => {
-                      if (textInputCancellingRef.current) {
-                        textInputCancellingRef.current = false;
-                        return;
-                      }
-                      handleTextConfirm();
-                    }}
-                    autoFocus
-                    placeholder={t('takeoff_viewer.text_placeholder', { defaultValue: 'Type annotation text...' })}
-                    className="rounded border-2 bg-white/95 dark:bg-gray-800/95 px-2 py-1 text-sm font-medium outline-none shadow-lg min-w-[150px]"
-                    style={{ borderColor: annotationColor, color: annotationColor }}
-                  />
-                </div>
-              )}
               {/* Cloud tool hint */}
               {activeTool === 'cloud' && activePoints.length > 0 && (
                 <div className="absolute top-2 left-2 bg-orange-500/90 text-white px-3 py-1.5 rounded-lg text-xs font-medium">
@@ -6590,23 +7293,44 @@ export default function TakeoffViewerModule({
               )}
 
               {/* Color-coded group legend — bottom-left, click row to toggle visibility. */}
-              {showLegend && legendSummaries.length > 0 && (
+              {/* Gate on the page having measurements at all, not on
+                  legendSummaries being non-empty (#359): the summaries already
+                  exclude hidden groups and hidden measurements, so hiding the
+                  last visible thing would otherwise unmount the legend and with
+                  it the only rows that can bring anything back. The row builder
+                  reconstructs a row for every group on the page regardless. */}
+              {showLegend && pageMeasurements.length > 0 && (
                 <div
+                  ref={attachLegend}
                   className={clsx(
-                    'absolute bottom-2 left-2 max-w-[240px] rounded-lg border border-border bg-surface-primary/95 dark:bg-gray-800/95 backdrop-blur-sm shadow-lg overflow-hidden',
+                    // Height cap (#358): flex column so the header stays pinned and
+                    // the rows scroll inside it, and the box can never grow its
+                    // header (the drag handle + close button) off the top.
+                    'absolute max-w-[240px] rounded-lg border border-border bg-surface-primary/95 dark:bg-gray-800/95 backdrop-blur-sm shadow-lg overflow-hidden flex flex-col max-h-[calc(50%-1rem)]',
+                    // Default corner when there is no dragged position (#358).
+                    legendPos === null && 'bottom-2 left-2',
                     // When a measurement/annotation tool is armed, let clicks pass through to the
                     // overlay canvas beneath — otherwise the legend swallows canvas clicks, the user
                     // sees no mark appear, and group-visibility toggles silently hide their work.
+                    // The draggable header re-enables pointer events below so it stays grabbable.
                     activeTool !== 'select' && 'pointer-events-none',
                   )}
+                  style={legendPos ? { left: `${legendPos.x}px`, top: `${legendPos.y}px` } : undefined}
                   data-testid="legend-overlay"
                 >
-                  <div className="flex items-center justify-between px-2.5 py-1.5 border-b border-border-light bg-surface-secondary/40">
+                  <div
+                    className="flex items-center justify-between px-2.5 py-1.5 border-b border-border-light bg-surface-secondary/40 shrink-0 cursor-move select-none pointer-events-auto"
+                    onMouseDown={startLegendDrag}
+                    onDoubleClick={resetLegendPos}
+                    data-testid="legend-drag-handle"
+                    title={t('takeoff_viewer.legend_drag_hint', { defaultValue: 'Drag to move, double-click to reset' })}
+                  >
                     <span className="text-[10px] font-bold uppercase tracking-widest text-content-tertiary">
                       {t('takeoff_viewer.legend', { defaultValue: 'Legend' })}
                     </span>
                     <button
                       type="button"
+                      onMouseDown={(e) => e.stopPropagation()}
                       onClick={() => setShowLegend(false)}
                       className="text-content-tertiary hover:text-content-primary transition-colors p-0.5"
                       aria-label={t('takeoff_viewer.hide_legend', { defaultValue: 'Hide legend' })}
@@ -6614,27 +7338,45 @@ export default function TakeoffViewerModule({
                       <X size={10} />
                     </button>
                   </div>
-                  <div className="py-1">
-                    {/* Always show hidden groups too, so users can restore them */}
+                  <div className="py-1 min-h-0 overflow-y-auto">
+                    {/* Always show every group on the page, hidden or not, so a
+                        hidden group (or a group whose measurements are all
+                        individually hidden) can still be restored (#359). */}
                     {(() => {
-                      // Merge: visible summaries from legendSummaries + placeholder rows for hiddenGroups that have measurements
                       const allGroupsOnPage = new Set<string>();
                       for (const m of pageMeasurements) allGroupsOnPage.add(m.group || 'General');
                       const visible = new Map(legendSummaries.map((s) => [s.name, s]));
                       const rows: Array<{ name: string; color: string; count: number; total: number; unit: string; hidden: boolean }> = [];
                       for (const name of Array.from(allGroupsOnPage).sort()) {
+                        // Derive hidden from hiddenGroups directly, never from a
+                        // group's absence in the summaries: a visible group whose
+                        // measurements are all individually hidden is absent too,
+                        // and treating that as a hidden GROUP would restore its
+                        // hidden count and wire its click to toggle a group that
+                        // was never hidden.
+                        const groupHidden = hiddenGroups.has(name);
                         const summary = visible.get(name);
-                        if (summary) {
+                        if (!groupHidden && summary) {
+                          // Visible group with visible measurements: the summary
+                          // already excludes hidden groups and hidden measurements.
                           rows.push({ ...summary, hidden: false });
                         } else {
-                          const items = pageMeasurements.filter((m) => (m.group || 'General') === name);
+                          // A hidden group shows its full content (dimmed) so it
+                          // can be restored; a visible-but-all-hidden group reads
+                          // as present with nothing visible in it. Filter by
+                          // hiddenMeasurements only when the group is not hidden.
+                          const items = pageMeasurements.filter(
+                            (m) =>
+                              (m.group || 'General') === name &&
+                              (groupHidden || !hiddenMeasurements.has(m.id)),
+                          );
                           rows.push({
                             name,
                             color: groupColorMap[name] || '#3B82F6',
                             count: items.length,
                             total: items.reduce((s, it) => s + it.value, 0),
                             unit: items.find((it) => it.unit)?.unit ?? '',
-                            hidden: true,
+                            hidden: groupHidden,
                           });
                         }
                       }
@@ -6686,8 +7428,10 @@ export default function TakeoffViewerModule({
 
           {/* Left-visually / DOM-first: Measurements panel. Collapsible for a
               larger drawing viewport; hiding it lets the flex-1 canvas column
-              take the full width (#315). */}
-          <div className={clsx('w-72 shrink-0 space-y-2', !showSidebar && 'hidden')}>
+              take the full width (#315). Stretches to the definite-height
+              viewer row (#341), so it scrolls internally with `overflow-y-auto`
+              + `min-h-0` rather than clipping a long measurement list. */}
+          <div className={clsx('w-72 shrink-0 space-y-2 overflow-y-auto min-h-0', !showSidebar && 'hidden')}>
             {/* Scale info */}
             <div className="rounded-md border border-border/80 bg-surface-primary/80 backdrop-blur-sm p-3 shadow-sm">
               <p className="text-[10px] font-bold uppercase tracking-widest text-content-tertiary mb-1">
@@ -6946,6 +7690,7 @@ export default function TakeoffViewerModule({
                   selectedMeasurementId={selectedMeasurementId}
                   onAddToBoq={handleLedgerAddToBoq}
                   onAddAllToBoq={handleLedgerAddAllToBoq}
+                  onCreateRfi={openRfiForMeasurement}
                 />
               </div>
             )}
@@ -6969,6 +7714,43 @@ export default function TakeoffViewerModule({
                     <X size={12} />
                   </button>
                 </div>
+
+                {/* Linked in - cross-module references for this measurement.
+                    Read-only chips; self-hides when the measurement has never
+                    synced (no serverId) or carries no links yet. */}
+                {selectedMeasurement.serverId && (
+                  <ReferencedInPanel
+                    projectId={activeProjectId || selectedProjectId || ''}
+                    fileKind="takeoff"
+                    fileId={selectedMeasurement.serverId}
+                    onChipClick={(ref) => {
+                      const openTab = (path: string) =>
+                        window.open(path, '_blank', 'noopener');
+                      switch (ref.target_type) {
+                        case 'rfi':
+                          openTab(`/rfi/${ref.target_id}`);
+                          break;
+                        case 'punch_item':
+                          openTab(`/punchlist?highlight=${ref.target_id}`);
+                          break;
+                        case 'task':
+                          openTab('/tasks');
+                          break;
+                        case 'boq_position':
+                          // The reference carries the position id, not the
+                          // owning BOQ id, so land on the BOQ list with the
+                          // position highlighted instead of guessing a boqId.
+                          openTab(`/boq?highlight=${ref.target_id}`);
+                          break;
+                        case 'ncr':
+                          openTab(`/ncr?highlight=${ref.target_id}`);
+                          break;
+                        default:
+                          break;
+                      }
+                    }}
+                  />
+                )}
 
                 {/* Group dropdown */}
                 <div>
@@ -7084,58 +7866,165 @@ export default function TakeoffViewerModule({
                   </div>
                 )}
 
-                {/* Line width (issue #312): distance and polyline runs render at a
-                    2px hairline; raise it so two near-identical lines (a footing
-                    and the stem wall above it) can be told apart. Unset = 2px. */}
+                {/* Line width (issues #312/#339): distance and polyline runs render
+                    at a 2px hairline; raise it so two near-identical lines (a footing
+                    and the stem wall above it) can be told apart. The unit select
+                    switches between screen pixels and the drawing's real-world unit
+                    (issue #339): a real width (metres, or feet + decimal inches) makes
+                    the band render at the element's TRUE width and stay consistent
+                    across pages calibrated at different scales. Unset = 2px. */}
                 {(selectedMeasurement.type === 'distance' ||
                   selectedMeasurement.type === 'polyline') && (
                   <div>
                     <label className="text-[10px] font-semibold text-content-tertiary flex items-center justify-between mb-0.5">
                       <span>{t('takeoff_viewer.prop_stroke_width', { defaultValue: 'Line width' })}</span>
-                      <span className="tabular-nums">{selectedMeasurement.strokeWidth ?? 2}px</span>
+                      <select
+                        value={widthMode}
+                        onChange={(e) => handleWidthUnitChange(e.target.value as 'px' | 'real')}
+                        className="rounded border border-border bg-surface-primary px-1 py-0.5 text-[10px] text-content-primary"
+                        data-testid="prop-width-unit"
+                      >
+                        <option value="px">{t('takeoff_viewer.width_unit_px', { defaultValue: 'px' })}</option>
+                        <option value="real">
+                          {measurementSystem === 'imperial'
+                            ? t('takeoff_viewer.width_unit_ftin', { defaultValue: 'ft + in' })
+                            : t('takeoff_viewer.width_unit_m', { defaultValue: 'm' })}
+                        </option>
+                      </select>
                     </label>
-                    <div className="flex items-center gap-2">
-                      <input
-                        type="range"
-                        min={1}
-                        max={50}
-                        step={1}
-                        value={Math.min(selectedMeasurement.strokeWidth ?? 2, 50)}
-                        onChange={(e) =>
-                          updateSelectedMeasurement({ strokeWidth: Number(e.target.value) })
-                        }
-                        className="flex-1"
-                        data-testid="prop-stroke-width"
-                      />
-                      {/* Numeric field so a width beyond the 50px slider can be typed
-                          for very wide elements like a continuous footing (issue #338);
-                          clamped to 1-100px. The slider value above is capped at its own
-                          max so the thumb stays valid when a larger width is typed here. */}
-                      <input
-                        type="number"
-                        min={1}
-                        max={100}
-                        step={1}
-                        value={selectedMeasurement.strokeWidth ?? 2}
-                        onChange={(e) => {
-                          const v = Number(e.target.value);
-                          if (!Number.isFinite(v) || v < 1) return;
-                          updateSelectedMeasurement({ strokeWidth: Math.min(100, Math.round(v)) });
-                        }}
-                        className="w-16 rounded border border-border bg-surface-primary px-1.5 py-1 text-xs text-content-primary tabular-nums"
-                        data-testid="prop-stroke-width-num"
-                      />
-                      {selectedMeasurement.strokeWidth != null && (
-                        <button
-                          type="button"
-                          onClick={() => updateSelectedMeasurement({ strokeWidth: undefined })}
-                          className="text-[10px] text-content-tertiary hover:text-content-primary underline"
-                          data-testid="prop-stroke-width-reset"
-                        >
-                          {t('takeoff_viewer.reset', { defaultValue: 'Reset' })}
-                        </button>
-                      )}
-                    </div>
+                    {widthMode === 'px' ? (
+                      <div className="flex items-center gap-2">
+                        <input
+                          type="range"
+                          min={1}
+                          max={50}
+                          step={1}
+                          value={Math.min(selectedMeasurement.strokeWidth ?? 2, 50)}
+                          onChange={(e) =>
+                            updateSelectedMeasurement({
+                              strokeWidth: Number(e.target.value),
+                              strokeWidthReal: undefined,
+                            })
+                          }
+                          className="flex-1"
+                          data-testid="prop-stroke-width"
+                        />
+                        {/* Numeric field so a width beyond the 50px slider can be typed
+                            for very wide elements like a continuous footing (issue #338);
+                            clamped to 1-100px. The slider value above is capped at its own
+                            max so the thumb stays valid when a larger width is typed here. */}
+                        <input
+                          type="number"
+                          min={1}
+                          max={100}
+                          step={1}
+                          value={selectedMeasurement.strokeWidth ?? 2}
+                          onChange={(e) => {
+                            const v = Number(e.target.value);
+                            if (!Number.isFinite(v) || v < 1) return;
+                            updateSelectedMeasurement({
+                              strokeWidth: Math.min(100, Math.round(v)),
+                              strokeWidthReal: undefined,
+                            });
+                          }}
+                          className="w-16 rounded border border-border bg-surface-primary px-1.5 py-1 text-xs text-content-primary tabular-nums"
+                          data-testid="prop-stroke-width-num"
+                        />
+                        {selectedMeasurement.strokeWidth != null && (
+                          <button
+                            type="button"
+                            onClick={() => updateSelectedMeasurement({ strokeWidth: undefined })}
+                            className="text-[10px] text-content-tertiary hover:text-content-primary underline"
+                            data-testid="prop-stroke-width-reset"
+                          >
+                            {t('takeoff_viewer.reset', { defaultValue: 'Reset' })}
+                          </button>
+                        )}
+                      </div>
+                    ) : (
+                      <div>
+                        <div className="flex items-center gap-2">
+                          {measurementSystem === 'imperial' ? (
+                            <>
+                              <input
+                                type="text"
+                                inputMode="decimal"
+                                value={widthDraft.ft}
+                                onChange={(e) => {
+                                  const nextDraft = { ...widthDraft, ft: e.target.value };
+                                  setWidthDraft(nextDraft);
+                                  applyRealWidthFromDraft(nextDraft);
+                                }}
+                                className="w-14 rounded border border-border bg-surface-primary px-1.5 py-1 text-xs text-content-primary tabular-nums"
+                                data-testid="prop-stroke-width-ft"
+                              />
+                              <span className="text-[10px] text-content-tertiary">
+                                {t('takeoff_viewer.width_unit_ft', { defaultValue: 'ft' })}
+                              </span>
+                              <input
+                                type="text"
+                                inputMode="decimal"
+                                value={widthDraft.in}
+                                onChange={(e) => {
+                                  const nextDraft = { ...widthDraft, in: e.target.value };
+                                  setWidthDraft(nextDraft);
+                                  applyRealWidthFromDraft(nextDraft);
+                                }}
+                                className="w-16 rounded border border-border bg-surface-primary px-1.5 py-1 text-xs text-content-primary tabular-nums"
+                                data-testid="prop-stroke-width-in"
+                              />
+                              <span className="text-[10px] text-content-tertiary">
+                                {t('takeoff_viewer.width_unit_in', { defaultValue: 'in' })}
+                              </span>
+                            </>
+                          ) : (
+                            <>
+                              <input
+                                type="text"
+                                inputMode="decimal"
+                                value={widthDraft.m}
+                                onChange={(e) => {
+                                  const nextDraft = { ...widthDraft, m: e.target.value };
+                                  setWidthDraft(nextDraft);
+                                  applyRealWidthFromDraft(nextDraft);
+                                }}
+                                className="w-20 rounded border border-border bg-surface-primary px-1.5 py-1 text-xs text-content-primary tabular-nums"
+                                data-testid="prop-stroke-width-m"
+                              />
+                              <span className="text-[10px] text-content-tertiary">
+                                {t('takeoff_viewer.width_unit_m', { defaultValue: 'm' })}
+                              </span>
+                            </>
+                          )}
+                          {selectedMeasurement.strokeWidthReal != null && (
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setWidthDraft({ m: '', ft: '', in: '' });
+                                updateSelectedMeasurement({ strokeWidthReal: undefined });
+                              }}
+                              className="text-[10px] text-content-tertiary hover:text-content-primary underline"
+                              data-testid="prop-stroke-width-real-reset"
+                            >
+                              {t('takeoff_viewer.reset', { defaultValue: 'Reset' })}
+                            </button>
+                          )}
+                        </div>
+                        {/* A real width only renders correctly once the page has a
+                            true scale; on an uncalibrated sheet pixelsPerUnit is the
+                            placeholder default, so warn the user to calibrate. */}
+                        {!pageIsCalibrated(pageScales, selectedMeasurement.page) && (
+                          <p
+                            className="mt-1 text-[10px] leading-tight text-amber-700 dark:text-amber-300"
+                            data-testid="prop-width-not-calibrated"
+                          >
+                            {t('takeoff_viewer.width_not_calibrated', {
+                              defaultValue: 'Calibrate this page to size the line in real-world units.',
+                            })}
+                          </p>
+                        )}
+                      </div>
+                    )}
                   </div>
                 )}
 
@@ -7653,9 +8542,13 @@ export default function TakeoffViewerModule({
                                 selectedMeasurementId === m.id
                                   ? 'bg-oe-blue/10 border border-oe-blue/40'
                                   : 'bg-surface-secondary/70 hover:bg-surface-secondary border border-transparent hover:border-border-light',
+                                // Dim a hidden measurement, keeping it listed so it
+                                // can be restored, the way hidden groups behave (#359).
+                                hiddenMeasurements.has(m.id) && 'opacity-50',
                               )}
                               data-testid="measurement-item"
                               data-selected={selectedMeasurementId === m.id}
+                              data-hidden={hiddenMeasurements.has(m.id)}
                             >
                               <div className="flex items-center gap-2 leading-tight">
                                 <span
@@ -7763,6 +8656,24 @@ export default function TakeoffViewerModule({
                                     }
                                   >
                                     <Link2 size={12} />
+                                  </button>
+                                  {/* Per-measurement visibility toggle (#359):
+                                      hide one measurement from the canvas without
+                                      moving it into its own group. View-only. */}
+                                  <button
+                                    onClick={(e) => { e.stopPropagation(); toggleMeasurementVisibility(m.id); }}
+                                    className="p-0.5 rounded text-content-tertiary hover:text-content-primary hover:bg-surface-secondary transition-colors shrink-0"
+                                    aria-label={hiddenMeasurements.has(m.id)
+                                      ? t('takeoff_viewer.show_measurement', { defaultValue: 'Show measurement' })
+                                      : t('takeoff_viewer.hide_measurement', { defaultValue: 'Hide measurement' })
+                                    }
+                                    title={hiddenMeasurements.has(m.id)
+                                      ? t('takeoff_viewer.show_measurement', { defaultValue: 'Show measurement' })
+                                      : t('takeoff_viewer.hide_measurement', { defaultValue: 'Hide measurement' })
+                                    }
+                                    data-testid="toggle-measurement-visibility"
+                                  >
+                                    {hiddenMeasurements.has(m.id) ? <EyeOff size={12} /> : <Eye size={12} />}
                                   </button>
                                   <button
                                     onClick={(e) => { e.stopPropagation(); deleteMeasurement(m.id); }}
@@ -8306,6 +9217,20 @@ export default function TakeoffViewerModule({
             </button>
             <button
               type="button"
+              onClick={() => {
+                const target = measurements.find((mm) => mm.id === contextMenu.measurementId);
+                setContextMenu(null);
+                if (target) openRfiForMeasurement(target);
+              }}
+              className="flex w-full items-center gap-2 px-3 py-1.5 text-start text-xs text-content-primary hover:bg-surface-secondary transition-colors"
+              role="menuitem"
+              data-testid="context-create-rfi"
+            >
+              <HelpCircle size={13} />
+              <span className="flex-1">{t('takeoff_crosslink.create_rfi', { defaultValue: 'Create RFI' })}</span>
+            </button>
+            <button
+              type="button"
               onClick={() => { deleteMeasurement(contextMenu.measurementId); setContextMenu(null); }}
               className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-xs text-semantic-error hover:bg-semantic-error-bg transition-colors"
               role="menuitem"
@@ -8317,6 +9242,18 @@ export default function TakeoffViewerModule({
             </button>
           </div>
         </div>
+      )}
+      {/* Create RFI from a measurement (cross-module link). Rendered fresh per
+          open so the prefilled fields initialise from the chosen measurement. */}
+      {rfiMeasurement && (
+        <CreateRfiFromMeasurementDialog
+          measurement={rfiMeasurement}
+          projectId={activeProjectId || selectedProjectId || ''}
+          documentId={documentId}
+          documentName={fileName}
+          onClose={() => setRfiMeasurement(null)}
+          onCreated={() => setRfiMeasurement(null)}
+        />
       )}
       {/* Volume depth input dialog */}
       {showVolumeDepthInput && (

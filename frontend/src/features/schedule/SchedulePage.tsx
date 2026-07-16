@@ -1,7 +1,9 @@
-import { useState, useMemo, useCallback, useRef, useEffect } from 'react';
+// DDC-CWICR-OE: DataDrivenConstruction · OpenConstructionERP
+// Copyright (c) 2026 Artem Boiko / DataDrivenConstruction
+import { Fragment, useState, useMemo, useCallback, useRef, useEffect } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
-import { useNavigate, useSearchParams } from 'react-router-dom';
+import { Link, useNavigate, useSearchParams } from 'react-router-dom';
 import {
   Calendar,
   CalendarDays,
@@ -25,6 +27,9 @@ import {
   TrendingUp,
   Layers,
   Table2,
+  Network,
+  ArrowRight,
+  ListPlus,
 } from 'lucide-react';
 import { Button, Card, Badge, Input, SkeletonTable, Breadcrumb, DismissibleInfo, IntroRichText, GanttChart as SVGGanttChart, ViewInBIMButton, ConfirmDialog, ModuleGuideButton } from '@/shared/ui';
 import { PageHeader } from '@/shared/ui/PageHeader';
@@ -47,6 +52,9 @@ import { ScheduleDelayPanel } from './ScheduleDelayPanel';
 import { ScheduleCodesPanel } from './ScheduleCodesPanel';
 import { ScheduleResourcePanel } from './ScheduleResourcePanel';
 import { ScheduleRealtimePanel } from './ScheduleRealtimePanel';
+import { DependencyEditor } from './DependencyEditor';
+import { ActivityGrid } from './ActivityGrid';
+import { WorkCalendarManager } from './WorkCalendarManager';
 import { scheduleGuide } from './scheduleGuide';
 import { fetchBIMModels } from '@/features/bim/api';
 import type {
@@ -1092,9 +1100,11 @@ function ScheduleDetail({
   const { confirm, ...confirmProps } = useConfirm();
   const [zoomLevel, setZoomLevel] = useState<ZoomLevel>('week');
   const [viewMode, setViewMode] = useState<
-    'table' | 'gantt' | 'evm' | '4d' | 'quality' | 'risk' | 'compare' | 'progress' | 'delay' | 'codes' | 'resources' | 'realtime' | 'interchange'
+    'table' | 'gantt' | 'evm' | '4d' | 'quality' | 'risk' | 'compare' | 'progress' | 'delay' | 'codes' | 'calendars' | 'resources' | 'realtime' | 'interchange'
   >('gantt');
   const [showAddActivity, setShowAddActivity] = useState(false);
+  // #348: activity whose dependency editor is open (click a Gantt bar to edit).
+  const [selectedActivityId, setSelectedActivityId] = useState<string | null>(null);
   const [showGenerateBOQ, setShowGenerateBOQ] = useState(false);
   const [selectedBOQId, setSelectedBOQId] = useState('');
   const [generateStartDate, setGenerateStartDate] = useState(
@@ -1349,6 +1359,12 @@ function ScheduleDetail({
     return map;
   }, [ganttData]);
 
+  // #348: the activity object backing the open dependency editor (or null).
+  const selectedActivity = useMemo(
+    () => ganttData?.activities.find((a) => a.id === selectedActivityId) ?? null,
+    [ganttData, selectedActivityId],
+  );
+
   // Filtered activities for the Gantt chart (Improvement #5)
   const filteredActivities = useMemo(() => {
     const activities = ganttData?.activities ?? [];
@@ -1433,6 +1449,7 @@ function ScheduleDetail({
             variant="secondary"
             icon={<FileBarChart size={16} />}
             onClick={() => setShowGenerateBOQ(true)}
+            data-guide="schedule-generate"
           >
             {t('schedule.generate_from_boq', 'Generate from BOQ')}
           </Button>
@@ -1451,6 +1468,7 @@ function ScheduleDetail({
                   { key: 'progress' as const, label: t('schedule.view_progress', { defaultValue: 'Progress' }) },
                   { key: 'delay' as const, label: t('schedule.view_delay', { defaultValue: 'Delay' }) },
                   { key: 'codes' as const, label: t('schedule.view_codes', { defaultValue: 'Codes' }) },
+                  { key: 'calendars' as const, label: t('schedule.calendar.view', { defaultValue: 'Calendars' }) },
                   { key: 'resources' as const, label: t('schedule.view_resources', { defaultValue: 'Resources' }) },
                   { key: 'realtime' as const, label: t('schedule.view_realtime', { defaultValue: 'Live' }) },
                   { key: 'interchange' as const, label: t('schedule.view_interchange', { defaultValue: 'Interchange' }) },
@@ -1470,10 +1488,11 @@ function ScheduleDetail({
                   </button>
                 ))}
               </div>
-              {/* Zoom only applies to the timeline views (table / gantt). */}
+              {/* Zoom only applies to the Gantt timeline; the Table view is a
+                  data grid with no timescale, so hide the zoom control there. */}
               <div
                 className={`flex items-center gap-1 rounded-lg border border-border-light p-0.5 ${
-                  viewMode !== 'table' && viewMode !== 'gantt' ? 'hidden' : ''
+                  viewMode !== 'gantt' ? 'hidden' : ''
                 }`}
               >
                 {(['day', 'week', 'month', 'quarter', 'year'] as const).map((level) => (
@@ -1498,6 +1517,7 @@ function ScheduleDetail({
                 onClick={() => calculateCPM.mutate()}
                 loading={calculateCPM.isPending}
                 title={t('schedule.cpm_tooltip', { defaultValue: 'Critical Path Method calculates the longest path through the project and identifies activities that cannot be delayed' })}
+                data-guide="schedule-cpm"
               >
                 {t('schedule.calculate_cpm', 'Critical Path')}
               </Button>
@@ -1506,6 +1526,7 @@ function ScheduleDetail({
                 icon={<ShieldAlert size={16} />}
                 onClick={() => fetchRiskAnalysis.mutate()}
                 loading={fetchRiskAnalysis.isPending}
+                data-guide="schedule-risk"
               >
                 {t('schedule.risk_analysis_btn', 'Risk Analysis')}
               </Button>
@@ -1728,6 +1749,8 @@ function ScheduleDetail({
               />
             ) : viewMode === 'codes' ? (
               <ScheduleCodesPanel scheduleId={schedule.id} projectId={projectId} />
+            ) : viewMode === 'calendars' ? (
+              <WorkCalendarManager projectId={projectId} />
             ) : viewMode === 'resources' ? (
               <ScheduleResourcePanel
                 scheduleId={schedule.id}
@@ -1752,6 +1775,16 @@ function ScheduleDetail({
                   showCriticalPath={!!cpmResult}
                   todayLine={true}
                   onActivityResize={handleActivityResize}
+                  onActivityClick={(id) => setSelectedActivityId(id)}
+                />
+              ) : viewMode === 'table' ? (
+                <ActivityGrid
+                  scheduleId={schedule.id}
+                  projectId={projectId}
+                  activities={filteredActivities}
+                  criticalActivityIds={criticalActivityIds}
+                  onEditDependencies={(id) => setSelectedActivityId(id)}
+                  onAddActivity={() => setShowAddActivity(true)}
                 />
               ) : (
                 <GanttChart
@@ -1917,6 +1950,34 @@ function ScheduleDetail({
             </Button>
           </div>
         </form>
+      </Modal>
+
+      {/* Edit dependencies Modal (#348) - opens when a Gantt bar is clicked */}
+      <Modal
+        open={!!selectedActivity}
+        onClose={() => setSelectedActivityId(null)}
+        title={t('schedule.edit_dependencies', { defaultValue: 'Edit dependencies' })}
+      >
+        {selectedActivity && (
+          <div className="space-y-4">
+            <div>
+              <p className="text-sm font-semibold text-content-primary">{selectedActivity.name}</p>
+              <p className="text-xs text-content-tertiary">
+                {formatDate(selectedActivity.start_date)} &ndash; {formatDate(selectedActivity.end_date)}
+              </p>
+            </div>
+            <DependencyEditor
+              scheduleId={schedule.id}
+              activity={selectedActivity}
+              activities={ganttData?.activities ?? []}
+            />
+            <div className="flex items-center justify-end pt-1">
+              <Button variant="ghost" type="button" onClick={() => setSelectedActivityId(null)}>
+                {t('common.done', { defaultValue: 'Done' })}
+              </Button>
+            </div>
+          </div>
+        )}
       </Modal>
 
       {/* Generate from BOQ Modal */}
@@ -2308,6 +2369,131 @@ function ProjectSchedules({
 
 /* ── Main Page ─────────────────────────────────────────────────────────── */
 
+/* ── How-it-works flow + module integrations ───────────────────────────── */
+
+/** A compact inline link to a sibling module (keeps the flow copy readable). */
+function ModLink({ to, children }: { to: string; children: React.ReactNode }) {
+  return (
+    <Link to={to} className="font-medium text-oe-blue-text hover:underline">
+      {children}
+    </Link>
+  );
+}
+
+/**
+ * One-glance explainer for the 4D Schedule: what it does and how it connects to
+ * the rest of the platform. The plan is generated from a priced BOQ, resourced
+ * with crews, sequenced with CPM, tracked against field progress and rolled up
+ * into the portfolio - so every connected module is a link.
+ */
+function HowScheduleWorks() {
+  const { t } = useTranslation();
+
+  const steps: { icon: React.ReactNode; title: string; desc: string }[] = [
+    {
+      icon: <CalendarDays size={14} className="text-oe-blue" />,
+      title: t('schedule.flow_1_title', { defaultValue: 'Create a schedule' }),
+      desc: t('schedule.flow_1_desc', {
+        defaultValue: 'Set up a programme for the project and give it a start date.',
+      }),
+    },
+    {
+      icon: <ListPlus size={14} className="text-oe-blue" />,
+      title: t('schedule.flow_2_title', { defaultValue: 'Add or generate activities' }),
+      desc: t('schedule.flow_2_desc', {
+        defaultValue: 'Add activities by hand or generate them straight from a BOQ.',
+      }),
+    },
+    {
+      icon: <GitBranch size={14} className="text-oe-blue" />,
+      title: t('schedule.flow_3_title', { defaultValue: 'Sequence & critical path' }),
+      desc: t('schedule.flow_3_desc', {
+        defaultValue: 'Link dependencies and run CPM to find the longest path and the float.',
+      }),
+    },
+    {
+      icon: <TrendingUp size={14} className="text-oe-blue" />,
+      title: t('schedule.flow_4_title', { defaultValue: 'Track progress' }),
+      desc: t('schedule.flow_4_desc', {
+        defaultValue: 'Update percent complete as work happens and compare plan against actual.',
+      }),
+    },
+    {
+      icon: <Box size={14} className="text-oe-blue" />,
+      title: t('schedule.flow_5_title', { defaultValue: 'Drive 4D on the model' }),
+      desc: t('schedule.flow_5_desc', {
+        defaultValue: 'Link activities to BIM elements to play back the build sequence in 4D.',
+      }),
+    },
+  ];
+
+  return (
+    <Card padding="md">
+      <h2 className="flex items-center gap-1.5 text-sm font-semibold text-content-primary">
+        <Network size={15} className="text-oe-blue" />
+        {t('schedule.flow_title', { defaultValue: 'How the 4D Schedule fits together' })}
+      </h2>
+      <p className="mt-1 text-xs text-content-tertiary">
+        {t('schedule.flow_intro', {
+          defaultValue:
+            'The schedule turns a priced estimate into a build timeline, then tracks it against what actually happens on site. This page is where that timeline is built.',
+        })}
+      </p>
+
+      <ol className="mt-3 flex flex-col gap-2 lg:flex-row lg:items-stretch">
+        {steps.map((s, i) => (
+          <Fragment key={s.title}>
+            <li className="flex-1 rounded-lg border border-border-light bg-surface-secondary/40 p-3">
+              <div className="flex items-center gap-2">
+                <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-oe-blue-subtle text-2xs font-bold text-oe-blue-text">
+                  {i + 1}
+                </span>
+                <span className="flex items-center gap-1 text-xs font-semibold text-content-primary">
+                  {s.icon}
+                  {s.title}
+                </span>
+              </div>
+              <p className="mt-1.5 text-2xs leading-relaxed text-content-tertiary">{s.desc}</p>
+            </li>
+            {i < steps.length - 1 && (
+              <li
+                aria-hidden="true"
+                className="hidden shrink-0 items-center self-center text-content-quaternary lg:flex"
+              >
+                <ArrowRight size={16} />
+              </li>
+            )}
+          </Fragment>
+        ))}
+      </ol>
+
+      <div className="mt-3 flex flex-col gap-1.5 border-t border-border-light pt-3 text-2xs text-content-tertiary sm:flex-row sm:flex-wrap sm:items-center sm:gap-x-5 sm:gap-y-1">
+        <span>
+          <span className="font-medium text-content-secondary">
+            {t('schedule.flow_pulls', { defaultValue: 'Pulls from:' })}
+          </span>{' '}
+          <ModLink to="/boq">{t('schedule.mod_boq', { defaultValue: 'BOQ' })}</ModLink> ·{' '}
+          <ModLink to="/resources">
+            {t('schedule.mod_resources', { defaultValue: 'Resources & crew' })}
+          </ModLink>
+        </span>
+        <span>
+          <span className="font-medium text-content-secondary">
+            {t('schedule.flow_feeds', { defaultValue: 'Feeds:' })}
+          </span>{' '}
+          <ModLink to="/field-reports">
+            {t('schedule.mod_field', { defaultValue: 'Field reports' })}
+          </ModLink>{' '}
+          ·{' '}
+          <ModLink to="/portfolio">
+            {t('schedule.mod_portfolio', { defaultValue: 'Portfolio' })}
+          </ModLink>
+        </span>
+      </div>
+    </Card>
+  );
+}
+
 export function SchedulePage() {
   const { t } = useTranslation();
   const navigate = useNavigate();
@@ -2420,6 +2606,9 @@ export function SchedulePage() {
 
       {/* Cross-module navigation — connects the planning value chain */}
       <PlanningCrossLinks active="schedule" />
+
+      {/* How this module works + what it connects to */}
+      <HowScheduleWorks />
 
       {isLoading ? (
         <SkeletonTable rows={3} columns={3} />
