@@ -68,6 +68,31 @@ DENY_PATTERNS = [
     r"(^|/)WORLD_[A-Z0-9_]*_INDEX\.md$",
     r"(^|/)[A-Z][A-Z0-9_]*_ACTIVATION\.md$",
     r"(^|/)INTEGRATION_GUIDE[^/]*\.md$",
+    # Provenance / watermark tooling and the integrity verifier are internal
+    # only - never public (they document the covert marker scheme). Kept
+    # locally, gitignored, blocked here across git tree, CI and wheel/dir.
+    r"(^|/)tools/watermark/",
+    r"(^|/)scripts/integrity_check\.py$",
+    # The public website is not part of the product repository. It is built
+    # and deployed on its own, and the source of truth is the live host, not
+    # this tree, so tracking it here only produced a copy that drifted.
+    r"(^|/)marketing-site/",
+    r"(^|/)website-marketing/",
+    # Documentation build helpers: internal tooling, not something a reader of
+    # the project is meant to run.
+    r"(^|/)docs/expand_docs\d*\.py$",
+    # Personal data must never enter this repository, which is public. The
+    # marketing host keeps its signup and enquiry captures as JSONL under
+    # /root/clawd, and exporting them for a mailing tool produces a CSV of
+    # real people. Those files are named here so that a working copy of one,
+    # or an export built from one, cannot be committed even by a pathless
+    # `git commit` during an unrelated sweep. The extension list is data
+    # formats only: `*_subscribers.py` is a notification handler and is not
+    # matched. Cost catalogues under data/catalog are unaffected.
+    r"(^|/)(demo-registrations|demo-tokens|newsletter-subscribers|license-requests"
+    r"|partner-applications|contact-requests|email-delivery-failures)[^/]*\.(jsonl|json|csv)$",
+    r"(^|/)[^/]*(subscribers?|mailing[_-]?list|newsletter|email[_-]?export"
+    r"|contacts?[_-]?export|leads?[_-]?export|audience)[^/]*\.(csv|jsonl|xlsx)$",
 ]
 _RX = [re.compile(p) for p in DENY_PATTERNS]
 

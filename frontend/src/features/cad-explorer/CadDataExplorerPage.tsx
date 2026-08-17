@@ -19,7 +19,9 @@ import {
   TrendingUp, Hash, Clock, ShieldCheck, Bookmark, ScatterChart as ScatterIcon, Trash2,
   Box, Ruler, Square, Building2, Palette,
 } from 'lucide-react';
-import { Button, Card, Badge, Breadcrumb, DismissibleInfo, EmptyState, ModuleGuideButton } from '@/shared/ui';
+import { Button, Card, Badge, Breadcrumb, DismissibleInfo, EmptyState, ModuleGuideButton, ProjectFilePicker, projectDocumentToFile } from '@/shared/ui';
+import { CAD_EXPLORER_FORMATS } from '@/shared/lib/projectFileFormats';
+import type { DocumentItem } from '@/features/documents/api';
 import { useToastStore } from '@/stores/useToastStore';
 import { useUploadQueueStore } from '@/stores/useUploadQueueStore';
 import { apiGet, apiPost, ApiError, getErrorMessage, extractErrorMessageFromBody } from '@/shared/lib/api';
@@ -77,6 +79,7 @@ import {
 } from './thresholds';
 import { ThresholdRulesModal } from './ThresholdRulesModal';
 import { cadExplorerGuide } from './cadExplorerGuide';
+import { fmtPercent } from '@/shared/lib/formatters';
 
 /* ── Recharts - lazy-loaded so the initial Data Explorer bundle stays lean.
       Charts live in a ~38 kB gzipped chunk that only loads once the user
@@ -2744,7 +2747,7 @@ function DescribeSummary({
         <div className="rounded-xl border border-border-light bg-surface-elevated/90 p-3 shadow-xs transition-shadow duration-normal ease-oe hover:shadow-sm">
           <p className="text-2xs text-content-tertiary uppercase">{t('explorer.data_completeness', { defaultValue: 'Data Completeness' })}</p>
           <p className={`text-lg font-bold tabular-nums ${qualityScore > 50 ? 'text-green-600' : qualityScore > 20 ? 'text-amber-600' : 'text-red-500'}`}>
-            {qualityScore.toFixed(1)}%
+            {fmtPercent(qualityScore)}
           </p>
         </div>
         <div className="rounded-xl border border-border-light bg-surface-elevated/90 p-3 shadow-xs transition-shadow duration-normal ease-oe hover:shadow-sm">
@@ -2828,7 +2831,7 @@ function DescribeSummary({
                   />
                 </div>
                 <span className="text-2xs text-content-primary tabular-nums w-16 text-right shrink-0">{v.count.toLocaleString()}</span>
-                <span className="text-2xs text-content-quaternary tabular-nums w-12 text-right shrink-0">{v.percentage.toFixed(1)}%</span>
+                <span className="text-2xs text-content-quaternary tabular-nums w-12 text-right shrink-0">{fmtPercent(v.percentage)}</span>
               </div>
             ))}
           </div>
@@ -3084,6 +3087,12 @@ function UploadConvertZone({
   const { t } = useTranslation();
   const addToast = useToastStore((s) => s.addToast);
   const inputRef = useRef<HTMLInputElement>(null);
+  /** "Open from project files": lists the CAD files already stored in the
+   *  active project so a model that is already on the platform does not have
+   *  to be uploaded again just to explore its data. */
+  const pickerProjectId = useProjectContextStore((s) => s.activeProjectId) ?? '';
+  const [showProjectFilePicker, setShowProjectFilePicker] = useState(false);
+  const [pickingFileId, setPickingFileId] = useState<string | null>(null);
   const [dragOver, setDragOver] = useState(false);
   const [uploading, setUploading] = useState(false);
   const [fileName, setFileName] = useState('');
@@ -3201,6 +3210,34 @@ function UploadConvertZone({
     }
   }, [addToast, t, onSessionReady, addQueueTask, updateQueueTask]);
 
+  /** Adopt a CAD file already stored in the project's Files area. The bytes
+   *  are pushed through `handleFile`, the same entry point a local pick and a
+   *  drag-drop use, so conversion and the queue task behave identically. */
+  const handlePickProjectFile = useCallback(
+    async (doc: DocumentItem) => {
+      setPickingFileId(doc.id);
+      try {
+        const picked = await projectDocumentToFile(doc);
+        setShowProjectFilePicker(false);
+        await handleFile(picked);
+      } catch (err) {
+        addToast({
+          type: 'error',
+          title: t('project_files.pick_failed_title', { defaultValue: 'Could not open that file' }),
+          message:
+            err instanceof Error
+              ? err.message
+              : t('project_files.pick_failed_msg', {
+                  defaultValue: 'The file could not be read from the project. Try again.',
+                }),
+        });
+      } finally {
+        setPickingFileId(null);
+      }
+    },
+    [handleFile, addToast, t],
+  );
+
   return (
     <div>
       <div
@@ -3279,6 +3316,29 @@ function UploadConvertZone({
           </div>
         )}
       </div>
+
+      {/* Second way in: a CAD file already filed in this project. The local
+          upload above is unchanged; this only saves re-uploading a model the
+          project already holds. */}
+      <button
+        type="button"
+        onClick={() => setShowProjectFilePicker(true)}
+        disabled={!pickerProjectId || uploading}
+        data-testid="cad-explorer-open-from-project-files"
+        className="mt-2 inline-flex w-full items-center justify-center gap-1.5 rounded-lg border border-border-medium bg-surface-primary px-3 py-2 text-xs font-semibold text-content-secondary transition-colors hover:border-oe-blue/40 hover:text-oe-blue disabled:cursor-not-allowed disabled:opacity-50"
+      >
+        <FolderOpen size={14} />
+        {t('project_files.open_from_project', { defaultValue: 'Open from project files' })}
+      </button>
+
+      <ProjectFilePicker
+        open={showProjectFilePicker}
+        onClose={() => setShowProjectFilePicker(false)}
+        projectId={pickerProjectId}
+        accepted={CAD_EXPLORER_FORMATS}
+        onPick={handlePickProjectFile}
+        busyId={pickingFileId}
+      />
     </div>
   );
 }
@@ -3854,8 +3914,15 @@ export function CadDataExplorerPage() {
       <div className="flex flex-col -mx-4 sm:-mx-7 -mt-6 -mb-6 border-s border-border-light animate-fade-in" style={{ height: 'calc(100vh - 56px)' }}>
         <div className="space-y-3 px-6 pt-4 pb-3 border-b border-border-light">
           <div className="flex items-center justify-between gap-3">
+            {/* #149: the page names itself from the same key the Sidebar
+                entry that leads here uses, so the name cannot change under
+                the user between the click and the screen. The defaultValue
+                here used to read "CAD-BIM Explorer", a spelling that exists
+                nowhere else - invisible while the key resolves, and a
+                seventh name for this one destination the moment it does
+                not. */}
             <Breadcrumb items={[
-              { label: t('nav.cad_bim_explorer', { defaultValue: 'CAD-BIM Explorer' }) },
+              { label: t('nav.cad_bim_explorer', { defaultValue: 'CAD-BIM BI Explorer' }) },
             ]} />
             <ModuleGuideButton content={cadExplorerGuide} />
           </div>
@@ -3964,14 +4031,19 @@ export function CadDataExplorerPage() {
                   background carries the visual weight. */}
               <div className="flex flex-col justify-center gap-4">
                 <div>
+                  {/* #149: was `explorer.hero_title` ("CAD/BIM Data
+                      Explorer"), a third spelling on the same screen. The
+                      first thing a user sees on this route should be the
+                      name they clicked. The subtitle below carries the
+                      description; the heading only has to name the place. */}
                   <h1 className="text-2xl font-bold text-content-primary tracking-tight leading-tight">
-                    {t('explorer.hero_title', { defaultValue: 'CAD/BIM Data Explorer' })}
+                    {t('nav.cad_bim_explorer', { defaultValue: 'CAD-BIM BI Explorer' })}
                   </h1>
                   <p className="text-base text-content-secondary mt-3 leading-relaxed">
-                    {t('explorer.hero_subtitle', { defaultValue: 'Analyze building element data in a powerful spreadsheet interface. Filter, pivot, chart, and export quantities from your IFC and Revit models.' })}
+                    {t('explorer.hero_subtitle', { defaultValue: 'Analyze building element data in a powerful spreadsheet interface. Filter, pivot, chart, and export quantities from your IFC and Revit® models.' })}
                   </p>
                   <p className="text-xs text-content-tertiary mt-3 leading-relaxed">
-                    IFC 2x3, 4.0, 4.1, 4.3 &middot; Revit 2015–2026 &middot; DWG &middot; DGN &middot; DXF &middot; RFA
+                    IFC 2x3, 4.0, 4.1, 4.3 &middot; Revit® 2015–2026 &middot; DWG &middot; DGN &middot; DXF &middot; RFA
                   </p>
                   <div className="mt-4 flex items-center justify-start">
                     <div className="inline-flex flex-wrap items-center gap-2 px-4 py-2 rounded-full bg-emerald-500/10 border border-emerald-500/20">
@@ -4111,7 +4183,12 @@ export function CadDataExplorerPage() {
             </div>
             <div>
               <h1 className="text-sm font-bold text-content-primary">
-                {describe ? describe.filename : t('explorer.title', { defaultValue: 'CAD-BIM BI Explorer' })}
+                {/* #149: was `explorer.title`, a second key holding the same
+                    English words as `nav.cad_bim_explorer`. A second copy of
+                    a translated name is what lets it drift - the shortcuts
+                    dialog had drifted in up to 21 of 29 locales the same way
+                    (#133). One key, one name. */}
+                {describe ? describe.filename : t('nav.cad_bim_explorer', { defaultValue: 'CAD-BIM BI Explorer' })}
               </h1>
               {describe?.format && (
                 <p className="text-[10px] text-content-tertiary truncate max-w-[160px]">{describe.format.toUpperCase()} {t('explorer.data_session', { defaultValue: 'Data Session' })}</p>

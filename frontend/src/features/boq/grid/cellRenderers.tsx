@@ -43,7 +43,7 @@ import {
   hasContributingResources,
   saveCustomUnit,
 } from '../boqHelpers';
-import { RESOURCE_TYPES, getResourceTypeLabel } from '../boqResourceTypes';
+import { RESOURCE_TYPES, getResourceTypeLabel, getResourceTypeShortCode } from '../boqResourceTypes';
 import { countComments } from '../CommentDrawer';
 import { BIMQuantityPicker } from './BIMQuantityPicker';
 import { resolveRowModelId } from './resolveRowModelId';
@@ -51,6 +51,7 @@ import { MiniGeometryPreview } from '@/shared/ui/MiniGeometryPreview';
 import { fetchBIMElementsByIds, fetchBIMElementProperties } from '@/features/bim/api';
 import type { BIMElementData } from '@/shared/ui/BIMViewer/ElementManager';
 import { getIntlLocale } from '@/shared/lib/formatters';
+import { localizedUnitCode } from '@/shared/lib/unitLabels';
 import type { DisplayQuantityApi } from '@/shared/hooks/useDisplayQuantity';
 import { useFxRatesStore, getFxRate } from '@/stores/useFxRatesStore';
 import { isFormula, evaluateFormula } from './cellEditors';
@@ -164,30 +165,13 @@ export function SectionFullWidthRenderer(params: ICellRendererParams) {
   const { data, context } = params;
   const ctx = context as FullGridContext | undefined;
 
-  if (!data?._isSection || !ctx) return null;
-
-  const isCollapsed = ctx.collapsedSections?.has(data.id) ?? false;
-  const childCount: number = data._childCount ?? 0;
-  const subtotal: number = data._subtotal ?? data.total ?? 0;
-  const description: string = data.description ?? '';
-  // Issue #136 — nesting level drives left-indentation so a sub-section
-  // reads as a real child of its parent section in the смета.
-  const depth: number = typeof data._depth === 'number' ? data._depth : 0;
-  const ordinal: string = data.ordinal ?? '';
-
-  // Issue #88 — when a non-base display currency is active, divide the
-  // subtotal by the rate before formatting and print in the active code.
-  // The base value stored in `_subtotal` is unchanged; this is a pure
-  // view conversion. Mirrors `totalFormatter` in columnDefs.ts.
-  const dc = ctx.displayCurrency;
-  const displayedSubtotal = dc && dc.rate > 0 ? subtotal / dc.rate : subtotal;
-  const displayCode = dc && dc.rate > 0 ? dc.code : (ctx.currencyCode ?? 'EUR');
-  const formattedSubtotal = ctx.fmt
-    ? fmtWithCurrency(displayedSubtotal, ctx.locale ?? 'de-DE', displayCode)
-    : `${displayedSubtotal.toFixed(2)}`;
-
-  const t = ctx.t ?? ((key: string, opts?: Record<string, string | number>) =>
-    (opts?.defaultValue as string) ?? key);
+  // Every hook this component owns runs ABOVE the guard below, and has to.
+  // AG Grid reuses a full-width renderer instance across rows as it scrolls,
+  // so one instance can render a section row (hooks run) and then a row that
+  // fails the guard (hooks skipped). React rejects that second render with
+  // "rendered fewer hooks than expected" and takes the grid down with it.
+  // Reading `data` optionally is the whole cost of keeping them up here.
+  const description: string = data?.description ?? '';
 
   const [dragOver, setDragOver] = useState(false);
 
@@ -206,13 +190,37 @@ export function SectionFullWidthRenderer(params: ICellRendererParams) {
     const next = nameDraft.trim();
     setRenaming(false);
     if (next && next !== description) {
-      ctx.onUpdatePosition?.(
+      ctx?.onUpdatePosition?.(
         data.id,
         { description: next },
         { description },
       );
     }
   }, [nameDraft, description, ctx, data]);
+
+  if (!data?._isSection || !ctx) return null;
+
+  const isCollapsed = ctx.collapsedSections?.has(data.id) ?? false;
+  const childCount: number = data._childCount ?? 0;
+  const subtotal: number = data._subtotal ?? data.total ?? 0;
+  // Issue #136 — nesting level drives left-indentation so a sub-section
+  // reads as a real child of its parent section in the смета.
+  const depth: number = typeof data._depth === 'number' ? data._depth : 0;
+  const ordinal: string = data.ordinal ?? '';
+
+  // Issue #88 — when a non-base display currency is active, divide the
+  // subtotal by the rate before formatting and print in the active code.
+  // The base value stored in `_subtotal` is unchanged; this is a pure
+  // view conversion. Mirrors `totalFormatter` in columnDefs.ts.
+  const dc = ctx.displayCurrency;
+  const displayedSubtotal = dc && dc.rate > 0 ? subtotal / dc.rate : subtotal;
+  const displayCode = dc && dc.rate > 0 ? dc.code : (ctx.currencyCode ?? 'EUR');
+  const formattedSubtotal = ctx.fmt
+    ? fmtWithCurrency(displayedSubtotal, ctx.locale ?? 'de-DE', displayCode)
+    : `${displayedSubtotal.toFixed(2)}`;
+
+  const t = ctx.t ?? ((key: string, opts?: Record<string, string | number>) =>
+    (opts?.defaultValue as string) ?? key);
 
   return (
     <div
@@ -244,8 +252,16 @@ export function SectionFullWidthRenderer(params: ICellRendererParams) {
         }
       }}
     >
-      <span className="cursor-grab opacity-40 group-hover/section:opacity-80 shrink-0 transition-opacity">
-        <GripVertical size={14} className="text-content-tertiary" />
+      {/* Drag handle. Rests at `secondary` like the assembly editor's, and the
+          resting opacity is gone with it: dimming a token to 40% undoes the
+          contrast the token was chosen for, so the class would have read as
+          fixed while the grip stayed invisible. The step on hover is colour
+          now, not opacity. */}
+      <span
+        data-testid="section-drag-grip"
+        className="cursor-grab shrink-0 text-content-secondary group-hover/section:text-content-primary transition-colors"
+      >
+        <GripVertical size={14} />
       </span>
 
       <button
@@ -738,7 +754,22 @@ export function ExpandCellRenderer(params: ICellRendererParams) {
   return (
     <div className="flex items-center justify-center h-full w-full">
       <button
-        onClick={() => ctx?.onToggleResources?.(data.id)}
+        // One-click expand. Fire on mousedown, which runs BEFORE the blur that
+        // commits an in-progress cell edit and re-renders the rows — that
+        // re-render used to unmount this button between mousedown and mouseup,
+        // so the native click never fired and only the SECOND click worked.
+        // preventDefault stops the button stealing focus. The onClick path runs
+        // only for keyboard activation (detail === 0) so a real mouse click,
+        // already handled by mousedown, never double-toggles (which would net
+        // to a no-op).
+        onMouseDown={(e) => {
+          if (e.button !== 0) return;
+          e.preventDefault();
+          ctx?.onToggleResources?.(data.id);
+        }}
+        onClick={(e) => {
+          if (e.detail === 0) ctx?.onToggleResources?.(data.id);
+        }}
         style={{ width: 22, height: 22 }}
         className={`shrink-0 flex items-center justify-center rounded-md ring-1 transition-colors cursor-pointer hover:bg-oe-blue hover:text-white hover:ring-oe-blue ${
           isExpanded
@@ -916,7 +947,7 @@ export function DescriptionCellRenderer(params: ICellRendererParams) {
     // ``nativeEvent.stopImmediatePropagation()`` in onClick + onMouseDown
     // — that proved unreliable when the description column was editable
     // and AG Grid attached its listener earlier in the event chain.
-    // Reported by user: "всё равно не работает - может перекрывается".
+    // Reported: still not working, possibly overlapped by something.
     const stopAndToggle = (e: Event) => {
       e.stopPropagation();
       e.stopImmediatePropagation();
@@ -1018,8 +1049,8 @@ export function DescriptionCellRenderer(params: ICellRendererParams) {
       // the V badge is clicked. Capture-phase listener handles activation.
       tabIndex={-1}
       // Stack above any AG Grid focus / selection overlay that may sit
-      // on top of the cell content (cause of the "ничего не происходит"
-      // case where the click landed on an invisible overlay).
+      // on top of the cell content (cause of the "nothing happens" case
+      // where the click landed on an invisible overlay).
       style={{ position: 'relative', zIndex: 10 }}
       className="shrink-0 inline-flex h-[18px] w-[18px] items-center justify-center
                  rounded-md cursor-pointer
@@ -1099,9 +1130,11 @@ export function DescriptionCellRenderer(params: ICellRendererParams) {
         })}
         data-testid="boq-resource-breakdown-pill"
       >
+        {/* Localised driver codes (de: MAT/LOH/GER) so the pill matches the
+            resource-split toolbar toggle's vocabulary on the same screen. */}
         {breakdownEntries
           .slice(0, 3)
-          .map((e) => `${e.pct}% ${e.rt.slice(0, 3).toUpperCase()}`)
+          .map((e) => `${e.pct}% ${getResourceTypeShortCode(e.rt, t)}`)
           .join(' · ')}
       </span>
     ) : null;
@@ -4604,8 +4637,8 @@ function VariantHeaderResourceRow({
     [ctx, positionId, unitLabel],
   );
 
-  // When qty is unset / 0 we hide qty / rate / total entirely — the user's
-  // spec: "если количества нет - то ничего и не показывай". The picker
+  // When qty is unset / 0 we hide qty / rate / total entirely, per spec:
+  // when there is no quantity, show nothing at all. The picker
   // and the editable name still render so the user can pick a variant or
   // promote the row before entering a quantity.
   const showNumbers = qty > 0;
@@ -5416,6 +5449,7 @@ export function UnitRateCellRenderer(params: ICellRendererParams) {
 
 export function UnitCellRenderer(params: ICellRendererParams) {
   const { data, value, context } = params;
+  const { i18n } = useTranslation();
   // Bug 9: render the raw unit code (e.g. "m2") with NO casing transform — must match
   // the agSelectCellEditor dropdown which lists lowercase values.
   if (!data || data._isSection || data._isFooter) {
@@ -5428,8 +5462,11 @@ export function UnitCellRenderer(params: ICellRendererParams) {
   // editor / valueSetter keep writing the metric token, never 'ft'.
   // ``unitFor`` is identity for metric and for any unit with no imperial
   // mapping (pcs, %, hr ...), so a plain code passes straight through.
+  // On top of the system seam, apply the locale trade spelling (de:
+  // "lsum" -> "psch") — display-only, storage keeps the canonical token.
   const rawUnit = value == null ? '' : String(value);
-  const displayUnit = ctx?.displayQuantity ? ctx.displayQuantity.unitFor(rawUnit) : rawUnit;
+  const systemUnit = ctx?.displayQuantity ? ctx.displayQuantity.unitFor(rawUnit) : rawUnit;
+  const displayUnit = localizedUnitCode(systemUnit, i18n.language);
 
   const meta = (data.metadata ?? {}) as Record<string, unknown>;
   const bimSource = meta.bim_qty_source as string | undefined;

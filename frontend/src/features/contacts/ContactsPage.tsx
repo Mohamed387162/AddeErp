@@ -22,6 +22,7 @@ import {
   FileDown,
   Users,
   HardHat,
+  Landmark,
   Truck,
   Briefcase,
   User,
@@ -51,8 +52,10 @@ import {
   WideModalField,
   SideDrawer,
   ModuleGuideButton,
+  CollapsibleSection,
 } from '@/shared/ui';
 import { PageHeader } from '@/shared/ui/PageHeader';
+import { TruncationNotice } from '@/shared/ui/TruncationNotice';
 import { useConfirm } from '@/shared/hooks/useConfirm';
 import { useCreateShortcut } from '@/shared/hooks/useCreateShortcut';
 import { useToastStore } from '@/stores/useToastStore';
@@ -74,6 +77,7 @@ import {
   type ContactType,
   type PrequalificationStatus,
   type CreateContactPayload,
+  type UpdateContactPayload,
   type ImportResult,
   type ContactModuleRows,
 } from './api';
@@ -85,9 +89,11 @@ const CONTACT_TYPES: ContactType[] = [
   'customer',
   'lead',
   'client',
+  'contractor',
   'subcontractor',
   'supplier',
   'consultant',
+  'authority',
   'internal',
 ];
 
@@ -107,7 +113,9 @@ const TAG_GROUP_CAP = 8;
 
 const TYPE_BADGE_VARIANT: Record<ContactType, 'blue' | 'warning' | 'success' | 'neutral'> = {
   client: 'blue',
+  contractor: 'blue',
   subcontractor: 'warning',
+  authority: 'neutral',
   supplier: 'success',
   consultant: 'neutral',
   internal: 'neutral',
@@ -145,6 +153,48 @@ const PREQUAL_CONFIG: Record<
   },
 };
 
+/* Property Development lead / buyer statuses shown on the linked-records rail.
+ * The module-rows bridge types both as a plain string, so the maps are keyed
+ * loosely and fall back to the stored value. The buyer map deliberately
+ * mirrors the one in EditBuyerModal — ``completed`` reads as "Handover" over
+ * in Property Development, and the two screens must not disagree. */
+type StatusLabel = { labelKey: string; defaultLabel: string };
+
+const PROPDEV_LEAD_STATUS: Record<string, StatusLabel> = {
+  new: { labelKey: 'propdev.lead_status_new', defaultLabel: 'New' },
+  qualified: { labelKey: 'propdev.lead_status_qualified', defaultLabel: 'Qualified' },
+  viewing_scheduled: {
+    labelKey: 'propdev.lead_status_viewing_scheduled',
+    defaultLabel: 'Viewing Scheduled',
+  },
+  visited: { labelKey: 'propdev.lead_status_visited', defaultLabel: 'Visited' },
+  quotation_sent: {
+    labelKey: 'propdev.lead_status_quotation_sent',
+    defaultLabel: 'Quotation Sent',
+  },
+  negotiating: { labelKey: 'propdev.lead_status_negotiating', defaultLabel: 'Negotiating' },
+  converted: { labelKey: 'propdev.lead_status_converted', defaultLabel: 'Converted' },
+  lost: { labelKey: 'propdev.lead_status_lost', defaultLabel: 'Lost' },
+  disqualified: { labelKey: 'propdev.lead_status_disqualified', defaultLabel: 'Disqualified' },
+};
+
+const PROPDEV_BUYER_STATUS: Record<string, StatusLabel> = {
+  lead: { labelKey: 'propdev.stage_lead', defaultLabel: 'Lead' },
+  reserved: { labelKey: 'propdev.stage_reserved', defaultLabel: 'Reserved' },
+  contracted: { labelKey: 'propdev.stage_contracted', defaultLabel: 'Contracted' },
+  completed: { labelKey: 'propdev.stage_handover', defaultLabel: 'Handover' },
+  cancelled: { labelKey: 'propdev.stage_cancelled', defaultLabel: 'Cancelled' },
+};
+
+function statusLabel(
+  map: Record<string, StatusLabel>,
+  status: string,
+  t: (k: string, o?: Record<string, unknown>) => string,
+): string {
+  const entry = map[status];
+  return entry ? t(entry.labelKey, { defaultValue: entry.defaultLabel }) : status;
+}
+
 const inputCls =
   'h-10 w-full rounded-lg border border-border bg-surface-primary px-3 text-sm focus:outline-none focus:ring-2 focus:ring-oe-blue/30 focus:border-oe-blue';
 
@@ -152,7 +202,9 @@ const inputCls =
 
 const TYPE_CARD_CONFIG: Record<ContactType, { icon: React.ElementType; color: string }> = {
   client: { icon: Users, color: 'text-blue-600 bg-blue-50 border-blue-200 dark:text-blue-400 dark:bg-blue-950/30 dark:border-blue-800' },
+  contractor: { icon: Building2, color: 'text-sky-600 bg-sky-50 border-sky-200 dark:text-sky-400 dark:bg-sky-950/30 dark:border-sky-800' },
   subcontractor: { icon: HardHat, color: 'text-amber-600 bg-amber-50 border-amber-200 dark:text-amber-400 dark:bg-amber-950/30 dark:border-amber-800' },
+  authority: { icon: Landmark, color: 'text-slate-600 bg-slate-50 border-slate-200 dark:text-slate-300 dark:bg-slate-800/50 dark:border-slate-700' },
   supplier: { icon: Truck, color: 'text-green-600 bg-green-50 border-green-200 dark:text-green-400 dark:bg-green-950/30 dark:border-green-800' },
   consultant: { icon: Briefcase, color: 'text-gray-600 bg-gray-50 border-gray-200 dark:text-gray-400 dark:bg-gray-800/50 dark:border-gray-700' },
   internal: { icon: Users, color: 'text-indigo-600 bg-indigo-50 border-indigo-200 dark:text-indigo-400 dark:bg-indigo-950/30 dark:border-indigo-800' },
@@ -172,6 +224,8 @@ interface ContactFormData {
   website: string;
   country: string;
   address: string;
+  postcode: string;
+  city: string;
   payment_terms: string;
   prequalification_status: PrequalificationStatus;
   notes: string;
@@ -189,10 +243,126 @@ const EMPTY_FORM: ContactFormData = {
   website: '',
   country: '',
   address: '',
+  postcode: '',
+  city: '',
   payment_terms: '30',
   prequalification_status: 'pending',
   notes: '',
 };
+
+/**
+ * Read one address field out of the JSON blob, trying the spellings this
+ * codebase already stores it under.
+ *
+ * `text` is the single unstructured line the form wrote before it had separate
+ * fields, `street` is what project addresses use, and `line1` is the e-invoice
+ * engine's own name for it. A contact captured before this existed keeps its
+ * one line in the street field, where the user can see it and move the city and
+ * post code out by hand. Nothing splits it automatically: a post code guessed
+ * out of free text is exported as fact, while a missing one is reported.
+ */
+function addressField(address: Record<string, unknown> | null | undefined, keys: string[]): string {
+  if (!address || typeof address !== 'object') return '';
+  for (const key of keys) {
+    const value = address[key];
+    if (typeof value === 'string' && value.trim()) return value.trim();
+  }
+  return '';
+}
+
+/**
+ * The address blob to store, or `null` when the user has emptied every part.
+ *
+ * Absent keys rather than empty ones, because the e-invoice merge treats an
+ * empty string as an answer and would stop the invoice supplying its own.
+ */
+function addressPayload(form: ContactFormData): Record<string, string> | null {
+  const stored: Record<string, string> = {};
+  if (form.address) stored.text = form.address;
+  if (form.postcode) stored.postcode = form.postcode;
+  if (form.city) stored.city = form.city;
+  return Object.keys(stored).length > 0 ? stored : null;
+}
+
+/**
+ * The form state a contact opens with.
+ *
+ * Pure and module-level so the edit handler can rebuild the same baseline the
+ * modal started from and send only what the user actually changed. Prefilling
+ * from a row and then PATCHing every field back rewrites fields nobody opened
+ * with the values they held when the list was last read, quietly undoing an
+ * edit somebody else made in between.
+ *
+ * `address` is a JSON blob on the record and three fields on the form, so the
+ * flattening lives here and both sides see the same strings. Post code and city
+ * are separate because EN 16931 asks for them separately and XRechnung refuses
+ * an invoice that lacks either (BR-DE-8, BR-DE-9), which no amount of street
+ * text can answer.
+ */
+export function contactFormData(contact?: Contact): ContactFormData {
+  if (!contact) return EMPTY_FORM;
+  return {
+    company_name: contact.company_name || '',
+    legal_name: contact.legal_name || '',
+    vat_number: contact.vat_number || '',
+    first_name: contact.first_name || '',
+    last_name: contact.last_name || '',
+    contact_type: contact.contact_type,
+    email: contact.primary_email || '',
+    phone: contact.primary_phone || '',
+    website: contact.website || '',
+    country: contact.country_code || '',
+    address: addressField(contact.address, ['text', 'line1', 'street']),
+    postcode: addressField(contact.address, ['postcode', 'postal_code', 'zip']),
+    city: addressField(contact.address, ['city']),
+    payment_terms: contact.payment_terms_days || '30',
+    prequalification_status: (contact.prequalification_status as PrequalificationStatus) || 'pending',
+    notes: contact.notes || '',
+  };
+}
+
+/**
+ * The body of an edit save: only the fields the user actually changed.
+ *
+ * Hand-written rather than a generic diff because almost every field is
+ * renamed on the way out (`email` becomes `primary_email`, `country` becomes
+ * `country_code`, the address line becomes a blob). A key-name diff would
+ * silently find no form field behind `primary_email`, read it as unchanged and
+ * drop the user's edit on every save, which is worse than the bug it fixes.
+ *
+ * Clearing is still a change and goes as `null`. `undefined` would not: the
+ * key is dropped by `JSON.stringify` and the old value simply survives.
+ */
+export function buildContactPatch(
+  form: ContactFormData,
+  base: ContactFormData,
+): UpdateContactPayload {
+  const data: UpdateContactPayload = {};
+  if (form.contact_type !== base.contact_type) data.contact_type = form.contact_type;
+  if (form.first_name !== base.first_name) data.first_name = form.first_name || null;
+  if (form.last_name !== base.last_name) data.last_name = form.last_name || null;
+  if (form.company_name !== base.company_name) data.company_name = form.company_name || null;
+  if (form.legal_name !== base.legal_name) data.legal_name = form.legal_name || null;
+  if (form.vat_number !== base.vat_number) data.vat_number = form.vat_number || null;
+  if (form.email !== base.email) data.primary_email = form.email || null;
+  if (form.phone !== base.phone) data.primary_phone = form.phone || null;
+  if (form.website !== base.website) data.website = form.website || null;
+  if (form.country !== base.country) data.country_code = form.country || null;
+  // One blob, so any of its three fields changing rewrites the whole of it.
+  // Sending only the changed part would drop the other two: the column is
+  // replaced, not merged.
+  if (form.address !== base.address || form.postcode !== base.postcode || form.city !== base.city) {
+    data.address = addressPayload(form);
+  }
+  if (form.payment_terms !== base.payment_terms) {
+    data.payment_terms_days = form.payment_terms || null;
+  }
+  if (form.prequalification_status !== base.prequalification_status) {
+    data.prequalification_status = form.prequalification_status;
+  }
+  if (form.notes !== base.notes) data.notes = form.notes || null;
+  return data;
+}
 
 function AddContactModal({
   onClose,
@@ -439,8 +609,29 @@ function AddContactModal({
             rows={2}
             className="w-full rounded-lg border border-border bg-surface-primary px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-oe-blue/30 focus:border-oe-blue resize-none"
             placeholder={t('contacts.address_placeholder', {
-              defaultValue: 'Street address, City, ZIP / Postal code',
+              defaultValue: 'Street & number',
             })}
+          />
+        </WideModalField>
+
+        {/* Separate fields because an e-invoice asks for them separately: the
+            post code is BT-53 and the city BT-52, and XRechnung rejects an
+            invoice missing either. A single address line cannot answer them. */}
+        <WideModalField label={t('contacts.field_postcode', { defaultValue: 'Postcode' })}>
+          <input
+            value={form.postcode}
+            onChange={(e) => set('postcode', e.target.value)}
+            maxLength={20}
+            className={inputCls}
+          />
+        </WideModalField>
+
+        <WideModalField label={t('contacts.field_city', { defaultValue: 'City' })}>
+          <input
+            value={form.city}
+            onChange={(e) => set('city', e.target.value)}
+            maxLength={100}
+            className={inputCls}
           />
         </WideModalField>
       </WideModalSection>
@@ -1110,15 +1301,18 @@ function ContactDetailDrawer({
                           )
                         }
                         className="flex w-full items-center justify-between gap-2 rounded-lg border border-border-light bg-surface-primary px-3 py-2 text-left hover:border-oe-blue/50 hover:bg-surface-secondary/50 transition-colors"
+                        title={lead.id}
                       >
                         <div className="min-w-0">
                           <p className="truncate text-sm font-medium text-content-primary">
-                            {lead.full_name || lead.email || lead.id.slice(0, 8)}
+                            {lead.full_name ||
+                              lead.email ||
+                              t('common.unnamed', { defaultValue: '(unnamed)' })}
                           </p>
                           <p className="text-xs text-content-tertiary">
                             {t('contacts.lead_meta', {
                               defaultValue: '{{status}} · score {{score}}',
-                              status: lead.status,
+                              status: statusLabel(PROPDEV_LEAD_STATUS, lead.status, t),
                               score: lead.lead_score,
                             })}
                           </p>
@@ -1145,12 +1339,17 @@ function ContactDetailDrawer({
                           )
                         }
                         className="flex w-full items-center justify-between gap-2 rounded-lg border border-border-light bg-surface-primary px-3 py-2 text-left hover:border-oe-blue/50 hover:bg-surface-secondary/50 transition-colors"
+                        title={buyer.id}
                       >
                         <div className="min-w-0">
                           <p className="truncate text-sm font-medium text-content-primary">
-                            {buyer.full_name || buyer.email || buyer.id.slice(0, 8)}
+                            {buyer.full_name ||
+                              buyer.email ||
+                              t('common.unnamed', { defaultValue: '(unnamed)' })}
                           </p>
-                          <p className="text-xs text-content-tertiary">{buyer.status}</p>
+                          <p className="text-xs text-content-tertiary">
+                            {statusLabel(PROPDEV_BUYER_STATUS, buyer.status, t)}
+                          </p>
                         </div>
                         <ExternalLink size={13} className="shrink-0 text-content-tertiary" />
                       </button>
@@ -1218,12 +1417,12 @@ function HowContactsWork() {
   ];
 
   return (
-    <section className="rounded-xl border border-border-light bg-surface-secondary/40 p-4">
-      <h2 className="flex items-center gap-1.5 text-sm font-semibold text-content-primary">
-        <Network size={15} className="text-oe-blue" />
-        {t('contacts.how_title', { defaultValue: 'How the contact directory fits together' })}
-      </h2>
-      <p className="mt-1 text-xs text-content-tertiary">
+    <CollapsibleSection
+      storageKey="contacts.how"
+      icon={<Network size={15} className="text-oe-blue" />}
+      title={t('contacts.how_title', { defaultValue: 'How the contact directory fits together' })}
+    >
+      <p className="text-xs text-content-tertiary">
         {t('contacts.how_intro', {
           defaultValue:
             'Capture each company and person once, then reuse the same record across the platform so a party is never retyped.',
@@ -1267,7 +1466,7 @@ function HowContactsWork() {
           {t('contacts.how_mod_correspondence', { defaultValue: 'Correspondence' })}
         </ModLink>
       </div>
-    </section>
+    </CollapsibleSection>
   );
 }
 
@@ -1305,7 +1504,7 @@ export function ContactsPage() {
 
   // Data
   const {
-    data: contacts = [],
+    data: contactsPage,
     isLoading,
     isError,
     error,
@@ -1322,6 +1521,7 @@ export function ContactsPage() {
         limit: 500,
       }),
   });
+  const contacts = useMemo(() => contactsPage?.items ?? [], [contactsPage]);
 
   // CRM tag facets — feeds the chip strip above the search bar.
   const { data: tagFacets = [] } = useQuery({
@@ -1469,7 +1669,7 @@ export function ContactsPage() {
 
   // Edit mutation
   const editMut = useMutation({
-    mutationFn: ({ id, data }: { id: string; data: Partial<CreateContactPayload> }) =>
+    mutationFn: ({ id, data }: { id: string; data: UpdateContactPayload }) =>
       updateContact(id, data),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['contacts'] });
@@ -1508,25 +1708,6 @@ export function ContactsPage() {
 
   const { confirm, ...confirmProps } = useConfirm();
 
-  const formDataFromContact = useCallback((c: Contact): ContactFormData => ({
-    company_name: c.company_name || '',
-    legal_name: c.legal_name || '',
-    vat_number: c.vat_number || '',
-    first_name: c.first_name || '',
-    last_name: c.last_name || '',
-    contact_type: c.contact_type,
-    email: c.primary_email || '',
-    phone: c.primary_phone || '',
-    website: c.website || '',
-    country: c.country_code || '',
-    address: c.address && typeof c.address === 'object' && 'text' in c.address
-      ? String(c.address.text)
-      : '',
-    payment_terms: c.payment_terms_days || '30',
-    prequalification_status: (c.prequalification_status as PrequalificationStatus) || 'pending',
-    notes: c.notes || '',
-  }), []);
-
   const handleEditContact = useCallback((contact: Contact) => {
     setEditingContact(contact);
     setShowAddModal(true);
@@ -1562,7 +1743,7 @@ export function ContactsPage() {
         primary_phone: formData.phone || undefined,
         website: formData.website || undefined,
         country_code: formData.country || undefined,
-        address: formData.address ? { text: formData.address } : undefined,
+        address: addressPayload(formData) ?? undefined,
         payment_terms_days: formData.payment_terms || undefined,
         prequalification_status: formData.prequalification_status || undefined,
         notes: formData.notes || undefined,
@@ -1574,24 +1755,11 @@ export function ContactsPage() {
   const handleEditSubmit = useCallback(
     (formData: ContactFormData) => {
       if (!editingContact) return;
+      // Rebuild the baseline the modal started from, so the save carries only
+      // what the user actually edited. See `buildContactPatch`.
       editMut.mutate({
         id: editingContact.id,
-        data: {
-          contact_type: formData.contact_type,
-          first_name: formData.first_name || undefined,
-          last_name: formData.last_name || undefined,
-          company_name: formData.company_name || undefined,
-          legal_name: formData.legal_name || undefined,
-          vat_number: formData.vat_number || undefined,
-          primary_email: formData.email || undefined,
-          primary_phone: formData.phone || undefined,
-          website: formData.website || undefined,
-          country_code: formData.country || undefined,
-          address: formData.address ? { text: formData.address } : undefined,
-          payment_terms_days: formData.payment_terms || undefined,
-          prequalification_status: formData.prequalification_status || undefined,
-          notes: formData.notes || undefined,
-        },
+        data: buildContactPatch(formData, contactFormData(editingContact)),
       });
     },
     [editMut, editingContact],
@@ -1906,6 +2074,15 @@ export function ContactsPage() {
 
       {/* Results */}
       <div>
+        {/* How much of the directory the server sent, above the branches
+            rather than inside the results one. The search and country boxes
+            filter the loaded rows, so a directory cut at 500 can answer "no
+            matching contacts" about a contact that exists at row 700 - that
+            branch is exactly where the reader needs to be told the set was
+            already cut. Fed the SERVER page, never `filtered`: a notice
+            reading a client-filtered array prints a true-looking sentence
+            about a set nobody asked about. */}
+        {contactsPage && <TruncationNotice page={contactsPage} className="mb-3" />}
         {isLoading ? (
           <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
             {Array.from({ length: 6 }).map((_, i) => (
@@ -1997,7 +2174,7 @@ export function ContactsPage() {
           onClose={() => { setShowAddModal(false); setEditingContact(null); }}
           onSubmit={editingContact ? handleEditSubmit : handleCreateSubmit}
           isPending={editingContact ? editMut.isPending : createMut.isPending}
-          initialData={editingContact ? formDataFromContact(editingContact) : null}
+          initialData={editingContact ? contactFormData(editingContact) : null}
           isEdit={!!editingContact}
         />
       )}

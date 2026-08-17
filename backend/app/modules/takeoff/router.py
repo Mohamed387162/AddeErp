@@ -34,6 +34,7 @@ Routes:
     GET    /cad-data/missingness                 - per-column fill-rate + row completeness
 """
 
+import contextlib
 import logging
 import os
 import random as _random
@@ -50,6 +51,7 @@ from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import delete, select
 
+from app.core.content_disposition import attachment_disposition
 from app.core.csv_safety import neutralise_formula
 from app.core.i18n import get_locale
 from app.core.rate_limiter import ai_limiter, upload_limiter
@@ -72,10 +74,12 @@ from app.modules.takeoff.schemas import (
     CreateVariationFromCompareResponse,
     DocumentPageScalesUpdate,
     LinkToBoqRequest,
+    MeasurementReviewRequest,
     PlanReadAcceptRequest,
     PlanReadAcceptResponse,
     PlanReadMetaResponse,
     PlanReadRequest,
+    ProposalQueueResponse,
     RecognizeResponse,
     ScaleDetectionResponse,
     SimilarSymbolsResponse,
@@ -1095,7 +1099,7 @@ def _download_one_file(download_url: str, target: Path) -> int:
     if hasattr(os, "O_NOFOLLOW"):
         open_flags |= os.O_NOFOLLOW  # type: ignore[attr-defined]
     try:
-        fd = os.open(str(target), open_flags, 0o644)
+        fd = os.open(str(target), open_flags, 0o600)
     except OSError as exc:
         # ELOOP on Linux when O_NOFOLLOW hits a symlink - surface as
         # a clear refusal rather than a generic OSError.
@@ -1135,6 +1139,71 @@ def _download_one_file(download_url: str, target: Path) -> int:
     return bytes_written
 
 
+# ``IMAGE_FILE_HEADER.Machine`` values we can put a name to. A value
+# outside the map is still reported, by its raw field, because the check
+# below compares a file against the exe we are about to launch rather
+# than against a list of blessed architectures.
+_PE_MACHINE_NAMES: dict[int, str] = {
+    0x014C: "x86 (32-bit)",
+    0x01C0: "ARM",
+    0x01C4: "ARM (Thumb-2)",
+    0x0200: "Itanium",
+    0x8664: "x64",
+    0xAA64: "ARM64",
+}
+
+
+def _describe_machine(machine: int) -> str:
+    """Render a PE Machine value for a message - name plus the raw field."""
+    name = _PE_MACHINE_NAMES.get(machine)
+    return f"{name} (0x{machine:04x})" if name else f"0x{machine:04x}"
+
+
+def _read_pe_machine(path: Path) -> tuple[int | None, str | None]:
+    """Read the ``IMAGE_FILE_HEADER.Machine`` word out of a Windows binary.
+
+    Returns ``(machine, None)`` for a well-formed PE image,
+    ``(None, None)`` for a file that is not a PE at all, and
+    ``(None, reason)`` for a file that starts like one but whose header
+    chain does not hold.
+
+    Classification is by the ``MZ`` signature and never by extension. Each
+    converter loads its format readers from ``datadrivenlibs/`` under
+    names like ``.tx``, ``.txv``, ``.txr`` and ``.x64``; those are PE DLLs
+    with the extension changed, they are 185 of the 251 files in a DGN
+    install, and an extension filter would walk past every one of them.
+
+    Costs one open and two short reads per file - the DOS header, then six
+    bytes at the offset it points to.
+    """
+    try:
+        with path.open("rb") as fh:
+            head = fh.read(0x40)
+            if head[:2] != b"MZ":
+                return None, None
+            if len(head) < 0x40:
+                return None, "file ends inside the DOS header (truncated download)"
+            # e_lfanew: little-endian uint32 at offset 0x3C → file offset
+            # of the PE header.
+            pe_off = int.from_bytes(head[0x3C:0x40], "little")
+            if pe_off <= 0 or pe_off > path.stat().st_size - 4:
+                return None, f"e_lfanew points outside the file ({pe_off}); binary is truncated or text-mode-corrupted"
+            fh.seek(pe_off)
+            # PE\0\0, then IMAGE_FILE_HEADER, whose first field is the
+            # 2-byte Machine.
+            header = fh.read(6)
+            if header[:4] != b"PE\x00\x00":
+                return (
+                    None,
+                    "PE signature not found where the DOS header points (CRLF-mangled or otherwise corrupt download)",
+                )
+            if len(header) < 6:
+                return None, "file ends inside the PE header, before the machine field"
+            return int.from_bytes(header[4:6], "little"), None
+    except OSError as exc:
+        return None, f"could not read the binary: {exc}"
+
+
 def _verify_pe_executable(path: Path) -> str | None:
     """Return a human-readable reason if ``path`` is not a well-formed
     Windows PE executable, or ``None`` if it looks structurally valid.
@@ -1145,26 +1214,147 @@ def _verify_pe_executable(path: Path) -> str | None:
     but shifts ``e_lfanew``, so the ``PE\\0\\0`` signature is no longer
     where the DOS header points. Validating that chain catches exactly
     that corruption at install time instead of at launch time.
+
+    Structure only. Whether the image matches the rest of the install is
+    :func:`_verify_downloaded_architecture`, which needs the whole tree.
     """
-    try:
-        with path.open("rb") as fh:
-            head = fh.read(0x40)
-            if len(head) < 0x40 or head[:2] != b"MZ":
-                return "missing 'MZ' DOS signature (not a PE executable)"
-            # e_lfanew: little-endian uint32 at offset 0x3C → file offset
-            # of the PE header.
-            pe_off = int.from_bytes(head[0x3C:0x40], "little")
-            if pe_off <= 0 or pe_off > path.stat().st_size - 4:
-                return f"e_lfanew points outside the file ({pe_off}); binary is truncated or text-mode-corrupted"
-            fh.seek(pe_off)
-            if fh.read(4) != b"PE\x00\x00":
-                return "PE signature not found where the DOS header points (CRLF-mangled or otherwise corrupt download)"
-    except OSError as exc:
-        return f"could not read the binary: {exc}"
+    machine, problem = _read_pe_machine(path)
+    if problem is not None:
+        return problem
+    if machine is None:
+        return "missing 'MZ' DOS signature (not a PE executable)"
     return None
 
 
-def _download_converter_files_windows(converter_id: str) -> Path:
+# How many filenames an install failure names before it stops listing them.
+# Shared by the three messages that can each end up describing the whole tree:
+# an architecture mismatch, files a prune could not remove, and files that
+# survived a clean. A 250-file converter would otherwise produce a 250-line
+# error string.
+_MAX_REPORTED_FILES = 5
+
+
+def _verify_downloaded_architecture(dest_root: Path, exe_path: Path) -> str | None:
+    """Check every downloaded PE image against the exe we will launch.
+
+    Windows refuses to start an image whose dependencies were built for
+    another word size, with ``0xC000007B``, and it names the library
+    rather than the program - so the failure arrives pointing at a file
+    the install gate never looked at. The gate used to read four bytes of
+    the exe and stop: one file out of 251 for DGN, and never the Machine
+    field, so a 32-bit build passed it cleanly.
+
+    Returns a reason when anything disagrees with the exe or fails to
+    parse, and ``None`` when the tree is one architecture throughout.
+    """
+    exe_machine, exe_problem = _read_pe_machine(exe_path)
+    if exe_problem is not None:
+        return f"{exe_path.name}: {exe_problem}"
+    if exe_machine is None:
+        return f"{exe_path.name} is not a PE executable"
+
+    mismatched: list[str] = []
+    unparsable: list[str] = []
+    images = 1  # the exe itself
+    for candidate in sorted(dest_root.rglob("*")):
+        if candidate == exe_path or not candidate.is_file():
+            continue
+        machine, problem = _read_pe_machine(candidate)
+        rel = candidate.relative_to(dest_root)
+        if problem is not None:
+            unparsable.append(f"{rel} ({problem})")
+            continue
+        if machine is None:
+            continue  # data file - the licence, the readme PDF, the notices
+        images += 1
+        if machine != exe_machine:
+            mismatched.append(f"{rel} is {_describe_machine(machine)}")
+
+    if not mismatched and not unparsable:
+        logger.info(
+            "Verified %d PE images under %s, all %s",
+            images,
+            dest_root,
+            _describe_machine(exe_machine),
+        )
+        return None
+
+    parts: list[str] = []
+    if mismatched:
+        shown = mismatched[:_MAX_REPORTED_FILES]
+        rest = len(mismatched) - len(shown)
+        parts.append(
+            f"{len(mismatched)} of {images} binaries do not match "
+            f"{exe_path.name} ({_describe_machine(exe_machine)}): "
+            + "; ".join(shown)
+            + (f"; and {rest} more" if rest else "")
+        )
+    if unparsable:
+        shown = unparsable[:_MAX_REPORTED_FILES]
+        rest = len(unparsable) - len(shown)
+        parts.append(
+            f"{len(unparsable)} file(s) start like a Windows binary but do not parse as one: "
+            + "; ".join(shown)
+            + (f"; and {rest} more" if rest else "")
+        )
+    return ". ".join(parts)
+
+
+def _prune_unlisted_files(dest_root: Path, expected: set[Path]) -> list[str]:
+    """Delete everything under ``dest_root`` the current listing does not carry.
+
+    The installer mirrored without ever pruning, so a converter folder
+    accumulated across versions: the download overwrites and adds, and
+    nothing removed a file that disappeared upstream. Measured on a real
+    install, a binary upstream dropped in one release was still on disk
+    after a reinstall three days later, in the folder our own remediation
+    text told people to fix by downloading again.
+
+    Returns the paths removed, relative to ``dest_root``. Raises
+    ``RuntimeError`` if a file cannot be deleted: a leftover we
+    deliberately tried to remove and could not is exactly the state this
+    exists to end, so it is not something to log and walk past.
+    """
+    # os.path.normcase because NTFS is case-insensitive - if upstream only
+    # changes a file's casing, the download overwrites the existing file
+    # while Windows keeps the old name on disk, and a case-sensitive
+    # comparison would then delete the file we just fetched.
+    keep = {os.path.normcase(str(p)) for p in expected}
+    removed: list[str] = []
+    stuck: list[str] = []
+    for candidate in sorted(dest_root.rglob("*")):
+        if not candidate.is_file() and not candidate.is_symlink():
+            continue
+        if os.path.normcase(str(candidate)) in keep:
+            continue
+        try:
+            candidate.unlink()
+        except OSError as exc:
+            stuck.append(f"{candidate.relative_to(dest_root)} ({exc})")
+            continue
+        removed.append(str(candidate.relative_to(dest_root)))
+
+    if stuck:
+        shown = stuck[:_MAX_REPORTED_FILES]
+        rest = len(stuck) - len(shown)
+        raise RuntimeError(
+            f"Could not remove {len(stuck)} file(s) that are no longer part of "
+            f"the converter: " + "; ".join(shown) + (f"; and {rest} more" if rest else "") + ". "
+            f"Close any running converter (and any antivirus scan of "
+            f"{dest_root}), then install again."
+        )
+
+    # Directories the prune emptied. Deepest first so a nested tree
+    # collapses in one pass; a directory that is not empty, or that
+    # something holds open, simply stays.
+    for candidate in sorted(dest_root.rglob("*"), reverse=True):
+        if candidate.is_dir():
+            with contextlib.suppress(OSError):
+                candidate.rmdir()
+    return removed
+
+
+def _download_converter_files_windows(converter_id: str, *, clean: bool = False) -> Path:
     """Download every file of a Windows converter into the install dir.
 
     Mirrors the per-format directory tree from
@@ -1172,6 +1362,12 @@ def _download_converter_files_windows(converter_id: str) -> Path:
     `~/.openestimator/converters/{format}_windows/` so multiple
     converters can coexist without overwriting each other's Qt DLLs
     or format readers.
+
+    Mirroring means mirroring in both directions: after the download,
+    anything in the destination the listing did not carry is removed. Set
+    ``clean`` to empty the destination up front instead - that is what the
+    install endpoint's ``force`` asks for, and unlike the prune it also
+    replaces files whose name still matches.
 
     The RVT converter alone is ~600 MB across ~175 files (most of
     which are the bundled cad2data format readers for every RVT
@@ -1207,6 +1403,28 @@ def _download_converter_files_windows(converter_id: str) -> Path:
     # Per-format install root keeps Qt DLLs and cad2data format readers from
     # clobbering each other when multiple formats are installed.
     dest_root = (_CONVERTER_INSTALL_DIR / f"{converter_id}_windows").resolve()
+    if clean and dest_root.exists():
+        import shutil as _shutil
+
+        _shutil.rmtree(dest_root, ignore_errors=True)
+        # rmtree with ignore_errors is silent about a file Windows would
+        # not let it delete, which is how a partial tree survives a
+        # rollback and then passes for an install. A forced reinstall is
+        # the one place the user has explicitly asked for the old folder
+        # to go, so say when it did not.
+        if dest_root.exists():
+            leftovers = sorted(str(p.relative_to(dest_root)) for p in dest_root.rglob("*") if p.is_file())
+            if leftovers:
+                _clear_install_progress(converter_id)
+                shown = leftovers[:_MAX_REPORTED_FILES]
+                rest = len(leftovers) - len(shown)
+                raise RuntimeError(
+                    f"Could not empty {dest_root} before reinstalling - "
+                    f"{len(leftovers)} file(s) are still there: "
+                    + "; ".join(shown)
+                    + (f"; and {rest} more" if rest else "")
+                    + ". Something has them open; close any running converter and try again."
+                )
     dest_root.mkdir(parents=True, exist_ok=True)
     install_dir_resolved = _CONVERTER_INSTALL_DIR.resolve()
     src_prefix = src_dir.rstrip("/") + "/"
@@ -1294,7 +1512,13 @@ def _download_converter_files_windows(converter_id: str) -> Path:
 
         _shutil.rmtree(dest_root, ignore_errors=True)
         _clear_install_progress(converter_id)
-        raise RuntimeError(f"{len(failures)} of {len(download_jobs)} downloads failed; first error: {failures[0]}")
+        # ``ignore_errors`` cannot remove a file another process holds
+        # open, and what it leaves behind is the partial tree that later
+        # passes for an install - so name it rather than let it be silent.
+        residue = f" {dest_root} could not be fully removed." if dest_root.exists() else ""
+        raise RuntimeError(
+            f"{len(failures)} of {len(download_jobs)} downloads failed; first error: {failures[0]}.{residue}"
+        )
 
     exe_name: str = _META_BY_ID[converter_id]["exe"]
     exe_path = dest_root / exe_name
@@ -1329,6 +1553,44 @@ def _download_converter_files_windows(converter_id: str) -> Path:
             f"{pe_problem}. The partial install was removed - please "
             f"retry the download (the binary-mode write fix ensures a "
             f"clean retry)."
+        )
+
+    # Prune before the architecture sweep, not after. A file left over
+    # from an older converter version is not ours to verify, and rolling
+    # the download back because a stale binary failed the check would
+    # delete a good fresh tree over a file we were about to remove.
+    try:
+        pruned = _prune_unlisted_files(dest_root, {target for _url, target in download_jobs})
+    except RuntimeError:
+        _clear_install_progress(converter_id)
+        raise
+    if pruned:
+        shown = pruned[:_MAX_REPORTED_FILES]
+        logger.info(
+            "Converter %s: removed %d file(s) no longer published upstream (%s%s)",
+            converter_id,
+            len(pruned),
+            ", ".join(shown),
+            ", ..." if len(pruned) > len(shown) else "",
+        )
+
+    # Architecture gate. Every file we publish is 64-bit, in every version
+    # we have ever published, so the tree the installer just wrote has to
+    # be uniform - and if it is not, the loader will refuse the image at
+    # launch and name a DLL nobody verified. Compare the whole tree
+    # against the exe we are going to start.
+    arch_problem = _verify_downloaded_architecture(dest_root, exe_path)
+    if arch_problem is not None:
+        import shutil as _shutil
+
+        _shutil.rmtree(dest_root, ignore_errors=True)
+        _clear_install_progress(converter_id)
+        raise RuntimeError(
+            f"{converter_id} install verification failed: {arch_problem}. "
+            f"The install was removed. Everything we publish for this "
+            f"converter is built for one architecture, so a tree that fails "
+            f"this check did not come from our download alone - check what "
+            f"else writes into {dest_root}, then install again."
         )
 
     logger.info(
@@ -1422,7 +1684,7 @@ async def install_converter(
     import asyncio
     import sys
 
-    from app.modules.boq.cad_import import find_converter
+    from app.modules.boq.cad_import import find_converter, missing_companion_files
 
     meta = _META_BY_ID.get(converter_id)
     if not meta:
@@ -1434,8 +1696,16 @@ async def install_converter(
     # Already installed? (cheap file-stat) - answer synchronously. ``force``
     # bypasses this so the "Update" button can re-download an outdated binary
     # whose blob SHA no longer matches upstream.
+    #
+    # A folder holding the exe without the Qt libraries beside it does not
+    # count as installed here. Resolution still returns it, deliberately, so
+    # that nothing downstream loses a path it used to have - but answering
+    # "already installed" for it would leave the health check calling the same
+    # folder broken while this endpoint refuses to repair it. Letting the
+    # install run does repair it: the download rewrites the tree and now prunes
+    # what the listing does not carry.
     existing = find_converter(converter_id)
-    if existing and not force:
+    if existing and not force and not missing_companion_files(existing):
         return {
             "converter_id": converter_id,
             "installed": True,
@@ -1562,11 +1832,17 @@ async def _install_converter_impl(converter_id: str, force: bool, app: Any) -> d
     come back as ``installed: False`` with a ``message`` (plus an ``error``
     string or apt ``instructions`` where useful). Mirrors the previous inline
     behaviour of :func:`install_converter`, minus the HTTP envelope.
+
+    ``force`` empties the Windows install folder before downloading. It used
+    to be accepted and thrown away, which made the Update button a synonym
+    for the Install button: files were overwritten and added, never removed.
+    It is a user action only - nothing auto-provisioning reaches it, so an
+    upload can never wipe a working converter on a flaky connection. The
+    Linux path installs from signed .deb archives and has no equivalent.
     """
     import asyncio
     import sys
 
-    _ = force  # reserved for future force-redownload semantics
     meta = _META_BY_ID[converter_id]
     try:
         platform = sys.platform
@@ -1579,6 +1855,7 @@ async def _install_converter_impl(converter_id: str, force: bool, app: Any) -> d
                 exe_path = await asyncio.to_thread(
                     _download_converter_files_windows,
                     converter_id,
+                    clean=force,
                 )
             except RuntimeError as exc:
                 logger.warning("Windows converter install failed for %s: %s", converter_id, exc)
@@ -2019,6 +2296,7 @@ async def cad_extract(
         group_cad_elements,
         parse_cad_excel,
     )
+    from app.modules.boq.dxf_native import is_natively_readable
 
     filename = file.filename or "file"
     ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
@@ -2041,12 +2319,19 @@ async def cad_extract(
 
     # Resolve the converter, auto-downloading it on first use if missing.
     # This makes a fresh install work with zero user action: uploading a
-    # .rvt/.ifc/.dwg/.dgn/.rfa/.dxf fetches the matching converter
-    # automatically instead of returning "converter not installed".
-    try:
-        await ensure_converter_async(conv_ext)
-    except ConverterUnavailableError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    # .rvt/.ifc/.dwg/.dgn/.rfa fetches the matching converter automatically
+    # instead of returning "converter not installed".
+    #
+    # A format the platform reads in-process is exempt, and the check is on the
+    # ORIGINAL ``ext`` because ``conv_ext`` has already been aliased to the
+    # binary that would have read it. Without this, a .dxf on a host with no
+    # converter for its CPU is rejected here, one call before the code that
+    # would have read it without any binary at all.
+    if not is_natively_readable(ext):
+        try:
+            await ensure_converter_async(conv_ext)
+        except ConverterUnavailableError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     content = await file.read()
     if not content:
@@ -2269,6 +2554,7 @@ async def cad_columns(
         get_available_columns,
         parse_cad_excel,
     )
+    from app.modules.boq.dxf_native import is_natively_readable
 
     filename = file.filename or "file"
     ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
@@ -2288,11 +2574,13 @@ async def cad_columns(
     conv_ext = _CONVERTER_FORMAT_ALIASES.get(ext, ext)
 
     # Resolve the converter, auto-downloading it on first use if missing
-    # (zero-user-action provisioning - see /cad-extract/ for rationale).
-    try:
-        await ensure_converter_async(conv_ext)
-    except ConverterUnavailableError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    # (zero-user-action provisioning - see /cad-extract/ for rationale, and
+    # for why the native-format exemption tests the original ``ext``).
+    if not is_natively_readable(ext):
+        try:
+            await ensure_converter_async(conv_ext)
+        except ConverterUnavailableError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     content = await file.read()
     if not content:
@@ -2953,7 +3241,7 @@ async def export_cad_group(
     return StreamingResponse(
         output,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": f'attachment; filename="{download_name}"'},
+        headers={"Content-Disposition": attachment_disposition(download_name)},
     )
 
 
@@ -4288,6 +4576,8 @@ async def upload_document(
         "pages": doc.pages,
         "size_bytes": doc.size_bytes,
         "status": doc.status,
+        # The owning project (audit case-2 B-7); None for standalone uploads.
+        "project_id": doc.project_id or None,
         # Per-page text-layer audit (8.2.0). Tells the client how many pages
         # came back with no text layer (likely scanned drawings needing OCR)
         # so a partly-scanned upload is not silently treated as empty.
@@ -4390,6 +4680,10 @@ async def create_takeoff_from_source(
     doc = await service.get_or_create_takeoff_from_source(
         source_document_id=str(src_uuid),
         source_project_id=str(src_doc.project_id),
+        # The resolved, containment-checked path from above. Takeoff references
+        # this blob rather than copying it; the documents module hands over a
+        # private copy if the project document is ever deleted.
+        source_file_path=str(file_path),
         filename=src_doc.name or "document.pdf",
         content=content,
         size_bytes=len(content),
@@ -4403,6 +4697,8 @@ async def create_takeoff_from_source(
         "pages": doc.pages,
         "size_bytes": doc.size_bytes,
         "status": doc.status,
+        # The owning project (audit case-2 B-7); mirrors the detail response.
+        "project_id": doc.project_id or None,
         "source_document_id": doc.source_document_id,
         "pages_without_text": no_text_count,
         "pages_without_text_list": no_text_pages,
@@ -4544,6 +4840,12 @@ async def get_document(
         "pages": doc.pages,
         "size_bytes": doc.size_bytes,
         "status": doc.status,
+        # The owning project (audit case-2 B-7): the viewer falls back to this
+        # for measurement identity when no project is active in the app header.
+        # ``None`` for legacy standalone uploads. Must live in this dict - the
+        # endpoint declares no response_model, so a field added only to
+        # ``TakeoffDocumentResponse`` never reaches the wire.
+        "project_id": doc.project_id or None,
         "extracted_text": doc.extracted_text[:2000] if doc.extracted_text else "",
         "page_data": doc.page_data,
         "analysis": doc.analysis,
@@ -4949,7 +5251,9 @@ async def analyze_document(
 @router.post(
     "/documents/{doc_id}/recognize/",
     response_model=RecognizeResponse,
-    dependencies=[Depends(RequirePermission("takeoff.read"))],
+    # Recognition now stores its candidates as proposals, so it is a create
+    # and is gated as one. It was ``takeoff.read`` while it persisted nothing.
+    dependencies=[Depends(RequirePermission("takeoff.create"))],
 )
 async def recognize_document(
     doc_id: str,
@@ -4967,10 +5271,13 @@ async def recognize_document(
 
     The deterministic, offline complement to ``analyze`` (which sends text to
     an LLM): scans the PDF's vector drawings with PyMuPDF and proposes
-    confidence-scored area / length / count candidates. Nothing is persisted -
-    the user confirms or rejects each candidate on the canvas, then the
-    accepted ones flow through the normal bulk-create path where the server
-    re-derives the billed quantity (Audit B8).
+    confidence-scored area / length / count candidates.
+
+    Candidates are stored as ``proposed`` rows and each carries its
+    ``measurement_id``, so a review decision survives a reload and a colleague
+    on the same project sees the same queue. They are proposals, not billed
+    work: confirming one is a separate act through the review endpoint, where
+    the server re-derives the quantity (Audit B8).
     """
     doc = await service.get_document(doc_id)
     if doc is None:
@@ -4978,14 +5285,21 @@ async def recognize_document(
     # Audit B5 - IDOR: a document's geometry is as sensitive as its text.
     await _verify_takeoff_doc_access(doc, str(user_id) if user_id else "", session)
 
-    result = await service.recognize_candidates(doc_id, page, scale_pixels_per_unit or None)
+    result = await service.recognize_candidates(
+        doc_id,
+        page,
+        scale_pixels_per_unit or None,
+        user_id=str(user_id) if user_id else "",
+    )
     return RecognizeResponse(**result)
 
 
 @router.post(
     "/documents/{doc_id}/similar-symbols/",
     response_model=SimilarSymbolsResponse,
-    dependencies=[Depends(RequirePermission("takeoff.read"))],
+    # Same reasoning as recognize: the search now stores its hits as a
+    # proposal, so it is gated as a create rather than a read.
+    dependencies=[Depends(RequirePermission("takeoff.create"))],
 )
 async def similar_symbols(
     doc_id: str,
@@ -5001,8 +5315,9 @@ async def similar_symbols(
     The deterministic counterpart to drawing each count by hand: the user
     clicks one symbol on a vector PDF page and this returns the centroids of
     all near-identical symbols, which they confirm as a single count
-    measurement. Nothing is persisted (CLAUDE.md rule 7); accepted points flow
-    through the normal bulk-create path where the server re-derives quantity.
+    measurement. The hits are stored as one ``proposed`` count row so the
+    review decision is durable; confirming it stays a separate human act
+    (CLAUDE.md rule 7) and the server re-derives quantity there.
     """
     doc = await service.get_document(doc_id)
     if doc is None:
@@ -5010,8 +5325,78 @@ async def similar_symbols(
     # Same IDOR gate as recognize - a document's geometry is as sensitive as its text.
     await _verify_takeoff_doc_access(doc, str(user_id) if user_id else "", session)
 
-    result = await service.find_similar_symbols(doc_id, page, seed_x, seed_y)
+    result = await service.find_similar_symbols(doc_id, page, seed_x, seed_y, user_id=str(user_id) if user_id else "")
     return SimilarSymbolsResponse(**result)
+
+
+# ── Proposal review queue ──────────────────────────────────────────────────
+
+
+@router.get(
+    "/documents/{doc_id}/proposals/",
+    response_model=ProposalQueueResponse,
+    dependencies=[Depends(RequirePermission("takeoff.read"))],
+)
+async def list_proposals(
+    doc_id: str,
+    user_id: CurrentUserId,
+    session: SessionDep,
+    page: int | None = Query(None, ge=1, description="Scope the list to one page"),
+    review_status: str = Query(
+        "proposed",
+        pattern="^(proposed|confirmed|rejected)$",
+        description="Which review state to list",
+    ),
+    service: TakeoffService = Depends(_get_service),
+) -> ProposalQueueResponse:
+    """Return the review queue for a document, with document-wide progress.
+
+    One queue for every proposal path, the offline detectors and the vision
+    run alike, so the reviewer has a single place to work through rather than
+    a different panel per detector.
+    """
+    doc = await service.get_document(doc_id)
+    if doc is None:
+        raise HTTPException(status_code=404, detail=translate("errors.document_not_found", locale=get_locale()))
+    await _verify_takeoff_doc_access(doc, str(user_id) if user_id else "", session)
+
+    result = await service.list_document_proposals(doc_id, page=page, review_status=review_status)
+    return ProposalQueueResponse(
+        proposals=[_measurement_to_response(m) for m in result.pop("proposals")],
+        **result,
+    )
+
+
+@router.post(
+    "/measurements/{measurement_id}/review/",
+    response_model=TakeoffMeasurementResponse,
+    dependencies=[Depends(RequirePermission("takeoff.update"))],
+)
+async def review_measurement(
+    measurement_id: _uuid.UUID,
+    body: MeasurementReviewRequest,
+    user_id: CurrentUserId,
+    session: SessionDep,
+    service: TakeoffService = Depends(_get_service),
+) -> TakeoffMeasurementResponse:
+    """Accept or reject one proposal, keeping the row either way.
+
+    A rejection is recorded, not deleted. That record is what makes the
+    detector auditable and what a later suppression pass needs so the same
+    wrong proposal is not offered twice. Corrected geometry may ride along
+    with an accept, and the value is re-derived from it server side.
+    """
+    item = await service.get_measurement(measurement_id)
+    await verify_project_access(item.project_id, str(user_id), session)
+
+    updated = await service.review_measurement(
+        measurement_id,
+        action=body.action,
+        points=body.points,
+        note=body.note,
+        user_id=str(user_id) if user_id else "",
+    )
+    return _measurement_to_response(updated)
 
 
 # ── Detect scale (tier-1, AI-free, from the text layer) ────────────────────

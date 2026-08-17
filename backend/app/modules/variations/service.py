@@ -469,6 +469,11 @@ _VARIATION_CLAUSES: dict[str, str] = {
     "JCT_SBC_2016": "Clause 5",
     "NEC4_ECC": "Clause 60-65",  # Compensation Events
     "PPC2000": "Part 5 - Pricing & Payment",
+    # German public and private works. § 1 Abs. 3 is the client's right to
+    # order a change; § 2 Abs. 5 is the price consequence and so the clause a
+    # variation is argued under. Works never agreed at all fall under § 2
+    # Abs. 6, which a row states in its own clause reference.
+    "VOB_B": "§ 2 Abs. 5 VOB/B",
     "GENERIC": "-",
 }
 
@@ -2173,10 +2178,9 @@ class VariationsService:
             subtotal_amount=subtotal,
             total_amount=total,
         )
-        # ``update_fields`` calls ``session.expire_all()`` which also
-        # expires the just-created ``row``. Re-load it so the caller can
-        # serialize it without triggering a lazy load outside the async
-        # greenlet (which raises MissingGreenlet -> 500).
+        # Re-load the just-created ``row`` so the caller serializes it with the
+        # sheet totals recomputed above and never lazy-loads mid-serialise,
+        # which raises MissingGreenlet.
         await self.session.refresh(row)
         return row
 
@@ -2210,9 +2214,9 @@ class VariationsService:
             subtotal_amount=subtotal,
             total_amount=total,
         )
-        # The sheet ``update_fields`` above ran ``session.expire_all()``,
-        # re-expiring ``row``; reload before returning so the response
-        # serializer doesn't hit a lazy load outside the greenlet.
+        # Reload before returning so the response carries the line together with
+        # the sheet totals recomputed above, without a lazy load that would
+        # raise MissingGreenlet.
         await self.session.refresh(row)
         return row
 

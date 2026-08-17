@@ -10,7 +10,10 @@ export const SUPPORTED_LANGUAGES = [
   { code: 'fr', name: 'Français', english: 'French', flag: '🇫🇷', country: 'fr' },
   { code: 'es', name: 'Español', english: 'Spanish', flag: '🇪🇸', country: 'es' },
   { code: 'es-MX', name: 'Español (México)', english: 'Spanish (Mexico)', flag: '🇲🇽', country: 'mx' },
-  { code: 'pt', name: 'Português', english: 'Portuguese', flag: '🇧🇷', country: 'br' },
+  { code: 'es-CL', name: 'Español (Chile)', english: 'Spanish (Chile)', flag: '🇨🇱', country: 'cl' },
+  { code: 'es-CO', name: 'Español (Colombia)', english: 'Spanish (Colombia)', flag: '🇨🇴', country: 'co' },
+  { code: 'pt', name: 'Português', english: 'Portuguese', flag: '🇵🇹', country: 'pt' },
+  { code: 'pt-BR', name: 'Português (Brasil)', english: 'Portuguese (Brazil)', flag: '🇧🇷', country: 'br' },
   { code: 'ru', name: 'Русский', english: 'Russian', flag: '🇷🇺', country: 'ru' },
   { code: 'zh', name: '简体中文', english: 'Chinese (Simplified)', flag: '🇨🇳', country: 'cn' },
   { code: 'ar', name: 'العربية', english: 'Arabic', flag: '🇸🇦', country: 'sa', dir: 'rtl' },
@@ -32,7 +35,19 @@ export const SUPPORTED_LANGUAGES = [
   { code: 'ro', name: 'Română', english: 'Romanian', flag: '🇷🇴', country: 'ro' },
   { code: 'th', name: 'ไทย', english: 'Thai', flag: '🇹🇭', country: 'th' },
   { code: 'vi', name: 'Tiếng Việt', english: 'Vietnamese', flag: '🇻🇳', country: 'vn' },
-  { code: 'mn', name: 'Монгол', english: 'Mongolian', flag: '🇲🇳', country: 'mn' },
+  // Mongolian is deliberately not offered: five invented roots passed every
+  // gate in mn.ts and the file needs a native-speaker pass before the
+  // language returns. The locale file stays on disk so the work resumes from
+  // where it stopped, but nothing loads it while it is off this list.
+  { code: 'ky', name: 'Кыргызча', english: 'Kyrgyz', flag: '🇰🇬', country: 'kg' },
+  { code: 'et', name: 'Eesti', english: 'Estonian', flag: '🇪🇪', country: 'ee' },
+  { code: 'bn', name: 'বাংলা', english: 'Bengali', flag: '🇧🇩', country: 'bd' },
+  { code: 'kk', name: 'Қазақша', english: 'Kazakh', flag: '🇰🇿', country: 'kz' },
+  { code: 'fil', name: 'Filipino', english: 'Filipino', flag: '🇵🇭', country: 'ph' },
+  { code: 'ur', name: 'اردو', english: 'Urdu', flag: '🇵🇰', country: 'pk', dir: 'rtl' },
+  { code: 'fa', name: 'فارسی', english: 'Persian', flag: '🇮🇷', country: 'ir', dir: 'rtl' },
+  { code: 'he', name: 'עברית', english: 'Hebrew', flag: '🇮🇱', country: 'il', dir: 'rtl' },
+  { code: 'el', name: 'Ελληνικά', english: 'Greek', flag: '🇬🇷', country: 'gr' },
 ];
 
 export function getLanguageByCode(code: string): (typeof SUPPORTED_LANGUAGES)[number] {
@@ -207,16 +222,28 @@ const initialLanguage = resolveInitialLanguage();
 i18n
   .use(initReactI18next)
   .init({
+    // Initialize synchronously: every resource this init needs is already in
+    // memory (the bundled EN object), so deferring init to a timer only opens
+    // a boot window where ``t()`` echoes raw keys. With sync init the store
+    // is ready the moment this module finishes evaluating, which the
+    // ``initialLocaleReady`` mount gate below relies on.
+    initImmediate: false,
     // Only English is bundled synchronously — every other locale is
     // lazy-loaded by ``loadLocaleResource`` below. ``fallbackLng: 'en'``
     // means missing keys (e.g. while the locale chunk is still in
     // flight) render in English instead of as raw key strings.
     resources: { en: enResource },
     lng: initialLanguage,
-    // ``es-MX`` (Mexican / LatAm Spanish) falls back to ``es`` first, then
-    // English, so any key not localised for Mexico shows Spanish rather than
-    // English. Every other locale falls back straight to English.
-    fallbackLng: { 'es-MX': ['es', 'en'], default: ['en'] },
+    // The regional variants fall back to their own language before English, so
+    // a key not localised for Chile shows Spanish rather than English. That is
+    // what lets those files carry only the words that actually differ.
+    fallbackLng: {
+      'es-MX': ['es', 'en'],
+      'es-CL': ['es', 'en'],
+      'es-CO': ['es', 'en'],
+      'pt-BR': ['pt', 'en'],
+      default: ['en'],
+    },
     // All translation keys are stored as flat strings with literal dots
     // (e.g. "match_elements.title"). Disable the dot-as-namespace
     // separator so lookups don't try to walk a nested object path that
@@ -264,11 +291,25 @@ i18n.on('languageChanged', (lng) => {
   void loadLocaleResource(lng);
 });
 
-// If the user's resolved language isn't English, kick off the lazy-load
-// straight away so the UI doesn't sit in English longer than necessary.
-if (initialLanguage !== 'en') {
-  void loadLocaleResource(initialLanguage);
-}
+/**
+ * Resolves once the resources of the *initial* language are in the store,
+ * or ``null`` when there is nothing to wait for (English boot).
+ *
+ * i18next starts with only the bundled English resource; the active locale
+ * arrives in a lazy chunk. Merely kicking that fetch off (`void load...`)
+ * loses the race against React's first paint every single time — the first
+ * frame of every non-English session rendered in English, whatever the cache
+ * state, because the paint is synchronous and the chunk resolve never is.
+ * ``main.tsx`` therefore awaits this promise (with a hard time cap so a
+ * stalled fetch cannot hold the mount hostage) before mounting the app, so
+ * the first frame already speaks the saved language.
+ *
+ * ``loadLocaleResource`` swallows its own failures (English fallback), so
+ * this promise always resolves; it never rejects and never blocks forever.
+ * The English path stays fully synchronous: no promise, no waiting.
+ */
+export const initialLocaleReady: Promise<void> | null =
+  initialLanguage !== 'en' ? loadLocaleResource(initialLanguage) : null;
 
 // Merge module-bundled translations (nav keys for regional modules, etc.)
 import { getModuleTranslations } from '@/modules/_registry';

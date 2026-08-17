@@ -20,21 +20,26 @@ import { PLAYBOOKS } from '@/features/cases/playbooks';
 import { useCasesStore } from '@/features/cases/useCasesStore';
 import { completedCount } from '@/features/cases/progress';
 import { tintFor } from '@/features/cases/categories';
+import { dealCaseFaces } from '@/features/cases/caseFaces';
+
+/** The honeycomb cell the Cases hub cuts its portraits to. */
+const HEX_CELL = 'polygon(50% 2%, 100% 26%, 100% 74%, 50% 98%, 0% 74%, 0% 26%)';
 import { rolesForPlaybook, ROLE_BY_ID } from '@/features/cases/roles';
 import { iconFor } from '@/features/cases/icons';
 import { CaseArt } from '@/features/cases/CaseArt';
 
-// How many cases to preview as picture tiles. Eight fills one compact row on a
-// wide dashboard (eight across) and reflows to fewer columns as it narrows, a
-// small gallery of the case library rather than a thin strip of chips.
-const PREVIEW_COUNT = 8;
+// How many cases to preview as picture tiles. Ten fills one compact row on a
+// wide dashboard (ten across, plus the "all cases" tile) and reflows to fewer
+// columns as it narrows, a small gallery of the case library rather than a thin
+// strip of chips.
+const PREVIEW_COUNT = 10;
 
 export function DashboardCasesCard() {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
   const navigate = useNavigate();
   const runs = useCasesStore((s) => s.runs);
-  const role = useCasesStore((s) => s.role);
-  const companyType = useCasesStore((s) => s.companyType);
+  const roles = useCasesStore((s) => s.roles);
+  const companyTypes = useCasesStore((s) => s.companyTypes);
 
   // Best progress a case reached across any run (unscoped or per sample
   // project), used both to rank and to show a resume hint.
@@ -48,23 +53,39 @@ export function DashboardCasesCard() {
       }
       const total = pb.steps.length;
       const inProgress = best > 0 && best < total;
-      const roleMatch = role ? rolesForPlaybook(pb).includes(role) : false;
-      const companyMatch = companyType ? pb.companyTypes.includes(companyType) : false;
-      return { pb, best, total, inProgress, roleMatch, companyMatch };
+      // Both hub filters hold a list, so count the overlap rather than test a
+      // single id: a case that fits all three of someone's roles should outrank
+      // one that fits a single role, and a boolean cannot say that.
+      const pbRoles = rolesForPlaybook(pb);
+      const roleMatches = roles.filter((r) => pbRoles.includes(r)).length;
+      const companyMatches = companyTypes.filter((c) =>
+        pb.companyTypes.includes(c),
+      ).length;
+      return { pb, best, total, inProgress, roleMatches, companyMatches };
     });
     scored.sort((a, b) => {
       if (a.inProgress !== b.inProgress) return a.inProgress ? -1 : 1;
-      const am = (a.roleMatch ? 2 : 0) + (a.companyMatch ? 1 : 0);
-      const bm = (b.roleMatch ? 2 : 0) + (b.companyMatch ? 1 : 0);
+      const am = a.roleMatches * 2 + a.companyMatches;
+      const bm = b.roleMatches * 2 + b.companyMatches;
       if (am !== bm) return bm - am;
       return a.pb.order - b.pb.order;
     });
     return scored.slice(0, PREVIEW_COUNT);
-  }, [runs, role, companyType]);
+  }, [runs, roles, companyTypes]);
 
-  const roleLabel = role
-    ? t(ROLE_BY_ID[role]?.labelKey ?? '', { defaultValue: ROLE_BY_ID[role]?.labelDefault ?? '' })
-    : '';
+  // Name every role the user picked, joined the way their language joins a
+  // list. Printing only the first would drop the others silently, which is the
+  // same thing the hub filters were fixed for.
+  const roleLabel = useMemo(() => {
+    const names = roles.map((r) =>
+      t(ROLE_BY_ID[r]?.labelKey ?? '', { defaultValue: ROLE_BY_ID[r]?.labelDefault ?? '' }),
+    );
+    if (names.length === 0) return '';
+    return new Intl.ListFormat(i18n.language, {
+      style: 'long',
+      type: 'conjunction',
+    }).format(names);
+  }, [roles, t, i18n.language]);
 
   // Frame the preview chips by what they actually are: something half-finished
   // to resume, a role-tuned pick, or - the default on a fresh workspace - the
@@ -73,9 +94,13 @@ export function DashboardCasesCard() {
   const anyInProgress = picks.some((p) => p.inProgress);
   const framingLabel = anyInProgress
     ? t('cases.dashboard_card.resume_hint', { defaultValue: 'Pick up where you left off' })
-    : role
+    : roles.length > 0
       ? t('cases.dashboard_card.for_role', { defaultValue: 'Picked for you' })
       : t('cases.dashboard_card.popular', { defaultValue: 'Popular starting points' });
+
+  // Dealt from the same helper the Cases hub uses, so a case wears the same
+  // person in both places rather than two different ones.
+  const faces = useMemo(() => dealCaseFaces(picks.map(({ pb }) => pb)), [picks]);
 
   return (
     <div
@@ -102,15 +127,21 @@ export function DashboardCasesCard() {
             </span>
           </div>
           <p className="mt-0.5 text-xs leading-relaxed text-content-secondary">
-            {role
+            {roles.length === 1
               ? t('cases.dashboard_card.body_role', {
                   defaultValue: 'Guided playbooks picked for a {{role}}, step by step across the modules.',
                   role: roleLabel,
                 })
-              : t('cases.dashboard_card.body', {
-                  defaultValue:
-                    'Follow a guided playbook from a PDF to a priced, validated estimate, step by step across the modules.',
-                })}
+              : roles.length > 1
+                ? t('cases.dashboard_card.body_roles', {
+                    defaultValue:
+                      'Guided playbooks picked for {{roles}}, step by step across the modules.',
+                    roles: roleLabel,
+                  })
+                : t('cases.dashboard_card.body', {
+                    defaultValue:
+                      'Follow a guided playbook from a PDF to a priced, validated estimate, step by step across the modules.',
+                  })}
           </p>
         </div>
         <button
@@ -140,11 +171,12 @@ export function DashboardCasesCard() {
           </div>
           {/* Picture gallery: each case leads with its line-art illustration on
               an always-light tile (the same art the Cases hub uses), so the
-              block previews the library visually. Eight compact tiles land as a
-              single row on a wide dashboard, reflowing to six, four or two on
-              narrower screens. */}
-          <div className="grid grid-cols-2 gap-2 sm:grid-cols-4 lg:grid-cols-6 xl:grid-cols-9">
+              block previews the library visually. Ten compact tiles plus the
+              "all cases" tile land as a single row on a wide dashboard,
+              reflowing to six, four or two on narrower screens. */}
+          <div className="grid grid-cols-2 gap-2 sm:grid-cols-4 lg:grid-cols-6 xl:grid-cols-11">
           {picks.map(({ pb, best, total, inProgress }) => {
+            const face = faces.get(pb.id);
             const Icon = iconFor(pb.icon);
             const tint = tintFor(pb.category);
             const title = t(pb.titleKey, { defaultValue: pb.titleDefault });
@@ -164,7 +196,34 @@ export function DashboardCasesCard() {
                 {/* Line-art banner on an always-light tile so the linework reads
                     the same in light and dark theme. */}
                 <div className="relative aspect-[16/9] w-full overflow-hidden border-b border-border-light bg-white ring-1 ring-inset ring-slate-900/[0.04]">
-                  <CaseArt id={pb.id} fallbackIcon={Icon} fallbackClass={tint.text} alt={title} />
+                  <CaseArt id={pb.id} category={pb.category} fallbackIcon={Icon} fallbackClass={tint.text} alt={title} />
+                  {/* The specialist the case is written for, cut to the same
+                      honeycomb cell the Cases hub and the marketing site use.
+                      It sits over a corner rather than beside the diagram:
+                      these tiles are a sixth of a row wide, and a band would
+                      leave the drawing too narrow to read at all. Decorative -
+                      the case title below carries the meaning. */}
+                  {face && (
+                    <span
+                      aria-hidden="true"
+                      className="pointer-events-none absolute bottom-1 start-1 block w-[30%] max-w-[2.75rem]"
+                    >
+                      <span
+                        className="block aspect-[7/8] bg-white/90 p-[2px] shadow-sm shadow-slate-900/20"
+                        style={{ clipPath: HEX_CELL }}
+                      >
+                        <img
+                          src={face}
+                          alt=""
+                          loading="lazy"
+                          decoding="async"
+                          draggable={false}
+                          className="h-full w-full object-cover object-[50%_18%]"
+                          style={{ clipPath: HEX_CELL }}
+                        />
+                      </span>
+                    </span>
+                  )}
                   {inProgress && (
                     <span
                       className="absolute right-2 top-2 h-2.5 w-2.5 rounded-full bg-oe-blue shadow-sm ring-2 ring-white"

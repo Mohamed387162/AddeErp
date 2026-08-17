@@ -55,6 +55,7 @@ Manager / ``pkill qdrant``.
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import logging
 import platform
@@ -64,6 +65,7 @@ import sys
 import tarfile
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import zipfile
 from dataclasses import dataclass
@@ -75,7 +77,44 @@ logger = logging.getLogger(__name__)
 # ── Constants ────────────────────────────────────────────────────────────
 
 
-QDRANT_HOME: Path = Path.home() / ".openestimator" / "qdrant"
+def _binary_name() -> str:
+    return "qdrant.exe" if sys.platform.startswith("win") else "qdrant"
+
+
+def _resolve_qdrant_home() -> Path:
+    """Return the install root for the embedded vector service.
+
+    Follows ``app.core.storage.resolve_data_dir``, the platform's single
+    source of truth for writable state, instead of the account's home
+    directory. In a container those are not the same place: the image points
+    OE_DATA_DIR at the mounted volume, while the home of the unprivileged
+    account it runs as lives inside the image. Installing into home therefore
+    put the binary and its storage somewhere that does not survive recreating
+    the container, so updating looked to the operator like the service had
+    uninstalled itself and was asking to be installed again. Mounting a volume
+    over that path to make it stick does not help either, because Docker
+    creates a volume for a path the image does not contain as root-owned while
+    the app runs unprivileged, and the download then fails on a read-only
+    directory.
+
+    An install already present in the legacy location keeps being used, so
+    upgrading never orphans a binary the operator has already downloaded.
+    """
+    legacy = Path.home() / ".openestimator" / "qdrant"
+    try:
+        from app.core.storage import resolve_data_dir
+
+        resolved = resolve_data_dir() / "qdrant"
+    except (ImportError, OSError):  # pragma: no cover - defensive
+        return legacy
+    if resolved == legacy:
+        return resolved
+    if (legacy / _binary_name()).is_file() and not (resolved / _binary_name()).is_file():
+        return legacy
+    return resolved
+
+
+QDRANT_HOME: Path = _resolve_qdrant_home()
 QDRANT_STORAGE_DIR: Path = QDRANT_HOME / "storage"
 QDRANT_SNAPSHOTS_DIR: Path = QDRANT_HOME / "snapshots"
 QDRANT_CONFIG_DIR: Path = QDRANT_HOME / "config"
@@ -115,10 +154,6 @@ _PLATFORM_ASSET: dict[tuple[str, str], str] = {
 }
 
 
-def _binary_name() -> str:
-    return "qdrant.exe" if sys.platform.startswith("win") else "qdrant"
-
-
 def _expected_binary_path() -> Path:
     return QDRANT_HOME / _binary_name()
 
@@ -137,6 +172,46 @@ class QdrantHealth:
     message: str
     install_hint: str
     download_url: str | None
+    #: Whether ``qdrant_client`` can be imported in this process. The server
+    #: being up says nothing about this, and without the client nothing can
+    #: talk to the server at all, so a health report that omits it can be
+    #: green while every match returns an empty list.
+    client_installed: bool = True
+
+
+#: Said once so the four report paths cannot drift apart. Deliberately does not
+#: offer to download the server binary: on an installation without the client
+#: that button installs something the process still cannot reach, which is the
+#: dead end this whole field exists to stop.
+_MISSING_CLIENT_HINT = (
+    "The vector client library is not part of this installation. Install the "
+    "client extra to enable it: pip install openconstructionerp[semantic-clients]. "
+    "That extra is the client alone and carries no embedding model, so it is a "
+    "small install; the container image and the desktop build ship it already. "
+    "Everything else works without it."
+)
+
+_client_installed: bool | None = None
+
+
+def qdrant_client_available() -> bool:
+    """Whether the ``qdrant_client`` package can actually be imported here.
+
+    Imported rather than located. A package can be present on disk, and so
+    resolvable by the import machinery, and still raise at import time on a
+    partial install or a missing native wheel; the two answers differ exactly
+    when it matters. Cached because the health card polls every 30 seconds and
+    the answer cannot change without a process restart.
+    """
+    global _client_installed
+    if _client_installed is None:
+        try:
+            import qdrant_client  # noqa: F401 - imported for the side effect of failing
+        except Exception:  # noqa: BLE001 - any import failure means unusable
+            _client_installed = False
+        else:
+            _client_installed = True
+    return _client_installed
 
 
 def find_qdrant_binary() -> Path | None:
@@ -155,6 +230,53 @@ def find_qdrant_binary() -> Path | None:
     return None
 
 
+# A probe of a process on this machine must never traverse an HTTP proxy.
+# ``urllib.request.urlopen`` goes through the default opener, which installs a
+# ``ProxyHandler`` seeded from the environment, and on POSIX the bypass check
+# consults ``no_proxy`` alone - loopback is not exempt on its own. A machine
+# with ``http_proxy`` set and no loopback entry therefore sent this probe to
+# the proxy, which refused it, and the vector-database card concluded Qdrant
+# was not installed and offered to download it while Qdrant was running the
+# whole time. Downloads in ``install_qdrant_native`` deliberately keep the
+# default opener: GitHub Releases is a genuinely remote host.
+_DIRECT_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+def _is_loopback(url: str) -> bool:
+    """Return ``True`` when ``url`` names this machine.
+
+    Literal addresses are classified by :mod:`ipaddress`, which covers all of
+    ``127.0.0.0/8`` and ``::1``. Only the name ``localhost`` is trusted without
+    resolution: looking up an arbitrary host would turn a 1.5 s health probe
+    into a DNS round trip, and a deployment that points ``QDRANT_URL`` at a
+    remote Qdrant behind a proxy still wants the proxy.
+    """
+
+    host = urllib.parse.urlsplit(url).hostname or ""
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def _probe_once(target: str, timeout_s: float, *, direct: bool) -> bool:
+    """One ``GET``; ``True`` on 2xx, ``False`` on any transport or HTTP error.
+
+    ``HTTPError`` subclasses ``URLError``, so a 4xx or 5xx lands in the same
+    branch as an unreachable port and the caller moves on to its fallback.
+    """
+
+    req = urllib.request.Request(target, method="GET")  # noqa: S310 - fixed http(s) URL from config
+    opener = _DIRECT_OPENER.open if direct else urllib.request.urlopen
+    try:
+        with opener(req, timeout=timeout_s) as resp:
+            return 200 <= resp.status < 300
+    except (urllib.error.URLError, TimeoutError, ConnectionError, OSError):
+        return False
+
+
 def probe_qdrant(url: str, *, timeout_s: float = 1.5) -> bool:
     """Return ``True`` if Qdrant answers ``GET /readyz`` quickly.
 
@@ -167,21 +289,13 @@ def probe_qdrant(url: str, *, timeout_s: float = 1.5) -> bool:
 
     if not url:
         return False
-    target = url.rstrip("/") + "/readyz"
-    try:
-        req = urllib.request.Request(target, method="GET")
-        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
-            return 200 <= resp.status < 300
-    except (urllib.error.URLError, TimeoutError, ConnectionError, OSError):
-        pass
+    base = url.rstrip("/")
+    direct = _is_loopback(url)
+    if _probe_once(base + "/readyz", timeout_s, direct=direct):
+        return True
     # Some older builds return 4xx on /readyz before collections mount;
     # fall back to the root endpoint which always responds.
-    try:
-        req = urllib.request.Request(url.rstrip("/") + "/", method="GET")
-        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
-            return 200 <= resp.status < 300
-    except (urllib.error.URLError, TimeoutError, ConnectionError, OSError):
-        return False
+    return _probe_once(base + "/", timeout_s, direct=direct)
 
 
 def _write_default_config() -> Path:
@@ -194,9 +308,28 @@ def _write_default_config() -> Path:
     rest of the schema from its compiled-in defaults.
     """
 
-    QDRANT_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    QDRANT_STORAGE_DIR.mkdir(parents=True, exist_ok=True)
-    QDRANT_SNAPSHOTS_DIR.mkdir(parents=True, exist_ok=True)
+    # A permission error here has to say so. ``mkdir(exist_ok=True)`` is a trap
+    # on a pre-created directory: it no-ops without probing whether anything can
+    # be written, so the first real signal is a write further down. Unguarded,
+    # an OSError from these three lines travels all the way to the app-wide
+    # handler, which strips the text by design and answers HTTP 500 with
+    # "Internal server error" - the operator is told the vector service will not
+    # start and given nothing to act on. The download path one level up already
+    # translates its OSError into a readable 502; this makes the directory setup
+    # behave the same way.
+    for directory in (QDRANT_CONFIG_DIR, QDRANT_STORAGE_DIR, QDRANT_SNAPSHOTS_DIR):
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            msg = (
+                f"Cannot prepare the vector service directory at {directory}: {exc}. "
+                f"Vector search stores its data under {QDRANT_HOME}, which is outside "
+                f"the container's declared data volume, so a bind mount added there is "
+                f"owned by root while the application runs as a non-root user. Either "
+                f"grant that path to the application user or point QDRANT_HOME at a "
+                f"writable location."
+            )
+            raise RuntimeError(msg) from exc
 
     config_path = QDRANT_CONFIG_DIR / "config.yaml"
     if config_path.exists():
@@ -373,7 +506,15 @@ def install_qdrant_native(*, force: bool = False) -> Path:
         logger.info("install_qdrant_native: already installed at %s", existing)
         return existing
 
-    QDRANT_HOME.mkdir(parents=True, exist_ok=True)
+    try:
+        QDRANT_HOME.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        msg = (
+            f"Cannot prepare the vector service directory at {QDRANT_HOME}: {exc}. "
+            f"Check that the path is writable by the account running the server."
+        )
+        raise RuntimeError(msg) from exc
+
     asset_name, download_url = _resolve_release_asset()
 
     archive_path = QDRANT_HOME / asset_name
@@ -418,6 +559,17 @@ def install_qdrant_native(*, force: bool = False) -> Path:
             raise RuntimeError(f"Unsupported archive type: {asset_name}")
     except (zipfile.BadZipFile, tarfile.TarError) as exc:
         raise RuntimeError(f"Could not extract {asset_name}: {exc}") from exc
+    except OSError as exc:
+        # Writing the binary out fails for reasons that have nothing to do with
+        # the archive being readable: no space left, or a QDRANT_HOME an operator
+        # bind-mounted root-owned while the server runs unprivileged. The
+        # app-wide handler strips exception text, so name the path here or the
+        # operator is left with a bare 500 and nothing to act on.
+        msg = (
+            f"Could not write the vector service binary to {target}: {exc}. "
+            f"Check that {target.parent} is writable by the account running the server."
+        )
+        raise RuntimeError(msg) from exc
     finally:
         archive_path.unlink(missing_ok=True)
 
@@ -451,6 +603,10 @@ def ensure_qdrant_running(url: str | None, *, spawn_if_installed: bool = True) -
     binary = find_qdrant_binary()
     installed = binary is not None
     spawn_attempted = False
+    # A running server the process cannot speak to is not a working setup, and
+    # it is the one state the old report called healthy. Answered once here so
+    # every return below carries it.
+    has_client = qdrant_client_available()
 
     if url and probe_qdrant(url):
         return QdrantHealth(
@@ -460,9 +616,17 @@ def ensure_qdrant_running(url: str | None, *, spawn_if_installed: bool = True) -
             binary_path=str(binary) if binary else None,
             storage_dir=str(QDRANT_STORAGE_DIR),
             spawn_attempted=False,
-            message="Vector database is up and answering on the configured URL.",
-            install_hint="",
+            message=(
+                "Vector database is up and answering on the configured URL."
+                if has_client
+                else (
+                    "Vector database is up, but this installation has no client "
+                    "library for it, so nothing here can query it."
+                )
+            ),
+            install_hint="" if has_client else _MISSING_CLIENT_HINT,
             download_url=None,
+            client_installed=has_client,
         )
 
     # Unreachable - try to auto-spawn if we have the binary on disk.
@@ -479,14 +643,39 @@ def ensure_qdrant_running(url: str | None, *, spawn_if_installed: bool = True) -
                     binary_path=str(binary),
                     storage_dir=str(QDRANT_STORAGE_DIR),
                     spawn_attempted=True,
-                    message="Vector database started from local binary.",
-                    install_hint="",
+                    message=(
+                        "Vector database started from local binary."
+                        if has_client
+                        else (
+                            "Vector database started from local binary, but this "
+                            "installation has no client library for it, so nothing "
+                            "here can query it."
+                        )
+                    ),
+                    install_hint="" if has_client else _MISSING_CLIENT_HINT,
                     download_url=None,
+                    client_installed=has_client,
                 )
             time.sleep(0.4)
 
-    # Still down. Build a hint that does NOT mention Docker - the
-    # native binary is the only recommended path here.
+    # Still down. Downloading the server is pointless when the process has no
+    # client for it, so say what is actually missing before offering the
+    # installer. This is the state a stock container or desktop build is in:
+    # the image installs the base extra only, so the client was never there.
+    if not has_client:
+        return QdrantHealth(
+            reachable=False,
+            url=url,
+            installed=installed,
+            binary_path=str(binary) if binary else None,
+            storage_dir=str(QDRANT_STORAGE_DIR),
+            spawn_attempted=spawn_attempted,
+            message=("Semantic matching is not available in this installation."),
+            install_hint=_MISSING_CLIENT_HINT,
+            download_url=None,
+            client_installed=False,
+        )
+
     if not installed:
         try:
             asset_name, asset_url = _resolve_release_asset()
@@ -515,6 +704,7 @@ def ensure_qdrant_running(url: str | None, *, spawn_if_installed: bool = True) -
             message="Vector database is not running.",
             install_hint=install_hint,
             download_url=download_url,
+            client_installed=True,
         )
 
     # Installed but spawn didn't bring it up in time. Common cause:
@@ -533,6 +723,7 @@ def ensure_qdrant_running(url: str | None, *, spawn_if_installed: bool = True) -
         ),
         install_hint=(f"Binary found at {binary}. Check ~/.openestimator/qdrant/qdrant.log for startup errors."),
         download_url=None,
+        client_installed=True,
     )
 
 

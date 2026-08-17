@@ -11,18 +11,40 @@ import uuid
 
 from sqlalchemy import (
     JSON,
+    BigInteger,
     CheckConstraint,
     DateTime,
     ForeignKey,
     Index,
     Numeric,
+    Sequence,
     String,
     Text,
     func,
+    text,
 )
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.database import GUID, Base
+
+# Backs ProgressEntry.seq. Attached to the metadata so create_all emits
+# CREATE SEQUENCE before the column that defaults from it, when it builds the
+# table. Dialects without sequences (the legacy SQLite upgrade source) skip it.
+#
+# The metadata attachment does NOT hand the sequence to the auto-migrator, and
+# the comment here used to claim it did. create_all's visit_metadata keeps only
+# the sequences whose .column is None; this one is passed to mapped_column, so
+# its .column is set and it is filtered out, leaving CREATE TABLE as its only
+# route - and that does not run for a table that already exists, which is
+# exactly the population the auto-migrator heals. So on an upgraded install this
+# sequence was absent when ADD COLUMN ... DEFAULT nextval(...) ran, the seq
+# column silently failed to land, and it failed again on every later boot: the
+# breakage was permanent, not one boot long, and invisible on fresh installs.
+# app.core.postgres_migrator._heal_sequences now creates it, and is the ONLY
+# thing in the app-managed upgrade path that ever will. Do not delete it on the
+# assumption that create_all covers this.
+_SEQUENCE_NAME = "oe_progress_entry_seq_seq"
+_progress_entry_seq = Sequence(_SEQUENCE_NAME, metadata=Base.metadata)
 
 
 class ProgressEntry(Base):
@@ -36,6 +58,13 @@ class ProgressEntry(Base):
     * Entries are *append-only*: to correct a mistake, record a new entry.
       The service layer always queries the *latest* entry for a position when
       computing current progress.
+    * ``seq`` is what makes "latest" well defined. ``recorded_at`` defaults to
+      the DB's ``now()``, which in PostgreSQL is the TRANSACTION timestamp, so
+      every row written by one transaction shares it exactly; ``created_at``
+      is a Python ``datetime.now()`` and ties too on a coarse clock. Without a
+      monotonic column the winner among same-transaction rows fell to a random
+      uuid, so a bulk-imported correction won only by luck. ``seq`` is
+      strictly increasing per INSERT and orders those rows properly.
     * ``geo_lat`` / ``geo_lon`` capture the worker's location at record-time
       (optional - phone may not provide GPS in all conditions).
     * ``rework_cost`` is stored as VARCHAR so money is never a float.
@@ -57,6 +86,36 @@ class ProgressEntry(Base):
         ),
         Index("ix_progress_entry_position_recorded", "boq_position_id", "recorded_at"),
         Index("ix_progress_entry_project_recorded", "project_id", "recorded_at"),
+        # "Latest wins" now leads with seq, so these are the indexes that
+        # actually serve the ranking queries in the repository.
+        Index("ix_progress_entry_position_seq", "boq_position_id", "seq"),
+        Index("ix_progress_entry_project_seq", "project_id", "seq"),
+    )
+
+    # Monotonic insertion counter; the database assigns it, callers never do.
+    # See the class docstring for why recorded_at and created_at cannot.
+    #
+    # Declared as an explicit Sequence with a server_default rather than as an
+    # Identity column, deliberately. Both produce the same thing under
+    # create_all, but only a server_default survives the OTHER schema path:
+    # `app.core.postgres_migrator` patches columns onto pre-existing tables by
+    # reading `col.server_default`, and it has no notion of identity. With
+    # Identity this column would land on an upgraded database as a plain
+    # nullable BIGINT with no default - NULL on every row, old and new - and
+    # "latest wins" would silently fall back to the tied timestamps this
+    # column exists to replace. The fix would look installed and do nothing.
+    # The default is spelled as raw text rather than as
+    # ``_progress_entry_seq.next_value()`` because the latter is compiled by
+    # the active dialect, and SQLite raises "does not support sequence
+    # increments" - which breaks the legacy SQLite-to-PostgreSQL upgrade path,
+    # since that builds the source schema from this same metadata. Raw text is
+    # emitted verbatim on PostgreSQL and never reaches the sequence compiler.
+    seq: Mapped[int] = mapped_column(
+        BigInteger,
+        _progress_entry_seq,
+        server_default=text(f"nextval('{_SEQUENCE_NAME}')"),
+        nullable=False,
+        unique=True,
     )
 
     project_id: Mapped[uuid.UUID] = mapped_column(

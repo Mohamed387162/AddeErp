@@ -17,9 +17,10 @@ from datetime import UTC, datetime
 
 from fastapi import APIRouter, Body, Depends, File, Form, HTTPException, Query, UploadFile, status
 from fastapi.responses import Response
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.content_disposition import attachment_disposition
 from app.dependencies import CurrentUserId, CurrentUserPayload, RequireRole, SessionDep, SettingsDep
 from app.modules.projects import profile_service
 from app.modules.projects.bundle_export import (
@@ -41,6 +42,7 @@ from app.modules.projects.bundle_import import (
     validate_bundle as fm_validate_bundle,
 )
 from app.modules.projects.file_manager_schemas import (
+    FILE_KINDS,
     EmailLinkResponse,
     ExportOptions,
     ExportPreview,
@@ -63,6 +65,8 @@ from app.modules.projects.file_manager_service import (
 )
 from app.modules.projects.member_schemas import (
     AddProjectMemberRequest,
+    BulkAddProjectMembersRequest,
+    BulkAddProjectMembersResponse,
     ProjectMemberResponse,
 )
 from app.modules.projects.module_presence import probe_project_modules
@@ -554,6 +558,60 @@ async def add_project_member_endpoint(
     from app.modules.projects.member_service import add_project_member
 
     return await add_project_member(session, project_id, data)
+
+
+@router.post(
+    "/{project_id}/members/bulk/",
+    response_model=BulkAddProjectMembersResponse,
+    status_code=201,
+    summary="Invite several members at once (mass invite)",
+    description="Open the project to the whole team in one call. Subject to the "
+    "CDE go-live gate: when the gate is enabled the project's common data "
+    "environment must have reached the required readiness level, otherwise the "
+    "invite is rejected with 409 so nobody is invited onto an unconfigured CDE.",
+)
+@router.post(
+    "/{project_id}/members/bulk",
+    response_model=BulkAddProjectMembersResponse,
+    status_code=201,
+    include_in_schema=False,
+)
+async def bulk_add_project_members_endpoint(
+    project_id: uuid.UUID,
+    data: BulkAddProjectMembersRequest,
+    user_id: CurrentUserId,
+    payload: CurrentUserPayload,
+    session: SessionDep,
+    service: ProjectService = Depends(_get_service),
+) -> BulkAddProjectMembersResponse:
+    """Invite several users at once, gated on CDE go-live readiness.
+
+    The CDE go-live gate is the anti-"showroom" protection: a team cannot invite
+    everyone onto a common data environment that has not actually been exercised.
+    When the gate blocks, the whole batch is rejected (409) so the invite is all
+    or nothing - no half-open CDE.
+    """
+    await _verify_project_owner(service, project_id, user_id, payload)
+
+    # Gate the mass invite on CDE readiness (lazy import to avoid a load-time
+    # cycle between the projects and cde modules).
+    from app.modules.cde.service import CDEService
+
+    gate = await CDEService(session).evaluate_go_live_gate(project_id)
+    if not gate.allowed:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"CDE go-live gate: the common data environment is not ready to open to the whole team. {gate.reason}"
+            ),
+        )
+
+    from app.modules.projects.member_service import add_project_member
+
+    added: list[ProjectMemberResponse] = []
+    for member in data.members:
+        added.append(await add_project_member(session, project_id, member))
+    return BulkAddProjectMembersResponse(added=added)
 
 
 @router.delete(
@@ -1413,11 +1471,23 @@ async def project_dashboard(
                     select(func.count(Requirement.id)).where(Requirement.requirement_set_id.in_(req_set_ids))
                 )
             ).scalar_one()
+            # Linked through either representation. A requirement governs work,
+            # plural, so the link table is the general answer and the single
+            # column is the one a caller wrote before that table existed.
+            # Counting only the column would make this figure fall as people
+            # move to the newer attachment, which is the opposite of the truth.
+            from app.modules.requirements.models import RequirementPositionLink
+
             linked_count = (
                 await session.execute(
                     select(func.count(Requirement.id)).where(
                         Requirement.requirement_set_id.in_(req_set_ids),
-                        Requirement.linked_position_id.isnot(None),
+                        or_(
+                            Requirement.linked_position_id.isnot(None),
+                            select(RequirementPositionLink.id)
+                            .where(RequirementPositionLink.requirement_id == Requirement.id)
+                            .exists(),
+                        ),
                     )
                 )
             ).scalar_one()
@@ -1466,13 +1536,13 @@ async def project_dashboard(
 
     measurements_count = 0
     try:
-        from app.modules.takeoff.models import TakeoffMeasurement
+        # Confirmed rows only: the dashboard reports work that has been agreed,
+        # so an unreviewed detector proposal must not inflate the tile. The
+        # repository owns the predicate so this tile and the takeoff totals
+        # cannot drift apart.
+        from app.modules.takeoff.repository import MeasurementRepository
 
-        measurements_count = (
-            await session.execute(
-                select(func.count(TakeoffMeasurement.id)).where(TakeoffMeasurement.project_id == project_id)
-            )
-        ).scalar_one()
+        measurements_count = await MeasurementRepository(session).count_confirmed_for_project(project_id)
     except Exception:
         logger.debug("Dashboard: takeoff measurements query failed", exc_info=True)
 
@@ -2564,6 +2634,11 @@ async def file_manager_list(
     session: SessionDep,
     service: ProjectService = Depends(_get_service),
     category: FileKind | None = Query(default=None),
+    kinds: str | None = Query(
+        default=None,
+        max_length=200,
+        description=("Comma-separated file kinds to include, e.g. 'document,takeoff'. Unknown kinds are rejected."),
+    ),
     extension: str | None = Query(default=None, max_length=10),
     q: str | None = Query(default=None, max_length=200),
     sort: str = Query(default="modified", pattern="^(modified|name|size|kind)$"),
@@ -2572,17 +2647,36 @@ async def file_manager_list(
 ) -> FileListResponse:
     """Flat listing of every file attached to ``project_id``.
 
-    Cross-module: documents, photos, sheets, BIM models, DWG drawings.
-    Each row carries the *real* on-disk path so the UI can ground users
-    on where their data actually lives.
+    Cross-module: documents, photos, sheets, BIM models, DWG drawings and
+    takeoff documents. Each row carries the *real* on-disk path so the UI can
+    ground users on where their data actually lives, and ``kind`` says which
+    module the row came from.
+
+    ``category`` selects one kind, ``kinds`` a set of them. A caller that wants
+    exactly two sources - the "open from project files" picker asking for the
+    documents area plus the calling module's own store - uses ``kinds`` and
+    gets one project-scoped, permission-checked, paged answer instead of
+    merging two listings client-side. An unknown kind is a 400 rather than a
+    silently empty page, because a typo there returns rows the caller did not
+    ask for and nothing on screen would say so.
     """
     # IDOR/RBAC: team-readable docs - allow project team members (owner/admin/member), not owner-only
     await _verify_project_access(service, project_id, user_id, session, payload)
+    wanted: list[str] | None = None
+    if kinds:
+        wanted = [k.strip() for k in kinds.split(",") if k.strip()]
+        unknown = sorted({k for k in wanted if k not in FILE_KINDS})
+        if unknown:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Unknown file kind(s): {', '.join(unknown)}",
+            )
     return await fm_list_files(
         session,
         str(project_id),
         user_id=str(user_id) if user_id else None,
         category=category,
+        kinds=wanted,
         extension=extension,
         query=q,
         limit=limit,
@@ -2706,7 +2800,7 @@ async def post_export_bundle(
         content=raw,
         media_type="application/zip",
         headers={
-            "Content-Disposition": f'attachment; filename="{fname}"',
+            "Content-Disposition": attachment_disposition(fname),
             "X-Bundle-Format": "ocep",
             "X-Bundle-Scope": options.scope,
         },

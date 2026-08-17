@@ -9,8 +9,11 @@ No business logic - pure data access.
 import uuid
 from typing import Any
 
-from sqlalchemy import func, or_, select, update
+from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm.attributes import set_committed_value
+from sqlalchemy.orm.util import identity_key
+from sqlalchemy.sql.elements import ClauseElement
 
 from app.modules.markups.models import Markup, MarkupComment, ScaleConfig, StampTemplate
 
@@ -146,7 +149,15 @@ class MarkupRepository:
         stmt = update(Markup).where(Markup.id == markup_id).values(**fields)
         await self.session.execute(stmt)
         await self.session.flush()
-        self.session.expire_all()
+        instance = self.session.identity_map.get(identity_key(Markup, markup_id))
+        if instance is None:
+            return
+        computed = [name for name, value in fields.items() if isinstance(value, ClauseElement)]
+        for name, value in fields.items():
+            if name not in computed:
+                set_committed_value(instance, name, value)
+        if computed:
+            self.session.expire(instance, computed)
 
     async def delete(self, markup_id: uuid.UUID) -> None:
         """Hard delete a markup."""
@@ -208,10 +219,23 @@ class StampTemplateRepository:
         self,
         project_id: uuid.UUID | None,
     ) -> list[StampTemplate]:
-        """List stamp templates: predefined (global) + project-specific."""
+        """List stamp templates: predefined (global) + project-specific.
+
+        "Global" means ``project_id IS NULL`` - the shape
+        ``MarkupsService.seed_default_stamps`` writes and the one the
+        router's ``_authorize_stamp_mutation`` gate assumes. It does NOT
+        mean ``category == "predefined"``: the category is a display label
+        constrained to ``predefined|custom`` by the schema, and the demo
+        seeder writes project-scoped rows carrying it. Testing the label
+        alone made every project's stamps match, so the ``project_id``
+        filter never bit and each project saw all the others' templates.
+        """
         stmt = select(StampTemplate).where(
             or_(
-                StampTemplate.category == "predefined",
+                and_(
+                    StampTemplate.category == "predefined",
+                    StampTemplate.project_id.is_(None),
+                ),
                 StampTemplate.project_id == project_id,
             )
         )
@@ -237,7 +261,15 @@ class StampTemplateRepository:
         stmt = update(StampTemplate).where(StampTemplate.id == template_id).values(**fields)
         await self.session.execute(stmt)
         await self.session.flush()
-        self.session.expire_all()
+        instance = self.session.identity_map.get(identity_key(StampTemplate, template_id))
+        if instance is None:
+            return
+        computed = [name for name, value in fields.items() if isinstance(value, ClauseElement)]
+        for name, value in fields.items():
+            if name not in computed:
+                set_committed_value(instance, name, value)
+        if computed:
+            self.session.expire(instance, computed)
 
     async def delete(self, template_id: uuid.UUID) -> None:
         """Hard delete a stamp template."""

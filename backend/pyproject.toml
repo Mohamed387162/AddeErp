@@ -1,7 +1,7 @@
 [project]
 name = "openconstructionerp"
-version = "11.10.0"
-description = "Open-source construction cost estimation, multi-currency BOQ, AI vector matching, CAD/BIM takeoff without IfcOpenShell, resource-based cost DB import with example templates, 48 regional catalogues, 27 languages. AGPL-3.0. After install, run: openconstructionerp"
+version = "14.8.1"
+description = "Open-source construction cost estimation, multi-currency BOQ, AI vector matching, CAD/BIM takeoff without IfcOpenShell, resource-based cost DB import with example templates, 48 regional catalogues, 29 locales. AGPL-3.0. After install, run: openconstructionerp"
 license = "AGPL-3.0-or-later"
 requires-python = ">=3.12"
 authors = [
@@ -90,7 +90,7 @@ dependencies = [
     # which the dashboards integrity detector and its tests were written
     # against. Revisit and lift the cap when adopting pandas 3 deliberately.
     "pandas>=2.2.0,<3",
-    "pyarrow>=23.0.1,<25",
+    "pyarrow>=23.0.1,<26",
     "trimesh>=4.0.0",
     # trimesh's COLLADA loader is a thin wrapper over pycollada (imported as
     # "collada"); without it trimesh.load() of a .dae raises ImportError and the
@@ -141,6 +141,37 @@ vector = [
     "lancedb>=0.17.0",
     "fastembed>=0.4.0",
 ]
+# The vector-store client, without any embedding model. qdrant-client talks to
+# the CWICR match store (app/modules/costs/qdrant_adapter.py) and was reachable
+# only through [semantic], so the standard docker image and the frozen desktop
+# sidecar both shipped without it and /match-elements answered an empty 200 on
+# every stock install. Not because results were poor: _get_client() raised
+# ImportError, the hybrid search failed, the ranker's encoder-free metadata
+# fallback called _get_client() too and raised again, and both failures were
+# logged and swallowed into an empty candidate list. It lives in its own extra
+# so the image and the desktop lock can carry the client without torch.
+#
+# Deliberately NOT here, each measured or traced rather than assumed:
+#
+# * FlagEmbedding / sentence-transformers - gigabytes of torch. The PyInstaller
+#   spec excludes torch outright, so they could never reach the desktop build.
+# * polars - only reads an operator-supplied CWICR rate parquet from
+#   ~/.openestimator/cwicr, and nothing ships or downloads that file (the
+#   snapshot loader restores Qdrant collections, not parquet). Weight no code
+#   path on a stock install would reach.
+# * lancedb - added here first, then removed on measurement. It is not a light
+#   client: 157 MB on Linux and 196 MB on Windows, almost all of it one
+#   unstripped Rust extension, against 21 MB for qdrant-client and its gRPC
+#   stack. It would also not have bought the feature it looks like it buys,
+#   because core/vector.py's get_embedder() only tries sentence-transformers
+#   and nothing in the tree imports fastembed, so the generic semantic store
+#   has no encoder either way. It stays in [vector]. Deploy targets do set
+#   VECTOR_BACKEND=lancedb against an uninstalled backend; that mismatch
+#   predates this extra and is a separate decision, not something to paper
+#   over by shipping 157 MB.
+semantic-clients = [
+    "qdrant-client>=1.12.0",
+]
 # Semantic search: Qdrant vector DB + sentence-transformers embeddings.
 # Used by the cost-database semantic-match endpoints and the RAG layer.
 #
@@ -150,7 +181,7 @@ vector = [
 # of dead wheels on the user's disk. API keys live in the database and
 # `~/.openestimate/config.json`, not in SDK clients.
 semantic = [
-    "qdrant-client>=1.12.0",
+    "openconstructionerp[semantic-clients]",
     "sentence-transformers>=3.3.0",
     # BAAI/bge-m3 multilingual encoder — 1024-dim dense + sparse + colbert
     # in one forward pass, MIT license, 100+ languages. Powers the CWICR
@@ -226,6 +257,12 @@ dev = [
     "pytest-split>=0.8.2",
     "httpx>=0.28.0",
     "factory-boy>=3.3.0",
+    # Gitignore-grammar matcher used by the .dockerignore coverage test, which
+    # asserts that a docker build context cannot pick up .env files or customer
+    # uploads. It was never declared, so the test could not import anywhere, and
+    # an uncollectable module aborts the whole run rather than one file: the
+    # entire suite was unrunnable because of a single missing test dependency.
+    "pathspec>=0.12.0",
     # XSD validation oracle for the GAEB DA XML 3.3 exporter conformance suite
     # (tests/unit/test_gaeb_export_xsd.py validates exported X83/X84 against the
     # official GAEB schema). Test-only; the runtime XML path uses defusedxml.

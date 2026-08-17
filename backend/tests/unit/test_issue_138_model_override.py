@@ -400,23 +400,25 @@ class TestErpChatFallbackDeliversOverride:
         assert key == "sk-or-e2e"
         assert model_override == "deepseek/deepseek-chat"
 
+    # Issue #417 turned ``_call_fallback`` from an SSE generator into a plain
+    # coroutine returning ``(text, tokens)``, so the caller can run the one
+    # shared tail that persists the reply and counts tokens. These two tests
+    # drive it the way the caller now does. What they are checking is
+    # unchanged: the model id the user picked has to reach the provider.
     async def test_call_fallback_sends_override_model_to_openrouter(self, post_recorder):
         from app.modules.erp_chat.service import ERPChatService
 
         svc = ERPChatService(session=object())
-        chunks = [
-            c
-            async for c in svc._call_fallback(
-                provider="openrouter",
-                api_key="sk-or-e2e",
-                message="estimate a wall",
-                model="deepseek/deepseek-chat",
-            )
-        ]
-        # No error event, and the override model was actually transmitted.
-        joined = "".join(chunks)
-        assert "error" not in joined
-        assert "ok-answer" in joined
+        text, tokens = await svc._call_fallback(
+            provider="openrouter",
+            api_key="sk-or-e2e",
+            message="estimate a wall",
+            model="deepseek/deepseek-chat",
+        )
+        # Failure is an exception now rather than an error frame in the stream,
+        # so reaching this line at all is the "no error" assertion.
+        assert "ok-answer" in text
+        assert isinstance(tokens, int)
         assert post_recorder.last_model == "deepseek/deepseek-chat"
         assert post_recorder.last_model != OPENROUTER_MODEL
 
@@ -424,15 +426,12 @@ class TestErpChatFallbackDeliversOverride:
         from app.modules.erp_chat.service import ERPChatService
 
         svc = ERPChatService(session=object())
-        _ = [
-            c
-            async for c in svc._call_fallback(
-                provider="openrouter",
-                api_key="sk-or-e2e",
-                message="hi",
-                model=None,
-            )
-        ]
+        await svc._call_fallback(
+            provider="openrouter",
+            api_key="sk-or-e2e",
+            message="hi",
+            model=None,
+        )
         assert post_recorder.last_model == OPENROUTER_MODEL
 
 
@@ -488,6 +487,11 @@ _HANDLER_FILES = [
 def _iter_call_ai_invocations(src: str) -> list[str]:
     """Return the full argument text of every real ``call_ai(...)`` call.
 
+    ``call_ai_tools(...)`` counts too. It is the tool-carrying sibling added
+    for issue #424 and it takes the same ``model=`` argument, so forgetting it
+    there is the identical #138 regression - and a pattern anchored on
+    ``call_ai(`` alone would not see it.
+
     Brackets are balanced so nested parentheses inside arguments are
     captured whole. Non-invocations are skipped:
 
@@ -498,7 +502,7 @@ def _iter_call_ai_invocations(src: str) -> list[str]:
       passes provider/api_key/etc., so a zero-arg span is documentation.
     """
     invocations: list[str] = []
-    for m in re.finditer(r"\bcall_ai\s*\(", src):
+    for m in re.finditer(r"\bcall_ai(?:_tools)?\s*\(", src):
         # Exclude the symbol appearing in an import statement.
         line_start = src.rfind("\n", 0, m.start()) + 1
         line = src[line_start : src.find("\n", m.start())]

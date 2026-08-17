@@ -6,7 +6,7 @@
  * All endpoints are prefixed with /v1/correspondence/.
  */
 
-import { apiDelete, apiGet, apiPatch, apiPost, triggerDownload } from '@/shared/lib/api';
+import { apiDelete, apiGet, apiPatch, apiPost, triggerDownload, type Page } from '@/shared/lib/api';
 import { useAuthStore } from '@/stores/useAuthStore';
 
 /* ── Types ─────────────────────────────────────────────────────────────── */
@@ -14,6 +14,8 @@ import { useAuthStore } from '@/stores/useAuthStore';
 export type CorrespondenceDirection = 'incoming' | 'outgoing';
 
 export type CorrespondenceType = 'letter' | 'email' | 'notice' | 'memo';
+
+export type CorrespondenceStatus = 'open' | 'awaiting_response' | 'responded' | 'closed';
 
 export interface Correspondence {
   id: string;
@@ -32,6 +34,16 @@ export interface Correspondence {
   linked_transmittal_id: string | null;
   /** Optional link back to the RFI this letter relates to. */
   linked_rfi_id: string | null;
+  /** Lifecycle state of the record. */
+  status: CorrespondenceStatus;
+  /** ISO date (yyyy-mm-dd) a reply is contractually due, if any. */
+  response_required_by: string | null;
+  /** Free-text pointer to the contract clause a notice is served under. */
+  contract_clause_ref: string | null;
+  /** Computed server-side: still open and past its response deadline. */
+  is_overdue: boolean;
+  /** Computed server-side: signed days to the deadline (negative once past). */
+  days_until_due: number | null;
   /** Server-derived relative paths of validated uploaded attachments. */
   attachments: string[];
   notes: string | null;
@@ -44,6 +56,7 @@ export interface CorrespondenceFilters {
   project_id?: string;
   direction?: CorrespondenceDirection | '';
   type?: CorrespondenceType | '';
+  status?: CorrespondenceStatus | '';
 }
 
 export interface CreateCorrespondencePayload {
@@ -58,6 +71,9 @@ export interface CreateCorrespondencePayload {
   linked_document_ids?: string[];
   linked_transmittal_id?: string | null;
   linked_rfi_id?: string | null;
+  status?: CorrespondenceStatus;
+  response_required_by?: string | null;
+  contract_clause_ref?: string | null;
   notes?: string;
 }
 
@@ -65,13 +81,25 @@ export interface UpdateCorrespondencePayload {
   subject?: string;
   direction?: CorrespondenceDirection;
   correspondence_type?: CorrespondenceType;
-  from_contact_id?: string;
+  /**
+   * `null` clears the sender. `undefined` cannot: `JSON.stringify` drops the
+   * key and the old value survives, so emptying the field would do nothing.
+   */
+  from_contact_id?: string | null;
   to_contact_ids?: string[];
-  date_sent?: string;
-  date_received?: string;
+  /**
+   * `null` clears the date. An empty string is rejected: the backend field
+   * sits behind a `^\d{4}-\d{2}-\d{2}$` pattern, so `''` is a 422 rather than
+   * "no date".
+   */
+  date_sent?: string | null;
+  date_received?: string | null;
   linked_document_ids?: string[];
   linked_transmittal_id?: string | null;
   linked_rfi_id?: string | null;
+  status?: CorrespondenceStatus;
+  response_required_by?: string | null;
+  contract_clause_ref?: string | null;
   notes?: string | null;
 }
 
@@ -87,12 +115,19 @@ type CorrespondenceWire = Omit<
   | 'linked_transmittal_id'
   | 'linked_rfi_id'
   | 'attachments'
+  | 'status'
+  | 'is_overdue'
 > & {
   to_contact_ids?: string[] | null;
   linked_document_ids?: string[] | null;
   linked_transmittal_id?: string | null;
   linked_rfi_id?: string | null;
   attachments?: string[] | null;
+  status?: CorrespondenceStatus | null;
+  response_required_by?: string | null;
+  contract_clause_ref?: string | null;
+  is_overdue?: boolean | null;
+  days_until_due?: number | null;
 };
 
 function normaliseCorrespondence(c: CorrespondenceWire): Correspondence {
@@ -103,6 +138,13 @@ function normaliseCorrespondence(c: CorrespondenceWire): Correspondence {
     linked_transmittal_id: c.linked_transmittal_id ?? null,
     linked_rfi_id: c.linked_rfi_id ?? null,
     attachments: c.attachments ?? [],
+    // Older rows / partial serialisers may omit the lifecycle fields; default
+    // to an open record with no deadline so the UI never reads undefined.
+    status: c.status ?? 'open',
+    response_required_by: c.response_required_by ?? null,
+    contract_clause_ref: c.contract_clause_ref ?? null,
+    is_overdue: c.is_overdue ?? false,
+    days_until_due: c.days_until_due ?? null,
   } as Correspondence;
 }
 
@@ -110,20 +152,26 @@ function normaliseCorrespondence(c: CorrespondenceWire): Correspondence {
 
 export async function fetchCorrespondence(
   filters?: CorrespondenceFilters,
-): Promise<Correspondence[]> {
+): Promise<Page<Correspondence>> {
   const params = new URLSearchParams();
   if (filters?.project_id) params.set('project_id', filters.project_id);
   if (filters?.direction) params.set('direction', filters.direction);
   if (filters?.type) params.set('type', filters.type);
+  if (filters?.status) params.set('status', filters.status);
   // Raise from the server default cap (50) to its accepted ceiling (le=100) so
   // the list and client-side search cover up to 100 records instead of
-  // silently dropping older rows.
+  // silently dropping older rows. Beyond that the server reports how many
+  // matched in `total`, which is what lets the page say the log is cut.
   params.set('limit', '100');
-  const qs = params.toString();
-  const rows = await apiGet<CorrespondenceWire[]>(
-    `/v1/correspondence/${qs ? `?${qs}` : ''}`,
+  // Written as one literal rather than a `qs ? '?' + qs : ''` ternary: the
+  // limit above is unconditional, so the empty branch was unreachable, and
+  // the route scan in scripts/check_page_envelope_consumers.py can only bind
+  // a URL it can read end to end - a ternary with a space in it stops the
+  // match and the endpoint reports zero call sites it never inspected.
+  const page = await apiGet<Page<CorrespondenceWire>>(
+    `/v1/correspondence/?${params.toString()}`,
   );
-  return rows.map(normaliseCorrespondence);
+  return { ...page, items: page.items.map(normaliseCorrespondence) };
 }
 
 export async function createCorrespondence(

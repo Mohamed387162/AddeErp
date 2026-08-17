@@ -71,6 +71,7 @@ import {
   DismissibleInfo,
   IntroRichText,
   ModuleGuideButton,
+  CollapsibleSection,
 } from '@/shared/ui';
 import { PageHeader } from '@/shared/ui/PageHeader';
 import { crmGuide } from './crmGuide';
@@ -82,9 +83,10 @@ import {
 import { MoneyDisplay } from '@/shared/ui/MoneyDisplay';
 import { MultiCurrencyTotal } from '@/shared/ui/MultiCurrencyTotal';
 import { DateDisplay } from '@/shared/ui/DateDisplay';
+import { TruncationNotice } from '@/shared/ui/TruncationNotice';
 import { useToastStore } from '@/stores/useToastStore';
 import { getErrorMessage } from '@/shared/lib/api';
-import { fetchContacts, type Contact } from '@/features/contacts/api';
+import { fetchContact, fetchContacts, type Contact } from '@/features/contacts/api';
 import { projectsApi, type Project } from '@/features/projects/api';
 import {
   listAccounts,
@@ -142,6 +144,32 @@ const OPP_STATUS_VARIANT: Record<
   lost: 'error',
   abandoned: 'neutral',
 };
+
+// English fallbacks for the two status enums. The screen always shows the
+// translated label — the storage token (``qualifying``, ``won``) is never
+// rendered on its own.
+const LEAD_STATUS_EN: Record<LeadStatus, string> = {
+  new: 'New',
+  qualifying: 'Qualifying',
+  qualified: 'Qualified',
+  disqualified: 'Disqualified',
+  converted: 'Converted',
+};
+
+const OPP_STATUS_EN: Record<OpportunityStatus, string> = {
+  open: 'Open',
+  won: 'Won',
+  lost: 'Lost',
+  abandoned: 'Abandoned',
+};
+
+function leadStatusLabel(s: LeadStatus, t: TFn): string {
+  return t(`crm.lead_status_${s}`, { defaultValue: LEAD_STATUS_EN[s] });
+}
+
+function oppStatusLabel(s: OpportunityStatus, t: TFn): string {
+  return t(`crm.opp_status_${s}`, { defaultValue: OPP_STATUS_EN[s] });
+}
 
 const LEAD_SOURCES: LeadSource[] = [
   'web',
@@ -261,12 +289,12 @@ function HowCrmWorks() {
   ];
 
   return (
-    <Card padding="md">
-      <h2 className="flex items-center gap-1.5 text-sm font-semibold text-content-primary">
-        <Network size={15} className="text-oe-blue" />
-        {t('crm.flow_title', { defaultValue: 'How the CRM fits together' })}
-      </h2>
-      <p className="mt-1 text-xs text-content-tertiary">
+    <CollapsibleSection
+      storageKey="crm.how"
+      icon={<Network size={15} className="text-oe-blue" />}
+      title={t('crm.flow_title', { defaultValue: 'How the CRM fits together' })}
+    >
+      <p className="text-xs text-content-tertiary">
         {t('crm.flow_intro', {
           defaultValue:
             'The CRM turns an enquiry into a qualified deal, moves it across the pipeline, and hands a win off to delivery. People come from Contacts; won work flows on to bids and contracts.',
@@ -326,7 +354,7 @@ function HowCrmWorks() {
           </ModLink>
         </span>
       </div>
-    </Card>
+    </CollapsibleSection>
   );
 }
 
@@ -1061,7 +1089,7 @@ function DealsTable({
                 </td>
                 <td className="px-4 py-2">
                   <Badge variant={OPP_STATUS_VARIANT[r.status]} dot>
-                    {r.status}
+                    {oppStatusLabel(r.status, t)}
                   </Badge>
                 </td>
                 <td className="px-4 py-2 text-right">
@@ -1158,7 +1186,7 @@ function LeadsTable({
               </td>
               <td className="px-4 py-2">
                 <Badge variant={LEAD_STATUS_VARIANT[r.status]} dot>
-                  {r.status}
+                  {leadStatusLabel(r.status, t)}
                 </Badge>
               </td>
               <td className="px-4 py-2 text-xs text-content-secondary">
@@ -1296,12 +1324,12 @@ function DealDrawer({
   );
 
   // Resolve the linked Contact through the Contacts module (no local copy).
+  // Asks for the one contact by id. It used to pull 500 rows and search them,
+  // which answered "no such contact" for every contact past the page - a
+  // silent wrong answer, since the drawer just rendered the empty state.
   const contactQ = useQuery({
     queryKey: ['contacts', 'one', opp?.primary_contact_id],
-    queryFn: () =>
-      fetchContacts({ limit: 500 }).then(
-        (cs) => cs.find((c) => c.id === opp?.primary_contact_id) ?? null,
-      ),
+    queryFn: () => fetchContact(opp!.primary_contact_id as string).catch(() => null),
     enabled: Boolean(opp?.primary_contact_id),
   });
 
@@ -1415,7 +1443,7 @@ function DealDrawer({
             <h2 className="truncate text-base font-semibold">{opp.title}</h2>
             <div className="mt-1 flex items-center gap-2">
               <Badge variant={OPP_STATUS_VARIANT[opp.status]} dot>
-                {opp.status}
+                {oppStatusLabel(opp.status, t)}
               </Badge>
               <span className="truncate text-xs text-content-tertiary">
                 {accountsById[opp.account_id]?.name || ''}
@@ -1974,12 +2002,13 @@ function LinkRecordsForm({
           <option value="">
             {t('crm.no_contact', { defaultValue: '- No contact -' })}
           </option>
-          {(contactsQ.data ?? []).map((c) => (
+          {(contactsQ.data?.items ?? []).map((c) => (
             <option key={c.id} value={c.id}>
               {contactLabel(c)}
             </option>
           ))}
         </select>
+        {contactsQ.data && <TruncationNotice page={contactsQ.data} className="mt-1" />}
       </div>
       <div>
         <p className="mb-1 text-[11px] uppercase tracking-wide text-content-tertiary">
@@ -2146,7 +2175,7 @@ function LeadDrawer({
           <div>
             <h2 className="text-base font-semibold">{lead.contact_name}</h2>
             <Badge variant={LEAD_STATUS_VARIANT[lead.status]} dot>
-              {lead.status}
+              {leadStatusLabel(lead.status, t)}
             </Badge>
           </div>
           <button
@@ -3001,12 +3030,13 @@ function CreateModal({
                 <option value="">
                   {t('crm.no_contact', { defaultValue: '- No contact -' })}
                 </option>
-                {(contactsQ.data ?? []).map((c) => (
+                {(contactsQ.data?.items ?? []).map((c) => (
                   <option key={c.id} value={c.id}>
                     {contactLabel(c)}
                   </option>
                 ))}
               </select>
+              {contactsQ.data && <TruncationNotice page={contactsQ.data} className="mt-1" />}
             </WideModalField>
             <WideModalField
               label={t('crm.project', { defaultValue: 'Project' })}

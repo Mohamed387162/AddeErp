@@ -35,11 +35,18 @@ from app.modules.finance.repository import (
     LedgerRepository,
     PaymentRepository,
 )
+from app.modules.finance.retention_ledger import (
+    InvoiceRetention,
+    PaymentWithholding,
+    RetentionLedger,
+    build_retention_ledger,
+)
 from app.modules.finance.schemas import (
     BudgetCreate,
     BudgetUpdate,
     EVMSnapshotCreate,
     InvoiceCreate,
+    InvoiceLineItemCreate,
     InvoiceUpdate,
     JournalEntryCreate,
     LedgerAccountCreate,
@@ -50,6 +57,11 @@ from app.modules.finance.schemas import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Upper bound on invoices scanned for the retention ledger (mirrors the invoice
+# Excel-export cap). A read model, so a hard ceiling keeps a pathological
+# project from loading unbounded rows; realistic projects stay far below it.
+_RETENTION_LEDGER_INVOICE_CAP = 50000
 
 
 def _safe_decimal(value: object, default: Decimal = Decimal("0")) -> Decimal:
@@ -243,6 +255,38 @@ def compute_payment_withholding(
     return _q2(amount_to_pay), _q2(withheld)
 
 
+def _line_item_from(invoice_id: uuid.UUID, item_data: InvoiceLineItemCreate, idx: int) -> InvoiceLineItem:
+    """Build a line item row from its Create schema.
+
+    Creating an invoice and replacing its lines persist the same shape, so the
+    mapping lives here once. Written out at each caller instead, a newly added
+    field reaches whichever caller the author happened to be editing and is
+    silently dropped by the other.
+
+    Args:
+        invoice_id: the invoice the line belongs to.
+        item_data: the validated Create schema for one line.
+        idx: position in the submitted list, used when no sort order is given.
+
+    Returns:
+        An unpersisted :class:`InvoiceLineItem`.
+    """
+    return InvoiceLineItem(
+        invoice_id=invoice_id,
+        description=item_data.description,
+        quantity=item_data.quantity,
+        unit=item_data.unit,
+        unit_rate=item_data.unit_rate,
+        amount=item_data.amount,
+        wbs_id=item_data.wbs_id,
+        cost_category=item_data.cost_category,
+        cost_line_id=getattr(item_data, "cost_line_id", None),
+        sort_order=item_data.sort_order if item_data.sort_order else idx,
+        vat_rate=item_data.vat_rate,
+        vat_category=item_data.vat_category,
+    )
+
+
 class FinanceService:
     """Business logic for finance operations."""
 
@@ -276,9 +320,30 @@ class FinanceService:
                 ),
             )
 
-        # Auto-generate invoice number if not provided
+        # Auto-generate invoice number if not provided.
+        #
+        # A number supplied by the caller is checked, because nothing else
+        # checks it: there is no unique constraint on the column, so a repeat
+        # simply produced a second invoice carrying a number already in use.
+        # That is the key reconciliation, payment matching and every accounting
+        # export rely on, so the duplicate does not surface as a display quirk,
+        # it surfaces as two documents nobody can tell apart.
         invoice_number = data.invoice_number
-        if not invoice_number:
+        if invoice_number:
+            taken = await self.invoices.invoice_number_taken(
+                data.project_id,
+                data.invoice_direction,
+                invoice_number,
+            )
+            if taken:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=(
+                        f"Invoice number '{invoice_number}' is already used on this "
+                        "project. Leave it empty to have one generated."
+                    ),
+                )
+        else:
             invoice_number = await self.invoices.next_invoice_number(data.project_id, data.invoice_direction)
 
         # Server-side total computation: always override amount_total
@@ -307,19 +372,7 @@ class FinanceService:
 
         # Create line items
         for idx, item_data in enumerate(data.line_items):
-            item = InvoiceLineItem(
-                invoice_id=invoice.id,
-                description=item_data.description,
-                quantity=item_data.quantity,
-                unit=item_data.unit,
-                unit_rate=item_data.unit_rate,
-                amount=item_data.amount,
-                wbs_id=item_data.wbs_id,
-                cost_category=item_data.cost_category,
-                cost_line_id=getattr(item_data, "cost_line_id", None),
-                sort_order=item_data.sort_order if item_data.sort_order else idx,
-            )
-            await self.line_items.create(item)
+            await self.line_items.create(_line_item_from(invoice.id, item_data, idx))
 
         # Re-fetch invoice with relationships (line_items, payments) eager-loaded
         refreshed = await self.invoices.get(invoice.id)
@@ -438,19 +491,7 @@ class FinanceService:
 
             await self.line_items.delete_by_invoice(invoice_id)
             for idx, item_data in enumerate(data.line_items):
-                item = InvoiceLineItem(
-                    invoice_id=invoice_id,
-                    description=item_data.description,
-                    quantity=item_data.quantity,
-                    unit=item_data.unit,
-                    unit_rate=item_data.unit_rate,
-                    amount=item_data.amount,
-                    wbs_id=item_data.wbs_id,
-                    cost_category=item_data.cost_category,
-                    cost_line_id=getattr(item_data, "cost_line_id", None),
-                    sort_order=item_data.sort_order if item_data.sort_order else idx,
-                )
-                await self.line_items.create(item)
+                await self.line_items.create(_line_item_from(invoice_id, item_data, idx))
 
             # Single audit row for the bulk replacement. Best-effort:
             # failures are warned (not rolled back) for the same reason as
@@ -511,6 +552,11 @@ class FinanceService:
         """
         invoice = await self.get_invoice(invoice_id)
         prior = invoice.status
+        # Read the number before the update expires the instance. Everything
+        # below the update that touches ``invoice`` runs after a re-``get``,
+        # which reloads the same identity-mapped row, but the audit call does
+        # not, and a lazy load there has no greenlet to run in.
+        invoice_number = invoice.invoice_number
         if prior not in ("draft", "pending"):
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -534,7 +580,7 @@ class FinanceService:
                 from_status=prior,
                 to_status="sent",
                 reason=reason or "Invoice approved via approve_invoice()",
-                metadata={"invoice_number": invoice.invoice_number},
+                metadata={"invoice_number": invoice_number},
             )
         except Exception as exc:
             logger.warning(
@@ -583,6 +629,10 @@ class FinanceService:
         """
         invoice = await self.get_invoice(invoice_id)
         prior = invoice.status
+        # Same reason as in ``approve_invoice``: the update expires the
+        # instance, and the audit call below is the one place that reads it
+        # before the re-``get`` reloads it.
+        invoice_number = invoice.invoice_number
         if prior not in ("approved", "sent"):
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -605,7 +655,7 @@ class FinanceService:
                 from_status=prior,
                 to_status="paid",
                 reason=reason or "Invoice paid via pay_invoice()",
-                metadata={"invoice_number": invoice.invoice_number},
+                metadata={"invoice_number": invoice_number},
             )
         except Exception as exc:
             logger.warning(
@@ -1093,6 +1143,37 @@ class FinanceService:
         line_repo = ProgressClaimLineRepository(self.session)
         claim_lines = await line_repo.list_for_claim(claim_id)
 
+        # The schedule-of-values lines the claim bills against supply what the
+        # claim rows do not carry: the human description of the work, its unit
+        # of measure and, via value / quantity, its billed rate. Without them
+        # every invoice line used to read "Progress claim <n> line (contract
+        # line <uuid>)" with no unit and a zero unit price, which no reader can
+        # parse and an e-invoice check rejects line by line (BR-23).
+        from sqlalchemy import select as _select
+
+        from app.modules.contracts.models import ContractLine as _ContractLine
+
+        sov_by_id: dict[uuid.UUID, _ContractLine] = {}
+        contract_line_ids = {cl.contract_line_id for cl in claim_lines}
+        if contract_line_ids:
+            rows = await self.session.execute(_select(_ContractLine).where(_ContractLine.id.in_(contract_line_ids)))
+            sov_by_id = {row.id: row for row in rows.scalars()}
+
+        # E-invoice metadata is contract data here: a public buyer hands the
+        # routing id (Leitweg-ID / buyer reference) and the agreed VAT
+        # treatment over at award, so they live under the contract's
+        # ``metadata.einvoice`` and every invoice raised from one of its claims
+        # inherits them. Writing provenance-only metadata used to drop this
+        # key, so the compliance check opened with findings (BR-DE-15) the
+        # invoice could have answered from data the platform already had.
+        contract_einvoice = dict((contract.metadata_ or {}).get("einvoice") or {})
+        vat_rate = _safe_decimal(contract_einvoice.get("vat_rate"), Decimal("0"))
+        tax_base = (
+            (gross_base * vat_rate / Decimal("100")).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            if vat_rate > 0
+            else Decimal("0")
+        )
+
         invoice_number = await self.invoices.next_invoice_number(project_id, "receivable")
         invoice = Invoice(
             project_id=project_id,
@@ -1103,9 +1184,9 @@ class FinanceService:
             due_date=None,
             currency_code=invoice_currency,
             amount_subtotal=gross_base,
-            tax_amount=Decimal("0"),
+            tax_amount=tax_base,
             retention_amount=retention_base,
-            amount_total=gross_base,
+            amount_total=gross_base + tax_base,
             status="draft",
             source_claim_id=claim_id,
             notes=f"Auto-created from certified progress claim {claim.claim_number}",
@@ -1118,19 +1199,42 @@ class FinanceService:
                 "claim_currency": claim_currency,
                 "gross_amount": str(gross_base),
                 "net_due": str(net_base),
+                **({"einvoice": contract_einvoice} if contract_einvoice else {}),
             },
         )
         invoice = await self.invoices.create(invoice)
 
         for idx, cl in enumerate(claim_lines):
             amount_base = _to_base(cl.period_completed_value)
+            sov = sov_by_id.get(cl.contract_line_id)
+            code = (sov.code or "").strip() if sov else ""
+            text = (sov.description or "").strip() if sov else ""
+            description = " ".join(part for part in (code, text) if part)
+            if not description:
+                # Degenerate schedule row with neither code nor text: name the
+                # claim and the position, never a raw id.
+                description = f"{claim.claim_number}, item {idx + 1}"
+            quantity = _safe_decimal(cl.period_completed_qty, Decimal("0"))
+            unit = ((sov.unit or "").strip() if sov else "") or None
+            if quantity > 0:
+                # Billed rate for the period, derived so quantity x rate is the
+                # billed value rather than restating the full contract rate on
+                # a partially completed line.
+                unit_rate = (amount_base / quantity).quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)
+            else:
+                # Value-only billing (percent complete without a measured
+                # quantity): one lump sum at the billed amount. "psch" is the
+                # schedule's own lump-sum token (UNECE LS).
+                quantity = Decimal("1")
+                unit = unit or "psch"
+                unit_rate = amount_base
             await self.line_items.create(
                 InvoiceLineItem(
                     invoice_id=invoice.id,
-                    description=(f"Progress claim {claim.claim_number} line (contract line {cl.contract_line_id})"),
-                    quantity=_safe_decimal(cl.period_completed_qty, Decimal("1")) or Decimal("1"),
-                    unit=None,
-                    unit_rate=Decimal("0"),
+                    description=description,
+                    quantity=quantity,
+                    unit=unit,
+                    unit_rate=unit_rate,
                     amount=amount_base,
                     wbs_id=None,
                     cost_category=None,
@@ -1676,6 +1780,55 @@ class FinanceService:
         return await self.evm.list(project_id=project_id, project_ids=project_ids)
 
     # ── Dashboard ───────────────────────────────────────────────────────────
+
+    async def get_retention_ledger(
+        self,
+        project_id: uuid.UUID,
+        *,
+        as_of: str | None = None,
+    ) -> RetentionLedger:
+        """Build the project's retention / withholding ledger from stored rows.
+
+        Loads every invoice for the project together with its payments (retainage
+        lives on ``Invoice.retention_amount`` and ``Payment.withholding_amount``),
+        then delegates the arithmetic to the pure
+        :func:`app.modules.finance.retention_ledger.build_retention_ledger`.
+
+        ``as_of`` is the release-date cutoff that decides what counts as
+        released; when omitted the current UTC date is used, so "released to
+        date" means "release date reached as of today". No money is blended
+        across currencies or across payable / receivable direction.
+        """
+        from sqlalchemy import select
+        from sqlalchemy.orm import selectinload
+
+        cutoff = as_of if as_of is not None else _utcnow_iso()[:10]
+
+        stmt = (
+            select(Invoice)
+            .where(Invoice.project_id == project_id)
+            .options(selectinload(Invoice.payments))
+            .limit(_RETENTION_LEDGER_INVOICE_CAP)
+        )
+        rows = (await self.session.execute(stmt)).scalars().all()
+
+        invoices = [
+            InvoiceRetention(
+                contact_id=inv.contact_id,
+                currency_code=inv.currency_code or "",
+                direction=inv.invoice_direction or "",
+                retention_amount=inv.retention_amount,
+                payments=[
+                    PaymentWithholding(
+                        withholding_amount=pay.withholding_amount,
+                        release_date=pay.withholding_release_date,
+                    )
+                    for pay in inv.payments
+                ],
+            )
+            for inv in rows
+        ]
+        return build_retention_ledger(invoices, as_of=cutoff)
 
     async def get_dashboard(
         self,

@@ -29,9 +29,12 @@ import {
   PinOff,
   GitCompare,
   BrainCircuit,
+  FolderOpen,
 } from 'lucide-react';
 
-import { Button, Card, Badge, Input, Skeleton, DismissibleInfo, IntroRichText, Breadcrumb, ModuleGuideButton } from '@/shared/ui';
+import { Button, Card, Badge, Input, Skeleton, DismissibleInfo, IntroRichText, Breadcrumb, ModuleGuideButton, ProjectFilePicker, type PickedProjectFile } from '@/shared/ui';
+import { PDF_TAKEOFF_FORMATS } from '@/shared/lib/projectFileFormats';
+import type { FileKind } from '@/features/file-manager/types';
 import { PdfCompareDrawer } from './PdfCompareDrawer';
 import { takeoffGuide } from './takeoffGuide';
 import { apiGet, apiPost } from '@/shared/lib/api';
@@ -46,6 +49,11 @@ import { aiApi } from '@/features/ai/api';
 import { hasLlmKey } from '@/features/ai-estimator/useAiReadiness';
 
 const TakeoffViewerModule = lazy(() => import('@/modules/pdf-takeoff/TakeoffViewerModule'));
+
+/** The module's own file store, listed in the picker beside the project's
+ *  documents area. Module scope, so a stable reference the picker can key its
+ *  query on rather than a fresh array every render. */
+const TAKEOFF_PICKER_KINDS: readonly FileKind[] = ['takeoff'];
 
 /* ── Types ─────────────────────────────────────────────────────────────── */
 
@@ -1222,6 +1230,28 @@ export function TakeoffPage() {
     () => searchParams.get('measurementId'),
   );
 
+  /** Set when the URL carries a `?page=` deep-link so the viewer can restore
+   *  it after the document loads, instead of always landing on page 1
+   *  (issue #386). Read once from the initial URL, mirroring
+   *  `initialMeasurementId` above. */
+  const [initialPage] = useState<number | null>(() => {
+    const raw = searchParams.get('page');
+    const parsed = raw ? parseInt(raw, 10) : NaN;
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+  });
+
+  /** The document id deep-linked at mount (`?doc=` or `?docId=`), if any.
+   *  `initialPage` only makes sense for THIS document - the viewer is keyed
+   *  by document id and remounts on document switch, so an unscoped
+   *  `initialPage` would leak onto the next document opened in the same
+   *  session. Captured once via a ref (mirrors `deepLinkConsumedRef` in the
+   *  viewer). The only later write is the `?source=document` branch below,
+   *  which swaps in the takeoff id that find-or-create resolved the deep-link
+   *  to - still the same deep link, just under the id the viewer is keyed by. */
+  const deepLinkedDocIdRef = useRef<string | null>(
+    searchParams.get('doc') || searchParams.get('docId') || null,
+  );
+
   /** True when a `?docId=` deep-link couldn't be resolved against either
    *  the takeoff documents catalogue or the project documents module —
    *  drives a friendly empty-state with a "back to /markups" link instead
@@ -1378,6 +1408,14 @@ export function TakeoffPage() {
         // Use the takeoff_document id everywhere from here on so scale-detect,
         // page-scales and measurements all resolve against takeoff_documents.
         setActiveDocId(takeoff.id);
+        // Re-point the deep-link ref at the id the viewer will actually be
+        // keyed by. `initialPage` is gated on `viewerDoc.id === ref`, and the
+        // ref was captured at mount from `?doc=`, which on this path is the
+        // documents-module id, not the takeoff id we just resolved. Without
+        // this the two never match and a `?page=` alongside `?source=document`
+        // is silently dropped, landing the user on page 1 of the right set -
+        // which is what the sheet register's "measure this sheet" link needs.
+        deepLinkedDocIdRef.current = takeoff.id;
         setViewerDoc({
           url: `/api/v1/takeoff/documents/${encodeURIComponent(takeoff.id)}/download/`,
           name: displayName,
@@ -1712,6 +1750,87 @@ export function TakeoffPage() {
     [uploadMutation, refetchServerDocuments],
   );
 
+  const [showProjectFilePicker, setShowProjectFilePicker] = useState(false);
+  const [pickingFileId, setPickingFileId] = useState<string | null>(null);
+
+  // Open a PDF that is already in the project instead of asking the user to
+  // find it on their own disk again.
+  //
+  // The picker federates two stores, so a pick arrives in one of three states.
+  //
+  //  * A takeoff document (kind `takeoff`): it already exists with its
+  //    measurements and page scales, so it just opens. No request at all.
+  //  * A project file the module has already been given (`takeoff_document_id`
+  //    set): same thing - open the takeoff document that exists rather than
+  //    asking for another one.
+  //  * A project file seen for the first time: ask the backend to
+  //    find-or-create the takeoff_document behind it, exactly like the
+  //    `?doc=X&source=document` deep-link above.
+  //
+  // This never re-uploads the bytes. Downloading the blob and pushing it back
+  // through the upload path would leave a second copy of the same drawing
+  // under a new id every time the user picked it. And a takeoff document owns
+  // the page rasters, annotations and AI recognition state that scale-detect,
+  // recognize and table-extract are keyed by, so the viewer needs a real
+  // takeoff id - handing it the CDE document id would render the sheet and
+  // then 404 every AI call on it.
+  //
+  // The endpoint is idempotent, so picking the same file twice reopens the
+  // same takeoff document with its measurements intact.
+  const openTakeoffDocument = useCallback(
+    (id: string, name: string) => {
+      setShowProjectFilePicker(false);
+      setActiveDocId(id);
+      setViewerDoc({
+        url: `/api/v1/takeoff/documents/${encodeURIComponent(id)}/download/`,
+        name,
+        id,
+      });
+      setActiveTab('measurements');
+    },
+    [],
+  );
+
+  const handlePickProjectFile = useCallback(
+    async (file: PickedProjectFile) => {
+      if (file.kind === 'takeoff') {
+        openTakeoffDocument(file.id, file.name);
+        return;
+      }
+      if (file.takeoff_document_id) {
+        openTakeoffDocument(file.takeoff_document_id, file.name);
+        void refetchServerDocuments();
+        return;
+      }
+      setPickingFileId(file.id);
+      try {
+        const takeoff = await apiPost<{ id: string; filename?: string; status?: string }>(
+          `/v1/takeoff/documents/from-source/${encodeURIComponent(file.id)}`,
+        );
+        openTakeoffDocument(takeoff.id, takeoff.filename || file.name);
+        // The catalogue now holds one more takeoff document, so refresh it or
+        // the sidebar list stays a step behind what the viewer is showing.
+        void refetchServerDocuments();
+      } catch (err) {
+        useToastStore.getState().addToast({
+          type: 'error',
+          title: t('project_files.pick_failed_title', {
+            defaultValue: 'Could not open that file',
+          }),
+          message:
+            err instanceof Error
+              ? err.message
+              : t('project_files.pick_failed_msg', {
+                  defaultValue: 'The file could not be read from the project. Try again.',
+                }),
+        });
+      } finally {
+        setPickingFileId(null);
+      }
+    },
+    [openTakeoffDocument, refetchServerDocuments, t],
+  );
+
   const handleRemoveDocument = useCallback(
     (docId: string) => {
       setDocuments((prev) => prev.filter((d) => d.id !== docId));
@@ -1926,6 +2045,27 @@ export function TakeoffPage() {
       );
     },
     [filmstripDocuments, t, setSearchParams],
+  );
+
+  /** Mirror the viewer's current page into the URL (issue #386) so a sheet
+   *  can be bookmarked/shared and reopening the document restores it. Page 1
+   *  keeps a clean URL (param dropped); any other page is written in. */
+  const handleViewerPageChange = useCallback(
+    (page: number) => {
+      setSearchParams(
+        (prev) => {
+          const next = new URLSearchParams(prev);
+          if (page > 1) {
+            next.set('page', String(page));
+          } else {
+            next.delete('page');
+          }
+          return next;
+        },
+        { replace: true },
+      );
+    },
+    [setSearchParams],
   );
 
   /* ── Render ─────────────────────────────────────────────────────────── */
@@ -2252,7 +2392,35 @@ export function TakeoffPage() {
           {/* Upload Area */}
           <div className="mb-6" data-guide="takeoff-upload">
             <DropZone onFilesSelected={handleFilesSelected} disabled={false} />
+            {selectedProjectId && (
+              <div className="mt-3 flex justify-center">
+                <button
+                  type="button"
+                  onClick={() => setShowProjectFilePicker(true)}
+                  data-testid="takeoff-open-from-project-files"
+                  className="inline-flex items-center gap-2 rounded-lg border border-border-medium bg-surface-primary px-3 py-2 text-sm font-semibold text-content-secondary transition-colors hover:border-oe-blue/40 hover:text-oe-blue focus:outline-none focus-visible:ring-2 focus-visible:ring-oe-blue/40"
+                >
+                  <FolderOpen size={14} />
+                  {t('project_files.open_from_project', {
+                    defaultValue: 'Open from project files',
+                  })}
+                </button>
+              </div>
+            )}
           </div>
+
+          <ProjectFilePicker
+            open={showProjectFilePicker}
+            onClose={() => setShowProjectFilePicker(false)}
+            projectId={selectedProjectId}
+            accepted={PDF_TAKEOFF_FORMATS}
+            // Takeoff keeps its own sheets, so "project files" has to mean both
+            // stores here or the dialog cannot find the plan this very module
+            // has open.
+            moduleKinds={TAKEOFF_PICKER_KINDS}
+            onPick={handlePickProjectFile}
+            busyId={pickingFileId}
+          />
 
           {/* Uploaded Documents — merged list (server + local) so uploads
               survive page reload. */}
@@ -2383,6 +2551,16 @@ export function TakeoffPage() {
                   initialPdfName={viewerDoc?.name}
                   initialDocumentId={viewerDoc?.id}
                   initialMeasurementId={initialMeasurementId}
+                  // Scoped to the document deep-linked at mount only - the
+                  // viewer remounts (new `key`) on document switch, so an
+                  // unscoped page would otherwise leak onto the next
+                  // document opened in this session (issue #386).
+                  initialPage={
+                    viewerDoc && viewerDoc.id === deepLinkedDocIdRef.current
+                      ? (initialPage ?? undefined)
+                      : undefined
+                  }
+                  onPageChange={handleViewerPageChange}
                   recentDocuments={serverDocuments}
                   onOpenRecentDocument={handleOpenDocInViewer}
                 />

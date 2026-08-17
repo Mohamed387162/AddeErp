@@ -19,7 +19,7 @@ const playbook: Playbook = {
   descKey: "cases.set_up_the_common_data_environment.desc",
   descDefault:
     "Stand up the common data environment, load the information containers with the right status, and aim coordination at the shared area.",
-  estMinutes: 7,
+  estMinutes: 11,
   steps: [
     {
       id: "define-states",
@@ -59,6 +59,48 @@ const playbook: Playbook = {
       whyDefault:
         "If everyone reads and writes to their own copies, someone builds from a superseded drawing. The states tell you what is safe to use and what is still a draft.",
       moduleLabel: "CDE",
+      moduleLabelKey: "cde.title",
+      to: "/projects/:projectId/cde",
+    },
+    {
+      id: "assign-roles",
+      icon: "Users",
+      inputs: [
+        {
+          labelKey:
+            "cases.set_up_the_common_data_environment.step.assign-roles.in.team",
+          label: "Project team",
+        },
+        {
+          labelKey:
+            "cases.set_up_the_common_data_environment.step.assign-roles.in.states",
+          label: "Status states",
+        },
+      ],
+      outputs: [
+        {
+          labelKey:
+            "cases.set_up_the_common_data_environment.step.assign-roles.out.roles",
+          label: "Role assignments",
+        },
+        {
+          labelKey:
+            "cases.set_up_the_common_data_environment.step.assign-roles.out.gates",
+          label: "Gate ownership",
+        },
+      ],
+      titleKey:
+        "cases.set_up_the_common_data_environment.step.assign-roles.title",
+      titleDefault: "Assign the functional roles",
+      whatKey:
+        "cases.set_up_the_common_data_environment.step.assign-roles.what",
+      whatDefault:
+        "In the CDE setup, give each person a functional role. The Author creates and edits information in work in progress and submits it for review. The Reviewer checks it for coordination and quality and promotes accepted work into the shared area. The Approver authorises a container into published, the accountable sign-off before it leaves the shared area. The Viewer reads shared and published information without changing it.",
+      whyKey: "cases.set_up_the_common_data_environment.step.assign-roles.why",
+      whyDefault:
+        "These are responsibilities in the document workflow, not job titles. One person can author their own discipline and only view another. Fixing who holds each role is what makes a gate crossing accountable instead of anonymous.",
+      moduleLabel: "CDE",
+      moduleLabelKey: "cde.title",
       to: "/projects/:projectId/cde",
     },
     {
@@ -99,8 +141,51 @@ const playbook: Playbook = {
         "cases.set_up_the_common_data_environment.step.load-containers.why",
       whyDefault:
         "A container with no status is a trap, nobody knows if it is checked or just parked. Correct status is what lets the next person trust the file.",
-      moduleLabel: "Project Files",
+      moduleLabel: "Documents",
+      moduleLabelKey: "nav.documents",
       to: "/projects/:projectId/files",
+    },
+    {
+      id: "simulate-route",
+      icon: "FlaskConical",
+      inputs: [
+        {
+          labelKey:
+            "cases.set_up_the_common_data_environment.step.simulate-route.in.preset",
+          label: "Review preset",
+        },
+        {
+          labelKey:
+            "cases.set_up_the_common_data_environment.step.simulate-route.in.roles",
+          label: "Role assignments",
+        },
+      ],
+      outputs: [
+        {
+          labelKey:
+            "cases.set_up_the_common_data_environment.step.simulate-route.out.outcome",
+          label: "Happy-path outcome",
+        },
+        {
+          labelKey:
+            "cases.set_up_the_common_data_environment.step.simulate-route.out.warnings",
+          label: "Design warnings",
+        },
+      ],
+      titleKey:
+        "cases.set_up_the_common_data_environment.step.simulate-route.title",
+      titleDefault: "Simulate your review route",
+      whatKey:
+        "cases.set_up_the_common_data_environment.step.simulate-route.what",
+      whatDefault:
+        "In Approval routes, open the Dry run panel on your chosen review preset. It walks the route step by step and shows how many approvals each step needs, whether the route reaches approved, and any design warnings, all without starting a real workflow.",
+      whyKey:
+        "cases.set_up_the_common_data_environment.step.simulate-route.why",
+      whyDefault:
+        "A review route that can never clear, or that needs two approvers where you meant one, only bites once real work is stuck in it. The dry run proves the flow terminates at approved before anyone routes a live container through it.",
+      moduleLabel: "Approval routes",
+      moduleLabelKey: "approvalRoutes.title",
+      to: "/approval-routes",
     },
     {
       id: "federate",
@@ -138,6 +223,7 @@ const playbook: Playbook = {
       whyDefault:
         "Clash checking against private working models finds clashes that are already fixed and misses the ones that are not. The shared area is the single source everyone federates from.",
       moduleLabel: "Coordination",
+      moduleLabelKey: "nav.coordination_hub",
       to: "/coordination",
     },
   ],

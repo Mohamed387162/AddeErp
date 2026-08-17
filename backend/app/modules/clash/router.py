@@ -31,6 +31,7 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy import select as _select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.content_disposition import attachment_disposition
 from app.core.csv_safety import neutralise_formula
 from app.dependencies import CurrentUserId, RequirePermission, SessionDep
 from app.modules.clash.models import ClashIssue as _IssueModel
@@ -70,6 +71,7 @@ from app.modules.clash.schemas import (
     ClashResultPage,
     ClashResultResponse,
     ClashResultUpdate,
+    ClashRiskMatrixResponse,
     ClashRule,
     ClashRuleList,
     ClashRuleSuggestion,
@@ -216,6 +218,44 @@ async def list_runs(
     await _require_project_access(session, project_id, user_id)
     runs = await service.list_runs(project_id)
     return [ClashRunListItem.model_validate(r) for r in runs]
+
+
+@router.get(
+    "/projects/{project_id}/risk-matrix",
+    response_model=ClashRiskMatrixResponse,
+    dependencies=[Depends(RequirePermission("clash.read"))],
+)
+async def get_risk_matrix(
+    project_id: uuid.UUID,
+    user_id: CurrentUserId,
+    session: SessionDep,
+    horizon_days: int = Query(
+        default=30,
+        ge=1,
+        le=365,
+        description="Look-ahead horizon in days. An overlap whose shared "
+        "window opens within this many days of today (or is already in "
+        "progress) is flagged ``imminent``; further out is ``upcoming``.",
+    ),
+    service: ClashService = Depends(_get_service),
+) -> ClashRiskMatrixResponse:
+    """Interference risk matrix - open clashes ranked against the schedule.
+
+    Correlates each still-open clash with the planned windows of the schedule
+    activities its two trades are booked into, and ranks them by
+    severity x cost impact x window proximity. Same access control as every
+    other clash read: the ``clash.read`` permission gate plus the shared
+    per-project owner/admin/team-member check, so a viewer of one project can
+    never lift another project's clash-schedule correlation.
+    """
+    await _require_project_access(session, project_id, user_id)
+    result = await service.build_project_risk_matrix(project_id, imminent_within_days=horizon_days)
+    if result is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Project {project_id} not found",
+        )
+    return ClashRiskMatrixResponse.model_validate(result)
 
 
 @router.post(
@@ -711,7 +751,7 @@ async def export_csv(
     return StreamingResponse(
         iter([csv_text]),
         media_type="text/csv",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        headers={"Content-Disposition": attachment_disposition(filename)},
     )
 
 

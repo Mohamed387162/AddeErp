@@ -23,6 +23,7 @@ import {
 import { useProjectBenchmarkData } from './hooks/useProjectBenchmarkData';
 import { fetchOwnPortfolio, type BenchmarkResponse } from './api';
 import { useDisplayQuantity } from '@/shared/hooks/useDisplayQuantity';
+import { fmtPercent } from '@/shared/lib/formatters';
 
 /* ── Helpers ───────────────────────────────────────────────────────── */
 
@@ -109,7 +110,7 @@ function ElementRow({
         <div className={`h-full rounded-sm ${barClass}`} style={{ width: `${widthPct}%` }} />
       </div>
       <span className="w-9 shrink-0 text-right tabular-nums text-content-tertiary">
-        {(row.pct * 100).toFixed(0)}%
+        {fmtPercent(row.pct * 100, 0)}
       </span>
       <span className="w-20 shrink-0 text-right tabular-nums font-medium text-content-primary">
         {/* RATE (reciprocal): EUR/m2 element share -> EUR/ft2 for imperial */}
@@ -535,7 +536,7 @@ export default function BenchmarkModule() {
           </p>
           <p className="text-xs text-content-tertiary mt-1">
             {/* diffPct is a percentage - passes through unchanged in both systems */}
-            {analysis.diffPct > 0 ? '+' : ''}{analysis.diffPct.toFixed(1)}% {t('benchmarks.vs_median', { defaultValue: 'vs median' })}
+            {analysis.diffPct > 0 ? '+' : ''}{fmtPercent(analysis.diffPct)} {t('benchmarks.vs_median', { defaultValue: 'vs median' })}
           </p>
         </div>
       </div>
@@ -562,7 +563,11 @@ export default function BenchmarkModule() {
                 type: buildingInfo.label,
                 region: regionInfo.label,
                 pct: analysis.percentile.toFixed(0),
-                label: t(pctLabel.key, { defaultValue: pctLabel.defaultValue }).toLowerCase(),
+                // Not lowercased: the label is a translated string, and casing is
+                // not a safe transform across locales. German keeps nouns capital
+                // mid-sentence, and Turkish maps I to i rather than the dotless
+                // form. It follows a dash here, so sentence case reads correctly.
+                label: t(pctLabel.key, { defaultValue: pctLabel.defaultValue }),
                 sign: analysis.diffPct > 0 ? '+' : '',
                 diff: analysis.diffPct.toFixed(1),
                 median: fmtRate(benchmarkRange.median, regionInfo.currency),
@@ -680,7 +685,18 @@ export default function BenchmarkModule() {
                 {t(confMeta.key, { defaultValue: confMeta.defaultValue })}
               </span>
             </div>
-            <p className="mb-4 text-xs text-content-tertiary">{ownPortfolio.note}</p>
+            {/* The server composes `note` in English and we cannot translate a
+                sentence that arrives at render time, so translate the code it
+                sends instead and keep the prose as the fallback for a server
+                that predates it. */}
+            <p className="mb-4 text-xs text-content-tertiary">
+              {ownPortfolio.note_code
+                ? t(`benchmarks.portfolio_note_${ownPortfolio.note_code}`, {
+                    defaultValue: ownPortfolio.note,
+                    count: ownPortfolio.project_count,
+                  })
+                : ownPortfolio.note}
+            </p>
 
             {/* Distribution bar: P25-P75 band with a median tick and your marker */}
             <div className="relative">
@@ -709,7 +725,12 @@ export default function BenchmarkModule() {
 
             {portfolioQuery.data?.explanation && (
               <p className="mt-3 text-xs font-medium text-content-secondary">
-                {t('benchmarks.portfolio_reading', { defaultValue: portfolioQuery.data.explanation })}
+                {portfolioQuery.data.explanation_code
+                  ? t(`benchmarks.portfolio_reading_${portfolioQuery.data.explanation_code}`, {
+                      defaultValue: portfolioQuery.data.explanation,
+                      currency: portfolioQuery.data.currency,
+                    })
+                  : portfolioQuery.data.explanation}
               </p>
             )}
           </div>
@@ -951,17 +972,6 @@ export default function BenchmarkModule() {
               {t('benchmarks.year', { defaultValue: 'Year' })}
             </p>
             <p className="mt-0.5 text-sm font-medium text-content-primary">{benchmarkRange.sourceYear}</p>
-          </div>
-          <div>
-            <p className="text-2xs uppercase tracking-wide text-content-quaternary">
-              {t('benchmarks.sample_size', { defaultValue: 'Planning sample' })}
-            </p>
-            <p className="mt-0.5 text-sm font-medium text-content-primary">
-              {t('benchmarks.sample_count', {
-                defaultValue: 'about {{count}} projects',
-                count: benchmarkRange.sampleSize,
-              })}
-            </p>
           </div>
           <div>
             <p className="text-2xs uppercase tracking-wide text-content-quaternary">

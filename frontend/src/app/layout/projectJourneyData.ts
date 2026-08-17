@@ -124,7 +124,7 @@ export const JOURNEY_PHASES: readonly JourneyPhase[] = [
     modules: [
       { to: '/projects', labelKey: 'projects.title', label: 'Projects' },
       { to: '/users', labelKey: 'sidebar.admin_grid.users', label: 'Users & teams' },
-      { to: '/files', labelKey: 'nav.project_files', label: 'Files' },
+      { to: '/files', labelKey: 'nav.documents', label: 'Documents' },
       { to: '/governance', labelKey: 'sidebar.admin_grid.governance', label: 'Governance' },
     ],
     extraRoutes: ['/settings'],
@@ -139,7 +139,7 @@ export const JOURNEY_PHASES: readonly JourneyPhase[] = [
     desc: 'Bring drawings, BIM models and reality scans into one place, and coordinate them.',
     modules: [
       { to: '/bim', labelKey: 'nav.bim_viewer', label: 'BIM Viewer' },
-      { to: '/data-explorer', labelKey: 'nav.cad_bim_explorer', label: 'Data Explorer' },
+      { to: '/data-explorer', labelKey: 'nav.cad_bim_explorer', label: 'CAD-BIM BI Explorer' },
       { to: '/pointcloud', labelKey: 'nav.point_cloud', label: 'Point Cloud' },
       { to: '/cde', labelKey: 'cde.title', label: 'CDE' },
       { to: '/coordination', labelKey: 'nav.coordination_hub', label: 'Coordination Hub' },

@@ -11,6 +11,9 @@ from datetime import UTC
 
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm.attributes import set_committed_value
+from sqlalchemy.orm.util import identity_key
+from sqlalchemy.sql.elements import ClauseElement
 
 from app.modules.users.models import APIKey, User
 
@@ -45,8 +48,24 @@ class UserRepository:
         limit: int = 50,
         is_active: bool | None = None,
     ) -> tuple[list[User], int]:
-        """List users with pagination. Returns (users, total_count)."""
-        base = select(User)
+        """List users with pagination. Returns (users, total_count).
+
+        Erased accounts (``deleted_at`` set) are never returned. Deleting a user
+        anonymises the row in place instead of removing it, because projects
+        point at it through ``owner_id`` and activity / audit rows through
+        ``actor_id``, and the projects foreign key cascades - a hard delete would
+        take the user's projects, BOQs and documents with it. The row therefore
+        has to survive, but it is no longer an account: it carries no personal
+        data, it cannot authenticate, and there is no administrator action left
+        to take on it. Listing it put a blank-named
+        ``deleted+<hash>@deleted.invalid`` row back on the management page, which
+        read as a deletion that had failed, and deleting it a second time
+        answered 404 because the erasure path refuses an already-erased row.
+
+        The predicate goes on ``base`` so the total and the page agree; putting
+        it only on the fetch would keep counting rows the caller never sees.
+        """
+        base = select(User).where(User.deleted_at.is_(None))
         if is_active is not None:
             base = base.where(User.is_active == is_active)
 
@@ -75,7 +94,15 @@ class UserRepository:
         await self.session.execute(stmt)
         await self.session.flush()
         # Expire cached ORM instances so the next get_by_id re-reads from DB
-        self.session.expire_all()
+        instance = self.session.identity_map.get(identity_key(User, user_id))
+        if instance is None:
+            return
+        computed = [name for name, value in fields.items() if isinstance(value, ClauseElement)]
+        for name, value in fields.items():
+            if name not in computed:
+                set_committed_value(instance, name, value)
+        if computed:
+            self.session.expire(instance, computed)
 
     async def email_exists(self, email: str) -> bool:
         """Check if an email is already registered."""

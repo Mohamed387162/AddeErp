@@ -8,6 +8,7 @@ import { ArrowDown, ArrowUp, ExternalLink, FileText, Image as ImageIcon, Layout,
 import clsx from 'clsx';
 import { DateDisplay } from '@/shared/ui/DateDisplay';
 import { primaryModule } from '../kindModule';
+import { SnippetHighlight } from '@/features/file-search/SnippetHighlight';
 import { CDEBadge } from './CDEBadge';
 import { favoriteKey, type FileRow, type FileKind, type FileFilters } from '../types';
 
@@ -36,6 +37,10 @@ interface FileListProps {
   onToggleFavorite?: (row: FileRow, isFavorite: boolean) => void;
   /** Right-click a row — opens the shared FileContextMenu at the cursor. */
   onContextMenu?: (row: FileRow, x: number, y: number) => void;
+  /** The live content-search term, so matched text can be highlighted.
+      Only set while the page is in content mode; filename mode leaves the
+      rows untouched. */
+  searchQuery?: string;
 }
 
 function fmtBytes(bytes: number): string {
@@ -75,6 +80,7 @@ export function FileList({
   favoriteKeys,
   onToggleFavorite,
   onContextMenu,
+  searchQuery,
 }: FileListProps) {
   const { t } = useTranslation();
   const showStar = Boolean(onToggleFavorite);
@@ -134,7 +140,7 @@ export function FileList({
     }
   };
 
-  const Header = ({ field, label, align = 'left' }: { field: SortKey; label: string; align?: 'left' | 'right' }) => {
+  const Header = ({ field, label, align = 'left', className }: { field: SortKey; label: string; align?: 'left' | 'right'; className?: string }) => {
     const active = sort === field;
     return (
       <th
@@ -142,6 +148,7 @@ export function FileList({
           'px-3 py-2 text-2xs font-medium uppercase tracking-wider text-content-tertiary',
           align === 'right' && 'text-right',
           'cursor-pointer select-none hover:text-content-primary',
+          className,
         )}
         onClick={() => onSortChange(field)}
       >
@@ -160,7 +167,12 @@ export function FileList({
         <thead className="sticky top-0 z-10 bg-surface-elevated border-b border-border-light">
           <tr>
             {showStar && <th className="w-9 px-2 py-2" aria-hidden="true" />}
-            <Header field="name" label={t('files.col.name', { defaultValue: 'Name' })} />
+            {/* w-full on the free-text column is what makes the other seven
+                take their content width and hand the remainder here. Without
+                it, max-w-0 below reads as "make this column as narrow as
+                possible" and the name collapses to a letter and an ellipsis
+                at every window width. */}
+            <Header field="name" label={t('files.col.name', { defaultValue: 'Name' })} className="w-full" />
             <Header field="kind" label={t('files.col.kind', { defaultValue: 'Type' })} />
             <th className="px-3 py-2 text-2xs font-medium uppercase tracking-wider text-content-tertiary text-center">
               {t('files.col.status', { defaultValue: 'Status' })}
@@ -183,7 +195,9 @@ export function FileList({
             Array.from({ length: 6 }).map((_, i) => (
               <tr key={i} className="border-b border-border-light">
                 {Array.from({ length: showStar ? 9 : 8 }).map((_, j) => (
-                  <td key={j} className="px-3 py-2">
+                  // The name column carries the same w-full here, so the
+                  // columns do not jump width when the rows arrive.
+                  <td key={j} className={clsx('px-3 py-2', j === (showStar ? 1 : 0) && 'w-full max-w-0')}>
                     <div className="h-3 rounded bg-surface-secondary animate-pulse" />
                   </td>
                 ))}
@@ -264,7 +278,10 @@ export function FileList({
                       </button>
                     </td>
                   )}
-                  <td className="px-3 py-2 max-w-0">
+                  {/* w-full claims the width the fixed columns leave over;
+                      max-w-0 keeps a long filename from pushing the column
+                      wider than that, so the truncate below is what gives. */}
+                  <td className="px-3 py-2 w-full max-w-0">
                     <div className="flex items-center gap-2 min-w-0">
                       <Icon size={14} strokeWidth={1.75} className="shrink-0 text-content-tertiary" />
                       {typeof row.extra?.drawing_number === 'string' && row.extra.drawing_number && (
@@ -288,6 +305,11 @@ export function FileList({
                       )}
                       {/* CDE state moved to its own dedicated Status column. */}
                     </div>
+                    {typeof row.extra?.snippet === 'string' && row.extra.snippet && (
+                      <p className="mt-0.5 ms-6 text-[11px] leading-snug text-content-secondary line-clamp-2">
+                        <SnippetHighlight text={row.extra.snippet} query={searchQuery ?? ''} />
+                      </p>
+                    )}
                   </td>
                   <td className="px-3 py-2 text-content-secondary text-xs">
                     {t(`files.category.${row.kind}`, { defaultValue: row.kind })}
@@ -302,8 +324,14 @@ export function FileList({
                   <td className="px-3 py-2 text-center text-content-secondary tabular-nums text-xs">
                     {versionLabel(row.extra?.version)}
                   </td>
+                  {/* A content-search hit comes from the index, not from a
+                      directory listing, so it has no size and no modified date.
+                      The placeholder zero would read as an empty file, hence
+                      the dash. */}
                   <td className="px-3 py-2 text-right text-content-secondary tabular-nums text-xs">
-                    {fmtBytes(row.size_bytes)}
+                    {typeof row.extra?.snippet === 'string' && row.extra.snippet
+                      ? '—'
+                      : fmtBytes(row.size_bytes)}
                   </td>
                   <td className="px-3 py-2 text-right text-content-secondary text-xs">
                     {row.modified_at ? <DateDisplay value={row.modified_at} format="relative" /> : '—'}

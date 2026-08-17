@@ -15,6 +15,7 @@ import { Button, Card, Badge, DismissibleInfo, IntroRichText, EmptyState, Skelet
 import { PageHeader } from '@/shared/ui/PageHeader';
 import { apiGet, apiPost, apiDelete } from '@/shared/lib/api';
 import { getIntlLocale } from '@/shared/lib/formatters';
+import { unitLabel } from '@/shared/lib/unitLabels';
 import { copyToClipboard } from '@/shared/lib/browser';
 import { useToastStore } from '@/stores/useToastStore';
 import {
@@ -182,7 +183,11 @@ export function AssembliesPage() {
     const ratedItems = all.filter((a) => a.total_rate > 0);
     const byCurrency = new Map<string, { sum: number; count: number }>();
     for (const a of ratedItems) {
-      const code = (a.currency || 'EUR').toUpperCase();
+      // No silent EUR in the grouping key either: an assembly with no stored
+      // currency is its own group, not a Euro one. Folding it into EUR made
+      // the tile label a set of unknown-currency rates "EUR", which is the
+      // same guess as showing the symbol on a bare number.
+      const code = (a.currency || '').toUpperCase();
       const acc = byCurrency.get(code) ?? { sum: 0, count: 0 };
       acc.sum += Number(a.total_rate) || 0;
       acc.count += 1;
@@ -284,7 +289,16 @@ export function AssembliesPage() {
     queryClient.invalidateQueries({ queryKey: ['assemblies-all-for-banner'] });
     addToast({
       type: fail === 0 ? 'success' : 'error',
-      title: t('assemblies.bulk_deleted', { defaultValue: `${ok} deleted${fail ? `, ${fail} failed` : ''}` }),
+      // Two keys rather than one with a conditional tail. A glued-on ", n failed"
+      // cannot be moved, and languages that inflect the count or put the failure
+      // first would have to break the opening half to place it.
+      title: fail
+        ? t('assemblies.bulk_deleted_partial', {
+            ok,
+            failed: fail,
+            defaultValue: '{{ok}} deleted, {{failed}} failed',
+          })
+        : t('assemblies.bulk_deleted', { count: ok, defaultValue: '{{count}} deleted' }),
     });
   }, [selected, addToast, queryClient, clearSelection, t]);
 
@@ -314,7 +328,7 @@ export function AssembliesPage() {
         `assemblies_bulk_${new Date().toISOString().slice(0, 10)}.json`,
         'application/json',
       );
-      addToast({ type: 'success', title: t('assemblies.bulk_exported', { defaultValue: `${exports.length} exported` }) });
+      addToast({ type: 'success', title: t('assemblies.bulk_exported', { count: exports.length, defaultValue: '{{count}} exported' }) });
     } catch {
       addToast({ type: 'error', title: t('common.export_failed', { defaultValue: 'Export failed' }) });
     }
@@ -338,7 +352,13 @@ export function AssembliesPage() {
     queryClient.invalidateQueries({ queryKey: ['assemblies-all-for-banner'] });
     addToast({
       type: fail === 0 ? 'success' : 'error',
-      title: t('assemblies.bulk_tagged', { defaultValue: `${ok} tagged${fail ? `, ${fail} failed` : ''}` }),
+      title: fail
+        ? t('assemblies.bulk_tagged_partial', {
+            ok,
+            failed: fail,
+            defaultValue: '{{ok}} tagged, {{failed}} failed',
+          })
+        : t('assemblies.bulk_tagged', { count: ok, defaultValue: '{{count}} tagged' }),
     });
   }, [selected, addToast, queryClient, data, allForBanner, t]);
 
@@ -553,7 +573,7 @@ export function AssembliesPage() {
           <StatTile
             icon={<BarChart3 size={14} />}
             label={
-              banner.avgRateMixed
+              banner.avgRateMixed && banner.avgRateCurrency
                 ? t('assemblies.stat_avg_rate_dominant', {
                     defaultValue: 'Avg. rate ({{currency}})',
                     currency: banner.avgRateCurrency,
@@ -561,18 +581,23 @@ export function AssembliesPage() {
                 : t('assemblies.stat_avg_rate', { defaultValue: 'Avg. rate' })
             }
             value={
-              banner.avgRate > 0
+              banner.avgRate > 0 && banner.avgRateCurrency
                 ? `${fmt(banner.avgRate)} ${banner.avgRateCurrency}`
                 : '—'
             }
             title={
-              banner.avgRateMixed
-                ? t('assemblies.stat_avg_rate_mixed_hint', {
+              banner.avgRate > 0 && !banner.avgRateCurrency
+                ? t('assemblies.stat_avg_rate_no_currency_hint', {
                     defaultValue:
-                      'Assemblies span multiple currencies; showing the average for the most common one ({{currency}}).',
-                    currency: banner.avgRateCurrency,
+                      'Most assemblies here have no currency set, so their average cannot be stated in any money.',
                   })
-                : undefined
+                : banner.avgRateMixed
+                  ? t('assemblies.stat_avg_rate_mixed_hint', {
+                      defaultValue:
+                        'Assemblies span multiple currencies; showing the average for the most common one ({{currency}}).',
+                      currency: banner.avgRateCurrency,
+                    })
+                  : undefined
             }
           />
           <StatTile
@@ -805,7 +830,7 @@ export function AssembliesPage() {
       {selected.size > 0 && (
         <div className="mb-3 flex flex-wrap items-center gap-2 rounded-lg border border-oe-blue/30 bg-oe-blue-subtle px-3 py-2">
           <span className="text-sm font-medium text-oe-blue">
-            {t('assemblies.selected_count', { defaultValue: `${selected.size} selected`, count: selected.size })}
+            {t('assemblies.selected_count', { count: selected.size, defaultValue: '{{count}} selected' })}
           </span>
           <button
             type="button"
@@ -1203,7 +1228,11 @@ function AssemblyTable({
                   <td className="px-3 py-2 align-middle text-right tabular-nums font-semibold text-content-primary">
                     {a.total_rate > 0 ? fmt(a.total_rate) : <span className="text-content-quaternary font-normal">—</span>}
                   </td>
-                  <td className="px-3 py-2 align-middle text-xs text-content-tertiary">{a.currency || 'EUR'}</td>
+                  <td className="px-3 py-2 align-middle text-xs text-content-tertiary">
+                    {a.currency || (
+                      <span title={t('projects.currency_not_set', { defaultValue: 'Currency not set' })}>—</span>
+                    )}
+                  </td>
                   <td className="px-3 py-2 align-middle text-right tabular-nums text-content-secondary">{a.component_count ?? 0}</td>
                   <td className="px-3 py-2 align-middle text-right tabular-nums">
                     {(a.usage_count ?? 0) > 0 ? (
@@ -1553,7 +1582,7 @@ function AIGenerateModal({
                 className="w-full h-9 px-2.5 rounded-lg border border-border-light bg-surface-primary text-sm text-content-primary focus:outline-none focus:ring-2 focus:ring-violet-500/30 appearance-none cursor-pointer"
               >
                 {UNIT_OPTIONS.map((u) => (
-                  <option key={u} value={u}>{u}</option>
+                  <option key={u} value={u}>{unitLabel(u, t)}</option>
                 ))}
               </select>
             </div>
@@ -1935,9 +1964,17 @@ function AssemblyCard({
               {assembly.category}
             </Badge>
           )}
-          <Badge variant="neutral" size="sm">
-            {assembly.currency || 'EUR'}
-          </Badge>
+          <span
+            title={
+              assembly.currency
+                ? undefined
+                : t('projects.currency_not_set', { defaultValue: 'Currency not set' })
+            }
+          >
+            <Badge variant="neutral" size="sm">
+              {assembly.currency || '—'}
+            </Badge>
+          </span>
           {assembly.bid_factor !== 1.0 && (
             <Badge variant="blue" size="sm">
               BF {assembly.bid_factor}

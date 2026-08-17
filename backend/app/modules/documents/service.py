@@ -38,6 +38,7 @@ from app.modules.documents.activity_service import record_activity
 from app.modules.documents.models import Document, DocumentBIMLink, ProjectPhoto, Sheet
 from app.modules.documents.repository import DocumentRepository, PhotoRepository, SheetRepository
 from app.modules.documents.schemas import (
+    PHOTO_CATEGORIES,
     DocumentBIMLinkCreate,
     DocumentUpdate,
     PhotoUpdate,
@@ -203,7 +204,8 @@ VALID_CATEGORIES = {
     "reality_capture",
     "other",
 }
-VALID_PHOTO_CATEGORIES = {"site", "progress", "defect", "delivery", "safety", "aerial", "other"}
+# Same set the edit schema validates against, so the two cannot drift again.
+VALID_PHOTO_CATEGORIES = set(PHOTO_CATEGORIES)
 
 # Reality-capture / drone-survey point-cloud file extensions. A file dropped
 # into the generic documents upload with one of these extensions is auto-
@@ -1155,7 +1157,41 @@ class DocumentService:
         except Exception as exc:
             logger.debug("Failed to publish documents.document.deleted event: %s", exc)
 
+        # Takeoff can reference this blob instead of holding a second copy of
+        # it, so hand it its own copy BEFORE the unlink below. Called directly
+        # rather than driven off the deleted event above: that event is
+        # published detached, so a subscriber would race this unlink and lose
+        # nondeterministically - passing on a developer's box and failing on a
+        # loaded one. A False return means the copy did not happen, and we then
+        # keep the original on disk. That is the same trade the docstring above
+        # already makes: an orphaned file is recoverable, a document row
+        # pointing at a deleted blob is not.
+        may_unlink = True
+        if file_path_str:
+            try:
+                from app.modules.takeoff.service import preserve_blobs_for_deleted_source
+
+                may_unlink = await preserve_blobs_for_deleted_source(
+                    self.session,
+                    source_document_id=str(document_id),
+                    source_file_path=file_path_str,
+                )
+            except Exception:
+                # Never let this stop the deletion itself - the row is already
+                # gone. Keep the blob so nothing that referenced it breaks.
+                logger.exception(
+                    "Failed to preserve takeoff copies of %s; keeping the file",
+                    file_path_str,
+                )
+                may_unlink = False
+
         # Then remove file from disk (best-effort)
+        if not may_unlink:
+            logger.warning(
+                "File kept because a takeoff document still references it: %s",
+                file_path_str,
+            )
+            return
         try:
             file_path = Path(file_path_str)
             if file_path.exists():
@@ -1588,6 +1624,7 @@ class PhotoService:
         user_id: str | None,
         *,
         limit: int = 12,
+        project_id: uuid.UUID | None = None,
     ) -> list[tuple[ProjectPhoto, str]]:
         """Return the most recent photos across every project the caller can see.
 
@@ -1596,6 +1633,14 @@ class PhotoService:
         leaks photos from a project the user cannot open. The accessible
         project-id set is resolved here and handed to the repository join,
         so the SQL can never return a row outside that set.
+
+        ``project_id`` narrows the answer to one project. It is applied as an
+        intersection with the accessible set and never as a replacement for
+        it, so asking for a project the caller cannot open returns nothing
+        rather than that project's photos. The caller is the dashboard, whose
+        card is project facing: clicking a photo opens that project's gallery,
+        so an unscoped answer put another project's site documentation under
+        the name of the one the reader had selected.
         """
         if not user_id:
             return []
@@ -1623,6 +1668,16 @@ class PhotoService:
                 (Project.owner_id == user_uuid) | (Project.id.in_(member_project_ids_subquery(user_uuid)))
             )
         accessible_ids = list((await self.session.execute(proj_stmt)).scalars().all())
+        if project_id is not None:
+            # Intersection, not replacement. An id the caller cannot reach
+            # falls out here and the empty list short-circuits below, which is
+            # the same answer an empty project gives. Narrowing must never be
+            # able to widen.
+            # Compared as text: the GUID column is VARCHAR(36) while the
+            # migrations declare a native uuid, so which Python type comes back
+            # is not something this line should have an opinion about.
+            wanted = str(project_id)
+            accessible_ids = [pid for pid in accessible_ids if str(pid) == wanted]
         if not accessible_ids:
             return []
 
@@ -1768,11 +1823,49 @@ def detect_discipline_from_sheet_number(sheet_number: str | None) -> str | None:
     return DISCIPLINE_PREFIX_MAP.get(prefix)
 
 
+# A title block lays its fields out in columns, and the text extractor joins
+# the cells that share a visual row into one line separated by runs of spaces.
+# So "SCALE: 1:50    DRAWN: AB    DATE: 2026-01-14" arrives as a single line and
+# a pattern that captures to the end of it captures three fields, not one.
+#
+# Two independent signals mark where the next field begins. A run of two or more
+# spaces is the column gap. A following label is the field name itself, and the
+# label carries no internal space so that "AS NOTED" is not mistaken for one.
+_FIELD_LABEL_BREAK = re.compile(r"[ \t]+(?=[A-Za-z][A-Za-z.]{0,14}[ \t]*[:=])")
+_COLUMN_GAP_BREAK = re.compile(r"[ \t]{2,}")
+
+
+def _trim_title_block_value(value: str, *, cut_on_column_gap: bool) -> str:
+    """Cut a captured title block value where the next field starts.
+
+    Args:
+        value: The raw capture, already bounded to a single line.
+        cut_on_column_gap: Whether a run of two or more spaces also ends the
+            value. True for narrow-vocabulary fields like the scale, where such
+            a run can only be a column gap. False for free text like the sheet
+            title, where wide letter spacing inside one cell can produce the
+            same run and cutting on it would truncate a real title.
+
+    Returns:
+        The value up to the first break, stripped.
+    """
+    cuts = [m.start() for m in (_FIELD_LABEL_BREAK.search(value),) if m is not None]
+    if cut_on_column_gap:
+        gap = _COLUMN_GAP_BREAK.search(value)
+        if gap is not None:
+            cuts.append(gap.start())
+    return (value[: min(cuts)] if cuts else value).strip()
+
+
 def detect_sheet_info(page_text: str) -> dict[str, str | None]:
     """Extract sheet number, title, scale, and revision from page text.
 
     Uses simple regex patterns on extracted text to find common title block fields.
     Does NOT rely on external OCR services - works on already-extracted text.
+
+    Scale reads both the ratio forms ("1:50", '1/4" = 1\'-0"') and the written
+    ones ("NTS", "N.T.S.", "VARIES", "AS NOTED"). Revision date is not read at
+    all, which is why a split row's ``revision_date`` is always null.
 
     Returns:
         Dict with keys: sheet_number, sheet_title, scale, revision
@@ -1808,21 +1901,42 @@ def detect_sheet_info(page_text: str) -> dict[str, str | None]:
     for pattern in title_patterns:
         match = re.search(pattern, page_text, re.IGNORECASE)
         if match:
-            title = match.group(1).strip()
+            # Free text, so only a following label ends it. A run of spaces
+            # inside a title can be letter spacing rather than a column gap.
+            title = _trim_title_block_value(match.group(1), cut_on_column_gap=False)
             if len(title) > 2:
                 result["sheet_title"] = title[:500]
             break
 
     # Scale patterns: "1:100", "1/4\" = 1'-0\"", "SCALE: 1:50"
+    #
+    # The labelled pattern is bounded to the label's own line. It used to allow
+    # \s inside the character class, which matches a newline, so the capture ran
+    # off the end of the line and the trailing \S* then took the first token of
+    # the next one. A title block reading "SCALE: 1:50" above "REV C" was stored
+    # as "1:50\nREV", and that string is what the sheet detail drawer prints.
+    # Horizontal whitespace only, on both sides of the separator, because a
+    # title block field and its value share a line and a scale value can contain
+    # spaces of its own ("1/4\" = 1'-0\"", "AS NOTED").
+    #
+    # The old pattern also had no "=" in its character class, so the imperial
+    # form was cut at the equals and stored as '1/4" ='. The third pattern below
+    # reads that form correctly but never ran, because the labelled pattern is
+    # tried first and the loop breaks on the first match.
     scale_patterns = [
-        r"(?:SCALE)\s*[:=]\s*([\d/:\"'\-\s]+\S*)",
+        r"(?:SCALE)[ \t]*[:=][ \t]*([^\r\n]+?)[ \t]*(?:\r?\n|$)",
         r"\b(1\s*:\s*\d{1,4})\b",
         r"(1/\d+\"\s*=\s*1'[\s-]*0\")",
     ]
-    for pattern in scale_patterns:
+    for idx, pattern in enumerate(scale_patterns):
         match = re.search(pattern, page_text, re.IGNORECASE)
         if match:
-            result["scale"] = match.group(1).strip()[:50]
+            value = match.group(1)
+            if idx == 0:
+                # Only the labelled pattern can run into a neighbouring column;
+                # the two below are bounded by their own character sets.
+                value = _trim_title_block_value(value, cut_on_column_gap=True)
+            result["scale"] = value.strip()[:50]
             break
 
     # Revision patterns: "REV A", "REVISION: 3", "Rev. B"
@@ -1947,6 +2061,74 @@ class SheetService:
 
     # ── Split PDF ──────────────────────────────────────────────────────────
 
+    async def _supersede_previous_sheets(
+        self,
+        project_id: uuid.UUID,
+        sheets: list[Sheet],
+    ) -> int:
+        """Point each incoming sheet at the one it replaces and retire that one.
+
+        Called with rows that are built but not yet inserted, so the links are
+        written before the insert and the retirements ride the same flush.
+
+        The rules, and why each one is the way it is:
+
+        A page with no readable ``sheet_number`` is never chained. There is no
+        key to chain it on, and treating "unreadable" as a value would collect
+        every unreadable page in the project into one bogus history.
+
+        A number carried by two pages of the SAME upload is a fault in the
+        drawing set, not something to resolve by guessing. The earlier page
+        takes the link, the predecessor retires because this upload does
+        supersede it, and the later page stays current and unlinked. The
+        register then shows two current rows for that number, which is the
+        truth about the file that was uploaded. It is logged, because the
+        alternative is that it looks like our duplication rather than theirs.
+
+        Nothing is deleted and nothing is overwritten. A retired row keeps every
+        column it had and only stops being current.
+
+        Args:
+            project_id: Project the upload belongs to.
+            sheets: Freshly built, not yet inserted rows.
+
+        Returns:
+            How many existing sheets were retired.
+        """
+        numbered = [s for s in sheets if s.sheet_number]
+        if not numbered:
+            return 0
+
+        predecessors = await self.repo.current_by_sheet_numbers(
+            project_id,
+            sorted({str(s.sheet_number) for s in numbered}),
+        )
+        if not predecessors:
+            return 0
+
+        claimed: set[str] = set()
+        retired = 0
+        for sheet in sorted(numbered, key=lambda s: s.page_number):
+            number = str(sheet.sheet_number)
+            previous = predecessors.get(number)
+            if previous is None:
+                continue
+            if number in claimed:
+                logger.warning(
+                    "Sheet number %s appears on more than one page of this upload "
+                    "for project %s; page %d is kept as a separate current sheet",
+                    number,
+                    project_id,
+                    sheet.page_number,
+                )
+                continue
+            claimed.add(number)
+            sheet.previous_version_id = previous.id
+            previous.is_current = False
+            retired += 1
+
+        return retired
+
     async def split_pdf_to_sheets(
         self,
         project_id: uuid.UUID,
@@ -1962,8 +2144,14 @@ class SheetService:
         4. Save page thumbnail as PNG
         5. Create Sheet record in database
 
+        A sheet number already current in this project is superseded rather than
+        duplicated, so uploading a revised set leaves one current row per number
+        with the earlier row retired and linked. See
+        ``_supersede_previous_sheets`` for the rules that decide this.
+
         Returns:
-            List of created Sheet records.
+            List of created Sheet records. Only the new rows, never the ones
+            they superseded.
         """
         try:
             import pdfplumber
@@ -2065,6 +2253,15 @@ class SheetService:
                 detail=f"Failed to process PDF file: {exc}",
             )
 
+        # A revised drawing set arrives as a new PDF, so without this every
+        # re-upload doubled the register: two rows per sheet number, both
+        # flagged current, distinguishable only by parent document. It also fed
+        # a doubled ACTUAL set into ``check_completeness``, which reads
+        # ``current_only=True`` and reconciles against a drawing index by
+        # number. Run before the insert so the retirements and the new rows
+        # land in one flush.
+        superseded = await self._supersede_previous_sheets(project_id, sheets)
+
         if sheets:
             sheets = await self.repo.create_many(sheets)
 
@@ -2091,12 +2288,115 @@ class SheetService:
             )
 
         logger.info(
-            "PDF split into %d sheets: %s for project %s",
+            "PDF split into %d sheets (%d earlier sheets superseded): %s for project %s",
             len(sheets),
+            superseded,
             safe_name,
             project_id,
         )
         return sheets
+
+    # ── Sheet completeness (drawing index reconciliation) ──────────────────
+
+    async def check_completeness(
+        self,
+        project_id: uuid.UUID,
+        *,
+        user_id: uuid.UUID | None = None,
+        index_document_id: uuid.UUID | None = None,
+        index_page: int | None = None,
+        pasted_index: str | None = None,
+        expected_sheets: list[Any] | None = None,
+        current_only: bool = True,
+    ) -> dict[str, Any]:
+        """Reconcile the project's sheet set against a drawing index.
+
+        Builds the EXPECTED sheet set from whichever index source was supplied
+        (a structured override, a pasted list, or an uploaded index PDF), loads
+        the ACTUAL ``Sheet`` rows, and hands both to the validation module which
+        runs the ``sheet_completeness`` rule set and persists a document report.
+
+        Parsing lives here (documents owns sheets + the index PDF); persistence
+        lives in the validation module. Raises :class:`ValueError` (mapped to
+        404 / 422 by the router) for a missing/foreign index document or an
+        unreadable index.
+        """
+        from app.modules.documents.sheet_index import (
+            ExpectedSheet,
+            normalize_sheet_number,
+            parse_index_tables,
+            parse_pasted_index,
+            reconcile,
+        )
+
+        # 1. Build the EXPECTED set.
+        if expected_sheets:
+            expected = [
+                ExpectedSheet(
+                    sheet_number=s.sheet_number,
+                    sheet_number_norm=normalize_sheet_number(s.sheet_number),
+                    sheet_title=s.sheet_title,
+                    revision=s.revision,
+                )
+                for s in expected_sheets
+            ]
+        elif pasted_index:
+            expected = parse_pasted_index(pasted_index)
+        elif index_document_id:
+            doc = await DocumentRepository(self.session).get_by_id(index_document_id)
+            # Re-assert the index document belongs to this project (IDOR-safe):
+            # raise the same "not found" for missing and foreign so a caller on
+            # one project cannot probe another project's document ids.
+            if doc is None or doc.project_id != project_id:
+                raise ValueError("Index document not found")
+            expected = parse_index_tables(doc.file_path, index_page)
+        else:
+            raise ValueError("No index source provided")
+
+        if not expected:
+            raise ValueError("Could not read any sheet numbers from the index")
+
+        # 2. Load the ACTUAL sheet rows (current-only by default so superseded
+        #    revisions do not read as extra).
+        sheets, _ = await self.list_sheets(project_id, limit=2000, current_only=current_only)
+        actual = [
+            {
+                "id": str(s.id),
+                "sheet_number": s.sheet_number,
+                "revision": s.revision,
+                "sheet_title": s.sheet_title,
+                "discipline": s.discipline,
+                "page_number": s.page_number,
+            }
+            for s in sheets
+        ]
+
+        # 3. Reconcile for the summary snapshot, then persist via the validation
+        #    module (which re-runs the same diff through the rule set).
+        result = reconcile(expected, actual)
+        target_id = str(index_document_id) if index_document_id else str(project_id)
+        source_meta = {
+            "index_source": "document" if index_document_id else "pasted",
+            "index_document_id": str(index_document_id) if index_document_id else None,
+            "index_page": index_page,
+            "expected_count": result.expected_count,
+            "actual_count": result.actual_count,
+            "missing": result.missing,
+            "extra": result.extra,
+            "matched": result.matched,
+            "rev_mismatch": result.rev_mismatch,
+        }
+
+        from app.modules.validation.service import ValidationModuleService
+
+        return await ValidationModuleService(self.session).run_sheet_completeness(
+            project_id,
+            target_id=target_id,
+            expected=[e.__dict__ for e in expected],
+            actual=actual,
+            source_meta=source_meta,
+            user_id=user_id,
+        )
 
 
 # ── DocumentBIMLink service ──────────────────────────────────────────────

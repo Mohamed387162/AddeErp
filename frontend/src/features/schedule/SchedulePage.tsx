@@ -31,7 +31,7 @@ import {
   ArrowRight,
   ListPlus,
 } from 'lucide-react';
-import { Button, Card, Badge, Input, SkeletonTable, Breadcrumb, DismissibleInfo, IntroRichText, GanttChart as SVGGanttChart, ViewInBIMButton, ConfirmDialog, ModuleGuideButton } from '@/shared/ui';
+import { Button, Card, Badge, Input, SkeletonTable, Breadcrumb, DismissibleInfo, IntroRichText, GanttChart as SVGGanttChart, ViewInBIMButton, ConfirmDialog, ModuleGuideButton, CollapsibleSection } from '@/shared/ui';
 import { PageHeader } from '@/shared/ui/PageHeader';
 import { useConfirm } from '@/shared/hooks/useConfirm';
 import type { GanttActivity as SVGGanttActivity, GanttViewMode } from '@/shared/ui';
@@ -427,6 +427,17 @@ const PIXELS_PER_DAY: Record<ZoomLevel, number> = {
 
 const ROW_HEIGHT = 44;
 
+/**
+ * Unreachable. The only render site is the final else of the viewMode chain
+ * below, and every member of that union is already matched by an earlier
+ * branch, so this never draws. The chart users actually see is SVGGanttChart
+ * from shared/ui/Gantt.
+ *
+ * Flagged rather than deleted because the label-collision handling here
+ * (MIN_GAP_PCT) reads like the live implementation and is not: the real one
+ * clips each header label to its own cell instead. Removal is queued
+ * separately.
+ */
 function GanttChart({
   activities,
   onUpdateProgress,
@@ -2097,7 +2108,7 @@ function ProjectSchedules({
 
   const { data: schedules, isLoading } = useQuery({
     queryKey: ['schedules', project.id],
-    queryFn: () => scheduleApi.listSchedules(project.id),
+    queryFn: () => scheduleApi.listSchedules(project.id).then((page) => page.items),
   });
 
   // CONN-34: when arriving via the BOQ "Build schedule from this BOQ" deep
@@ -2428,12 +2439,12 @@ function HowScheduleWorks() {
   ];
 
   return (
-    <Card padding="md">
-      <h2 className="flex items-center gap-1.5 text-sm font-semibold text-content-primary">
-        <Network size={15} className="text-oe-blue" />
-        {t('schedule.flow_title', { defaultValue: 'How the 4D Schedule fits together' })}
-      </h2>
-      <p className="mt-1 text-xs text-content-tertiary">
+    <CollapsibleSection
+      storageKey="schedule.how"
+      icon={<Network size={15} className="text-oe-blue" />}
+      title={t('schedule.flow_title', { defaultValue: 'How the 4D Schedule fits together' })}
+    >
+      <p className="text-xs text-content-tertiary">
         {t('schedule.flow_intro', {
           defaultValue:
             'The schedule turns a priced estimate into a build timeline, then tracks it against what actually happens on site. This page is where that timeline is built.',
@@ -2490,7 +2501,7 @@ function HowScheduleWorks() {
           </ModLink>
         </span>
       </div>
-    </Card>
+    </CollapsibleSection>
   );
 }
 

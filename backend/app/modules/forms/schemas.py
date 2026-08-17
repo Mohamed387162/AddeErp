@@ -8,12 +8,37 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from app.modules.forms.conditional import CONDITION_OPERATORS
 from app.modules.forms.validation import CATEGORIES, FIELD_TYPES
 
-# Build the regex alternations from the single source of truth in validation.py
-# so a new field type / category only has to be added in one place.
+# Build the regex alternations from the single source of truth in validation.py /
+# conditional.py so a new field type / category / operator only has to be added
+# in one place.
 _FIELD_TYPE_PATTERN = "^(" + "|".join(FIELD_TYPES) + ")$"
 _CATEGORY_PATTERN = "^(" + "|".join(CATEGORIES) + ")$"
+_OPERATOR_PATTERN = "^(" + "|".join(CONDITION_OPERATORS) + ")$"
+
+
+class ConditionExpr(BaseModel):
+    """A branching rule attached to a field via ``visible_if`` / ``required_if``.
+
+    It is either a single comparison (``field`` + ``op`` [+ ``value``]) or a
+    boolean group of nested expressions - ``all`` (every one holds) or ``any`` (at
+    least one holds). Only operators in
+    :data:`app.modules.forms.conditional.CONDITION_OPERATORS` are accepted; the
+    pure evaluator in that module is the runtime source of truth.
+    """
+
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    field: str | None = Field(default=None, max_length=60, description="Key of the field this rule reads.")
+    op: str | None = Field(default=None, pattern=_OPERATOR_PATTERN, description="Comparison operator.")
+    value: Any = Field(default=None, description="Value compared against (unused by empty / not_empty).")
+    all: list["ConditionExpr"] | None = Field(default=None, description="Every sub-expression must hold.")
+    any: list["ConditionExpr"] | None = Field(default=None, description="At least one sub-expression must hold.")
+
+
+ConditionExpr.model_rebuild()
 
 
 class FormField(BaseModel):
@@ -21,6 +46,8 @@ class FormField(BaseModel):
 
     ``key`` is optional on input - the service derives a stable unique key from
     the label when it is omitted (see :func:`validation.normalize_fields`).
+    ``visible_if`` / ``required_if`` carry optional branching logic (see
+    :class:`ConditionExpr`).
     """
 
     model_config = ConfigDict(str_strip_whitespace=True)
@@ -33,6 +60,17 @@ class FormField(BaseModel):
     options: list[str] = Field(default_factory=list)
     unit: str | None = Field(default=None, max_length=40)
     max_rating: int | None = Field(default=None, ge=2, le=10)
+    # Per-field capture config. All optional; the service keeps only the ones that
+    # apply to the field's type (see validation.normalize_fields).
+    placeholder: str | None = Field(default=None, max_length=200)
+    default: Any = Field(default=None, description="Prefilled default answer.")
+    min: float | None = Field(default=None, description="Minimum for a number field.")
+    max: float | None = Field(default=None, description="Maximum for a number field.")
+    min_length: int | None = Field(default=None, ge=0, description="Minimum length for a text field.")
+    pattern: str | None = Field(default=None, max_length=300, description="Regex a text answer must match.")
+    formula: str | None = Field(default=None, max_length=512, description="Expression for a computed field.")
+    visible_if: ConditionExpr | None = Field(default=None, description="Show this field only while the rule holds.")
+    required_if: ConditionExpr | None = Field(default=None, description="Require this field only while the rule holds.")
 
 
 # ── Templates ────────────────────────────────────────────────────────────────

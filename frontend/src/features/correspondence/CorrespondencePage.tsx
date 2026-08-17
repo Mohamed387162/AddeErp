@@ -27,6 +27,9 @@ import {
   ExternalLink,
   ArrowRight,
   Network,
+  Clock,
+  AlertTriangle,
+  ListTodo,
 } from 'lucide-react';
 import {
   Button,
@@ -44,11 +47,13 @@ import {
   WideModalSection,
   WideModalField,
   ModuleGuideButton,
+  CollapsibleSection,
 } from '@/shared/ui';
 import { ContactSearchInput } from '@/shared/ui/ContactSearchInput';
 import { PageHeader } from '@/shared/ui/PageHeader';
+import { TruncationNotice } from '@/shared/ui/TruncationNotice';
 import { useConfirm } from '@/shared/hooks/useConfirm';
-import { apiGet } from '@/shared/lib/api';
+import { apiGet, type Page } from '@/shared/lib/api';
 import { useToastStore } from '@/stores/useToastStore';
 import { useProjectContextStore } from '@/stores/useProjectContextStore';
 import {
@@ -62,10 +67,14 @@ import {
   type Correspondence,
   type CorrespondenceDirection,
   type CorrespondenceType,
+  type CorrespondenceStatus,
   type CreateCorrespondencePayload,
   type UpdateCorrespondencePayload,
 } from './api';
 import { correspondenceGuide } from './correspondenceGuide';
+import { CreateTaskFromSourceDialog } from '@/features/tasks';
+import { InsightsPanel, InsightsToggleButton, useModuleInsights } from '@/features/insights';
+import { buildCorrespondenceInsights } from './correspondenceInsights';
 
 /* ── Constants ─────────────────────────────────────────────────────────── */
 
@@ -89,6 +98,36 @@ const prettyType = (tp: string): string =>
   tp.replace(/[_-]+/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase());
 const correspondenceTypeLabel = (tp: string | null | undefined): string =>
   (tp ? (TYPE_LABELS as Record<string, string>)[tp] : undefined) ?? prettyType(tp || 'letter');
+
+/* Lifecycle statuses in workflow order, plus their English fallback labels and
+   badge colours. open = still with us to action, awaiting_response = ball is in
+   the other party's court, responded = reply received, closed = done. */
+const STATUS_ORDER: CorrespondenceStatus[] = [
+  'open',
+  'awaiting_response',
+  'responded',
+  'closed',
+];
+const STATUS_LABELS: Record<CorrespondenceStatus, string> = {
+  open: 'Open',
+  awaiting_response: 'Awaiting response',
+  responded: 'Responded',
+  closed: 'Closed',
+};
+const correspondenceStatusLabel = (s: string | null | undefined): string =>
+  (s ? (STATUS_LABELS as Record<string, string>)[s] : undefined) ?? prettyType(s || 'open');
+const statusVariant = (s: string | null | undefined): 'blue' | 'warning' | 'success' | 'neutral' => {
+  switch (s) {
+    case 'awaiting_response':
+      return 'warning';
+    case 'responded':
+      return 'success';
+    case 'closed':
+      return 'neutral';
+    default:
+      return 'blue';
+  }
+};
 
 const DIRECTION_CARD_CONFIG: Record<
   CorrespondenceDirection,
@@ -240,6 +279,9 @@ interface CorrespondenceFormData {
   to_display: string;
   date_sent: string;
   date_received: string;
+  status: CorrespondenceStatus;
+  response_required_by: string;
+  contract_clause_ref: string;
   notes: string;
   linked_document_ids: string[];
   linked_transmittal_id: string;
@@ -258,11 +300,108 @@ const EMPTY_FORM: CorrespondenceFormData = {
   to_display: '',
   date_sent: '',
   date_received: '',
+  status: 'open',
+  response_required_by: '',
+  contract_clause_ref: '',
   notes: '',
   linked_document_ids: [],
   linked_transmittal_id: '',
   linked_rfi_id: '',
 };
+
+/**
+ * The form state an existing entry opens with.
+ *
+ * Pure and module-level so the edit handler can rebuild the same baseline the
+ * modal started from and send only what the user actually changed. Prefilling
+ * from a row and then PATCHing every field back rewrites fields nobody opened
+ * with the values they held when the list was last read, quietly undoing an
+ * edit somebody else made in between.
+ */
+export function correspondenceFormData(c: Correspondence): CorrespondenceFormData {
+  return {
+    subject: c.subject,
+    direction: c.direction,
+    type: c.correspondence_type,
+    from_contact: c.from_contact_id || '',
+    from_display: c.from_contact_id || '',
+    to_contacts: (c.to_contact_ids ?? []).join(', '),
+    to_display: (c.to_contact_ids ?? []).join(', '),
+    date_sent: c.date_sent || '',
+    date_received: c.date_received || '',
+    status: c.status,
+    response_required_by: c.response_required_by || '',
+    contract_clause_ref: c.contract_clause_ref || '',
+    notes: c.notes || '',
+    linked_document_ids: c.linked_document_ids ?? [],
+    linked_transmittal_id: c.linked_transmittal_id || '',
+    linked_rfi_id: c.linked_rfi_id || '',
+  };
+}
+
+/** Recipients are typed as one comma-separated line and sent as a list. */
+function recipientIds(form: CorrespondenceFormData): string[] {
+  return (form.to_display || form.to_contacts)
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+/**
+ * The body of an edit save: only the fields the user actually changed.
+ *
+ * Correcting a subject used to write the whole entry back, links and dates
+ * included, exactly as they stood when the list was last read. The update route
+ * dumps with `exclude_unset=True`, so a field left out of the body is left
+ * alone in the database, which is what makes omission the right tool.
+ *
+ * Hand-written rather than a generic key diff because the payload renames
+ * fields on the way out (`type` becomes `correspondence_type`, the recipient
+ * line becomes a list). A name-matched diff would find no form field behind the
+ * renamed key, read it as unchanged and drop the edit on every save.
+ *
+ * Clearing goes as `null`, never `undefined`: the key would be dropped by
+ * `JSON.stringify` and the old value would simply survive.
+ */
+export function buildCorrespondencePatch(
+  form: CorrespondenceFormData,
+  base: CorrespondenceFormData,
+): UpdateCorrespondencePayload {
+  const data: UpdateCorrespondencePayload = {};
+  if (form.subject !== base.subject) data.subject = form.subject;
+  if (form.direction !== base.direction) data.direction = form.direction;
+  if (form.type !== base.type) data.correspondence_type = form.type;
+  if (form.from_contact !== base.from_contact) data.from_contact_id = form.from_contact || null;
+  // Both fields feed one list, so either one moving has to resend it.
+  if (form.to_display !== base.to_display || form.to_contacts !== base.to_contacts) {
+    data.to_contact_ids = recipientIds(form);
+  }
+  if (form.date_sent !== base.date_sent) data.date_sent = form.date_sent || null;
+  if (form.date_received !== base.date_received) data.date_received = form.date_received || null;
+  if (form.status !== base.status) data.status = form.status;
+  if (form.response_required_by !== base.response_required_by) {
+    data.response_required_by = form.response_required_by || null;
+  }
+  if (form.contract_clause_ref !== base.contract_clause_ref) {
+    data.contract_clause_ref = form.contract_clause_ref || null;
+  }
+  if (form.notes !== base.notes) data.notes = form.notes || null;
+  // Compared by content, not identity: rebuilding the baseline makes a fresh
+  // array every time, so a reference test would resend the links on every save.
+  if (
+    form.linked_document_ids.length !== base.linked_document_ids.length ||
+    form.linked_document_ids.some((id, i) => id !== base.linked_document_ids[i])
+  ) {
+    data.linked_document_ids = form.linked_document_ids;
+  }
+  if (form.linked_transmittal_id !== base.linked_transmittal_id) {
+    data.linked_transmittal_id = form.linked_transmittal_id || null;
+  }
+  if (form.linked_rfi_id !== base.linked_rfi_id) {
+    data.linked_rfi_id = form.linked_rfi_id || null;
+  }
+  return data;
+}
 
 /* Minimal row shapes for the link pickers — only the fields we render. */
 interface PickerDocument {
@@ -322,7 +461,7 @@ function CreateCorrespondenceModal({
   const transmittalsQuery = useQuery({
     queryKey: ['correspondence-link-transmittals', projectId],
     queryFn: () =>
-      apiGet<PickerTransmittal[] | { items: PickerTransmittal[] }>(
+      apiGet<Page<PickerTransmittal>>(
         `/v1/transmittals/?project_id=${projectId}`,
       ),
     enabled: !!projectId,
@@ -336,9 +475,8 @@ function CreateCorrespondenceModal({
   });
 
   const documents = docsQuery.data ?? [];
-  const transmittals = Array.isArray(transmittalsQuery.data)
-    ? transmittalsQuery.data
-    : (transmittalsQuery.data?.items ?? []);
+  const transmittalPage = transmittalsQuery.data;
+  const transmittals = transmittalPage?.items ?? [];
   const rfis = rfisQuery.data ?? [];
 
   const toggleDocument = (id: string) =>
@@ -632,6 +770,73 @@ function CreateCorrespondenceModal({
         </WideModalField>
       </WideModalSection>
 
+      {/* Lifecycle + response deadline — lets a formal notice carry its
+          contractual reply date and the clause it is served under, so the
+          register can flag it overdue and drive the status badge. */}
+      <WideModalSection
+        title={t('correspondence.section_tracking', { defaultValue: 'Tracking' })}
+        columns={2}
+      >
+        <WideModalField
+          label={t('correspondence.status', { defaultValue: 'Status' })}
+          htmlFor="corr-status"
+        >
+          <select
+            id="corr-status"
+            value={form.status}
+            onChange={(e) => set('status', e.target.value as CorrespondenceStatus)}
+            className={inputCls}
+          >
+            {STATUS_ORDER.map((s) => (
+              <option key={s} value={s}>
+                {t(`correspondence.status_${s}`, { defaultValue: correspondenceStatusLabel(s) })}
+              </option>
+            ))}
+          </select>
+        </WideModalField>
+
+        <WideModalField
+          label={t('correspondence.response_required_by', {
+            defaultValue: 'Response required by',
+          })}
+          htmlFor="corr-response-by"
+          hint={t('correspondence.hint_response_required_by', {
+            defaultValue: 'Optional - the date a reply is contractually due. Leave blank if none.',
+          })}
+        >
+          <input
+            id="corr-response-by"
+            type="date"
+            value={form.response_required_by}
+            onChange={(e) => set('response_required_by', e.target.value)}
+            className={inputCls}
+          />
+        </WideModalField>
+
+        <WideModalField
+          label={t('correspondence.contract_clause_ref', {
+            defaultValue: 'Contract clause',
+          })}
+          span={2}
+          htmlFor="corr-clause"
+          hint={t('correspondence.hint_contract_clause_ref', {
+            defaultValue: 'Optional - the clause this notice is served under.',
+          })}
+        >
+          <input
+            id="corr-clause"
+            type="text"
+            maxLength={120}
+            value={form.contract_clause_ref}
+            onChange={(e) => set('contract_clause_ref', e.target.value)}
+            className={inputCls}
+            placeholder={t('correspondence.contract_clause_placeholder', {
+              defaultValue: 'e.g. NEC cl. 61.3',
+            })}
+          />
+        </WideModalField>
+      </WideModalSection>
+
       {/* Linked references — connect this entry into the traceable thread
           (Documents / Transmittal / RFI). Backend fully supports these; this
           is what makes the "Docs" count and the linked-reference badges
@@ -662,6 +867,11 @@ function CreateCorrespondenceModal({
               </option>
             ))}
           </select>
+          {/* A dropdown cannot scroll past what the read returned, so an
+              absent transmittal has to be explained rather than looked for. */}
+          {transmittalPage && (
+            <TruncationNotice page={transmittalPage} className="mt-1.5" />
+          )}
         </WideModalField>
 
         <WideModalField
@@ -739,6 +949,7 @@ const CorrespondenceRow = React.memo(function CorrespondenceRow({
   onDelete,
   onUploadAttachment,
   onDownloadAttachment,
+  onCreateTask,
 }: {
   item: Correspondence;
   onEdit: (item: Correspondence) => void;
@@ -747,6 +958,8 @@ const CorrespondenceRow = React.memo(function CorrespondenceRow({
   onUploadAttachment: (item: Correspondence, file: File) => Promise<void>;
   /** Download the attachment at the given index (Bearer-authed fetch). */
   onDownloadAttachment: (item: Correspondence, index: number, filename: string) => void;
+  /** Open the "Create task" quick-create prefilled from this entry. */
+  onCreateTask: (item: Correspondence) => void;
 }) {
   const { t } = useTranslation();
   const [expanded, setExpanded] = useState(false);
@@ -827,6 +1040,37 @@ const CorrespondenceRow = React.memo(function CorrespondenceRow({
           {t(`correspondence.type_${item.correspondence_type ?? 'letter'}`, { defaultValue: correspondenceTypeLabel(item.correspondence_type) })}
         </Badge>
 
+        {/* Status */}
+        <Badge variant={statusVariant(item.status)} size="sm" className="shrink-0">
+          {t(`correspondence.status_${item.status}`, {
+            defaultValue: correspondenceStatusLabel(item.status),
+          })}
+        </Badge>
+
+        {/* Response deadline — overdue reads red, a near deadline amber. Only
+            meaningful while the record still awaits a reply. */}
+        {item.response_required_by &&
+          (item.status === 'open' || item.status === 'awaiting_response') &&
+          (item.is_overdue ? (
+            <Badge variant="error" size="sm" className="shrink-0">
+              <AlertTriangle size={11} className="mr-1" />
+              {t('correspondence.overdue', { defaultValue: 'Overdue' })}
+            </Badge>
+          ) : (
+            typeof item.days_until_due === 'number' &&
+            item.days_until_due <= 7 && (
+              <Badge variant="warning" size="sm" className="shrink-0 hidden md:inline-flex">
+                <Clock size={11} className="mr-1" />
+                {item.days_until_due <= 0
+                  ? t('correspondence.due_today', { defaultValue: 'Due today' })
+                  : t('correspondence.due_in_days', {
+                      defaultValue: 'Due in {{count}}d',
+                      count: item.days_until_due,
+                    })}
+              </Badge>
+            )
+          ))}
+
         {/* From — deep-links to the contact when the value is an id */}
         <span
           className="text-xs text-content-tertiary w-24 truncate shrink-0 hidden lg:block"
@@ -897,6 +1141,31 @@ const CorrespondenceRow = React.memo(function CorrespondenceRow({
               {t('correspondence.label_received', { defaultValue: 'Received' })}:{' '}
               <DateDisplay value={item.date_received} className="text-xs" />
             </span>
+            <span className="inline-flex items-center gap-1">
+              {t('correspondence.status', { defaultValue: 'Status' })}:{' '}
+              <Badge variant={statusVariant(item.status)} size="sm">
+                {t(`correspondence.status_${item.status}`, {
+                  defaultValue: correspondenceStatusLabel(item.status),
+                })}
+              </Badge>
+            </span>
+            {item.response_required_by && (
+              <span className={item.is_overdue ? 'text-semantic-error font-medium' : ''}>
+                {t('correspondence.response_required_by', {
+                  defaultValue: 'Response required by',
+                })}
+                :{' '}
+                <DateDisplay value={item.response_required_by} className="text-xs" />
+                {item.is_overdue &&
+                  ` (${t('correspondence.overdue', { defaultValue: 'Overdue' })})`}
+              </span>
+            )}
+            {item.contract_clause_ref && (
+              <span className="inline-flex items-center gap-1">
+                {t('correspondence.contract_clause_ref', { defaultValue: 'Contract clause' })}:{' '}
+                <span className="text-content-secondary">{item.contract_clause_ref}</span>
+              </span>
+            )}
           </div>
 
           {item.notes && (
@@ -1016,6 +1285,21 @@ const CorrespondenceRow = React.memo(function CorrespondenceRow({
 
           {/* Actions */}
           <div className="flex items-center gap-2 pt-1">
+            <Button
+              variant="secondary"
+              size="sm"
+              icon={<ListTodo size={13} />}
+              onClick={(e) => {
+                e.stopPropagation();
+                onCreateTask(item);
+              }}
+              data-testid={`correspondence-create-task-${item.id}`}
+              title={t('correspondence.create_task_hint', {
+                defaultValue: 'Turn this entry into a task',
+              })}
+            >
+              {t('correspondence.create_task', { defaultValue: 'Create task' })}
+            </Button>
             <Button
               variant="secondary"
               size="sm"
@@ -1159,12 +1443,12 @@ function HowCorrespondenceWorks() {
   ];
 
   return (
-    <section className="rounded-xl border border-border-light bg-surface-secondary/40 p-4">
-      <h2 className="flex items-center gap-1.5 text-sm font-semibold text-content-primary">
-        <Network size={15} className="text-oe-blue" />
-        {t('correspondence.how_title', { defaultValue: 'How correspondence fits together' })}
-      </h2>
-      <p className="mt-1 text-xs text-content-tertiary">
+    <CollapsibleSection
+      storageKey="correspondence.how"
+      icon={<Network size={15} className="text-oe-blue" />}
+      title={t('correspondence.how_title', { defaultValue: 'How correspondence fits together' })}
+    >
+      <p className="text-xs text-content-tertiary">
         {t('correspondence.how_intro', {
           defaultValue:
             'Log every formal letter, notice, email and memo, attach its source file and link it into one traceable thread you can rely on if a claim arises.',
@@ -1212,7 +1496,7 @@ function HowCorrespondenceWorks() {
           {t('correspondence.how_mod_submittals', { defaultValue: 'Submittals' })}
         </ModLink>
       </div>
-    </section>
+    </CollapsibleSection>
   );
 }
 
@@ -1229,9 +1513,11 @@ export function CorrespondencePage() {
   // State
   const [showCreateModal, setShowCreateModal] = useState(false);
   const [editingItem, setEditingItem] = useState<Correspondence | null>(null);
+  const [taskSourceItem, setTaskSourceItem] = useState<Correspondence | null>(null);
   const [searchQuery, setSearchQuery] = useState('');
   const [directionFilter, setDirectionFilter] = useState<CorrespondenceDirection | ''>('');
   const [typeFilter, setTypeFilter] = useState<CorrespondenceType | ''>('');
+  const [statusFilter, setStatusFilter] = useState<CorrespondenceStatus | ''>('');
   const { confirm, ...confirmProps } = useConfirm();
 
   // Data
@@ -1249,21 +1535,25 @@ export function CorrespondencePage() {
     projects.find((p) => p.id === selectedProjectId)?.name || '';
 
   const {
-    data: items = [],
+    data: page,
     isLoading,
     isError,
     error,
     refetch,
   } = useQuery({
-    queryKey: ['correspondence', projectId, directionFilter, typeFilter],
+    queryKey: ['correspondence', projectId, directionFilter, typeFilter, statusFilter],
     queryFn: () =>
       fetchCorrespondence({
         project_id: projectId,
         direction: directionFilter || undefined,
         type: typeFilter || undefined,
+        status: statusFilter || undefined,
       }),
     enabled: !!projectId,
   });
+  // Memoised on the page object rather than defaulted inline: a fresh `[]`
+  // on every render would change the identity every dependent useMemo reads.
+  const items = useMemo(() => page?.items ?? [], [page]);
 
   // Client-side search
   const filtered = useMemo(() => {
@@ -1277,6 +1567,15 @@ export function CorrespondencePage() {
         (c.to_contact_ids ?? []).some((tc) => tc.toLowerCase().includes(q)),
     );
   }, [items, searchQuery]);
+
+  // ── Module Insights ──────────────────────────────────────────────────
+  // Built off the already-loaded register rows; until the register has some
+  // the panel draws nothing rather than inventing entries to fill it.
+  const insights = useModuleInsights('correspondence', { defaultOpen: true });
+  const { datasets: insightDatasets, builtins: insightBuiltins } = useMemo(
+    () => buildCorrespondenceInsights(items, '', t),
+    [items, t],
+  );
 
   // Invalidation
   const invalidateAll = useCallback(() => {
@@ -1344,12 +1643,14 @@ export function CorrespondencePage() {
       direction: formData.direction,
       correspondence_type: formData.type,
       from_contact_id: formData.from_contact || undefined,
-      to_contact_ids: (formData.to_display || formData.to_contacts)
-        .split(',')
-        .map((s) => s.trim())
-        .filter(Boolean),
+      to_contact_ids: recipientIds(formData),
       date_sent: formData.date_sent || undefined,
       date_received: formData.date_received || undefined,
+      // Lifecycle + response deadline. status is always sent; the date and
+      // clause send null when cleared so an edit is fully round-trippable.
+      status: formData.status,
+      response_required_by: formData.response_required_by || null,
+      contract_clause_ref: formData.contract_clause_ref || null,
       // Link this entry into the traceable thread. Always sent (empty array /
       // null clears links on edit) so the picker is fully round-trippable.
       linked_document_ids: formData.linked_document_ids,
@@ -1374,28 +1675,14 @@ export function CorrespondencePage() {
   const handleEditSubmit = useCallback(
     (formData: CorrespondenceFormData) => {
       if (!editingItem) return;
-      updateMut.mutate({ id: editingItem.id, data: buildPayload(formData) });
+      // Rebuild the baseline the modal started from, so the save carries only
+      // what the user actually edited. See `buildCorrespondencePatch`.
+      updateMut.mutate({
+        id: editingItem.id,
+        data: buildCorrespondencePatch(formData, correspondenceFormData(editingItem)),
+      });
     },
-    [updateMut, editingItem, buildPayload],
-  );
-
-  const formDataFromItem = useCallback(
-    (c: Correspondence): CorrespondenceFormData => ({
-      subject: c.subject,
-      direction: c.direction,
-      type: c.correspondence_type,
-      from_contact: c.from_contact_id || '',
-      from_display: c.from_contact_id || '',
-      to_contacts: (c.to_contact_ids ?? []).join(', '),
-      to_display: (c.to_contact_ids ?? []).join(', '),
-      date_sent: c.date_sent || '',
-      date_received: c.date_received || '',
-      notes: c.notes || '',
-      linked_document_ids: c.linked_document_ids ?? [],
-      linked_transmittal_id: c.linked_transmittal_id || '',
-      linked_rfi_id: c.linked_rfi_id || '',
-    }),
-    [],
+    [updateMut, editingItem],
   );
 
   const handleDelete = useCallback(
@@ -1473,6 +1760,7 @@ export function CorrespondencePage() {
         })}
         actions={
           <>
+            <InsightsToggleButton open={insights.open} onClick={insights.toggle} />
             <ModuleGuideButton content={correspondenceGuide} />
             <Button
               variant="primary"
@@ -1487,6 +1775,18 @@ export function CorrespondencePage() {
             </Button>
           </>
         }
+      />
+
+      <InsightsPanel
+        open={insights.open}
+        title={t('correspondence.insights.title', { defaultValue: 'Correspondence insights' })}
+        datasets={insightDatasets}
+        builtins={insightBuiltins}
+        custom={insights.custom}
+        onAdd={insights.addCustom}
+        onUpdate={insights.updateCustom}
+        onRemove={insights.removeCustom}
+        onCollapse={() => insights.setOpen(false)}
       />
 
       {/* Canonical module info card \u2014 pain-named title + workflow body. */}
@@ -1616,6 +1916,28 @@ export function CorrespondencePage() {
             <ChevronDown size={14} />
           </div>
         </div>
+
+        {/* Status filter */}
+        <div className="relative">
+          <select
+            value={statusFilter}
+            onChange={(e) => setStatusFilter(e.target.value as CorrespondenceStatus | '')}
+            aria-label={t('correspondence.filter_all_status', { defaultValue: 'All Statuses' })}
+            className="h-10 appearance-none rounded-lg border border-border bg-surface-primary pl-3 pr-9 text-sm text-content-primary focus:outline-none focus:ring-2 focus:ring-oe-blue sm:w-40"
+          >
+            <option value="">
+              {t('correspondence.filter_all_status', { defaultValue: 'All Statuses' })}
+            </option>
+            {(Object.keys(STATUS_LABELS) as CorrespondenceStatus[]).map((st) => (
+              <option key={st} value={st}>
+                {t(`correspondence.status_${st}`, { defaultValue: STATUS_LABELS[st] })}
+              </option>
+            ))}
+          </select>
+          <div className="pointer-events-none absolute inset-y-0 right-0 flex items-center pr-2.5 text-content-tertiary">
+            <ChevronDown size={14} />
+          </div>
+        </div>
       </div>
 
       {/* Table */}
@@ -1628,12 +1950,12 @@ export function CorrespondencePage() {
           <EmptyState
             icon={<Mail size={28} strokeWidth={1.5} />}
             title={
-              searchQuery || directionFilter || typeFilter
+              searchQuery || directionFilter || typeFilter || statusFilter
                 ? t('correspondence.no_results', { defaultValue: 'No matching entries' })
                 : t('correspondence.no_entries', { defaultValue: 'No correspondence yet' })
             }
             description={
-              searchQuery || directionFilter || typeFilter
+              searchQuery || directionFilter || typeFilter || statusFilter
                 ? t('correspondence.no_results_hint', {
                     defaultValue: 'Try adjusting your search or filters',
                   })
@@ -1642,7 +1964,7 @@ export function CorrespondencePage() {
                   })
             }
             action={
-              !searchQuery && !directionFilter && !typeFilter
+              !searchQuery && !directionFilter && !typeFilter && !statusFilter
                 ? {
                     label: t('correspondence.new_letter', { defaultValue: 'New Letter' }),
                     onClick: () => setShowCreateModal(true),
@@ -1658,6 +1980,10 @@ export function CorrespondencePage() {
                 count: filtered.length,
               })}
             </p>
+            {/* The count above is what the search left of the page; this is
+                what the page left of the register. Both have to be said, or a
+                letter that never loaded reads as a letter that never existed. */}
+            {page && <TruncationNotice page={page} className="-mt-2 mb-3" />}
             <Card padding="none" className="overflow-x-auto">
               {/* Table header */}
               <div className="flex items-center gap-3 px-4 py-2.5 border-b border-border-light bg-surface-secondary/30 text-2xs font-medium text-content-tertiary uppercase tracking-wider min-w-[640px]">
@@ -1695,6 +2021,7 @@ export function CorrespondencePage() {
                   onDelete={handleDelete}
                   onUploadAttachment={handleUploadAttachment}
                   onDownloadAttachment={handleDownloadAttachment}
+                  onCreateTask={setTaskSourceItem}
                 />
               ))}
             </Card>
@@ -1717,10 +2044,28 @@ export function CorrespondencePage() {
         <CreateCorrespondenceModal
           isEdit
           projectId={projectId}
-          initialData={formDataFromItem(editingItem)}
+          initialData={correspondenceFormData(editingItem)}
           onClose={() => setEditingItem(null)}
           onSubmit={handleEditSubmit}
           isPending={updateMut.isPending}
+        />
+      )}
+
+      {/* Create task quick action — prefilled from this correspondence entry */}
+      {taskSourceItem && (
+        <CreateTaskFromSourceDialog
+          projectId={taskSourceItem.project_id || projectId}
+          sourceType="correspondence"
+          sourceId={taskSourceItem.id}
+          sourceLabel={taskSourceItem.reference_number}
+          defaultTitle={taskSourceItem.subject}
+          defaultDescription={t('correspondence.task_desc_default', {
+            defaultValue: 'Follow up on correspondence {{ref}}: {{subject}}',
+            ref: taskSourceItem.reference_number,
+            subject: taskSourceItem.subject,
+          })}
+          defaultDueDate={taskSourceItem.response_required_by}
+          onClose={() => setTaskSourceItem(null)}
         />
       )}
 

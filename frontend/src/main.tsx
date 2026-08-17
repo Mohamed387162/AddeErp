@@ -1,10 +1,11 @@
 import React from 'react';
 import ReactDOM from 'react-dom/client';
-import { QueryClient, QueryClientProvider, MutationCache } from '@tanstack/react-query';
+import { QueryClient, QueryClientProvider, MutationCache, QueryCache } from '@tanstack/react-query';
 import { BrowserRouter } from 'react-router-dom';
 import App from './app/App';
 import { useToastStore } from '@/stores/useToastStore';
-import './app/i18n';
+import { notifyQueryError } from '@/shared/lib/queryErrorToast';
+import { initialLocaleReady } from './app/i18n';
 import './index.css';
 
 (window as unknown as { CESIUM_BASE_URL: string }).CESIUM_BASE_URL = '/cesium/';
@@ -43,6 +44,13 @@ const queryClient = new QueryClient({
       retry: 0,
     },
   },
+  // Queries had no global error handling at all, so a request that came back
+  // with nothing showed as an empty screen: components read `data ?? []` and
+  // render the same table for "no rows" and "no answer". The handler decides
+  // what is worth saying; see `queryErrorToast.ts` for what it stays quiet on.
+  queryCache: new QueryCache({
+    onError: (error, query) => notifyQueryError(error, query),
+  }),
   mutationCache: new MutationCache({
     onSuccess: (_data, _variables, _context, mutation) => {
       // Global: after ANY successful mutation, invalidate related queries
@@ -96,12 +104,47 @@ window.addEventListener('vite:preloadError', () => {
   }
 });
 
-ReactDOM.createRoot(__rootEl).render(
-  <React.StrictMode>
-    <QueryClientProvider client={queryClient}>
-      <BrowserRouter future={{ v7_startTransition: true, v7_relativeSplatPath: true }}>
-        <App />
-      </BrowserRouter>
-    </QueryClientProvider>
-  </React.StrictMode>,
-);
+// The public demo is served under /demo (Caddy strips the prefix before it
+// reaches the backend, but the browser URL keeps it), so react-router needs a
+// matching basename there. Desktop and localhost serve at the root, where the
+// path never starts with /demo, so the basename stays undefined ("/").
+const routerBasename =
+  window.location.pathname === '/demo' || window.location.pathname.startsWith('/demo/')
+    ? '/demo'
+    : undefined;
+
+const renderApp = () => {
+  ReactDOM.createRoot(__rootEl).render(
+    <React.StrictMode>
+      <QueryClientProvider client={queryClient}>
+        <BrowserRouter basename={routerBasename}>
+          <App />
+        </BrowserRouter>
+      </QueryClientProvider>
+    </React.StrictMode>,
+  );
+};
+
+// A saved non-English language must be IN the i18next store before the first
+// paint, or that first frame renders through the English fallback — the
+// "English flash" every non-English session used to open with. Waiting here
+// costs one same-origin chunk fetch (~50 KB gzip, usually cached) during a
+// window where the user already sees the plain index.html shell, so nothing
+// visibly changes except the language of the first frame. The cap bounds the
+// wait: if the chunk stalls, mount anyway in English and let the existing
+// re-render-on-arrival path recover. English boots keep today's fully
+// synchronous mount (`initialLocaleReady` is null — no promise, no timer).
+const LOCALE_MOUNT_CAP_MS = 2000;
+if (initialLocaleReady) {
+  let mounted = false;
+  const mountOnce = () => {
+    if (!mounted) {
+      mounted = true;
+      renderApp();
+    }
+  };
+  void initialLocaleReady.then(mountOnce);
+  window.setTimeout(mountOnce, LOCALE_MOUNT_CAP_MS);
+} else {
+  renderApp();
+}

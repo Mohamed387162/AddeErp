@@ -14,6 +14,7 @@ Endpoints:
 
 import logging
 import uuid
+from datetime import UTC, datetime
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
@@ -37,6 +38,7 @@ ALLOWED_ATTACHMENT_TYPES = frozenset({"pdf", "png", "jpeg", "gif", "webp", "zip"
 from app.dependencies import CurrentUserId, RequirePermission, SessionDep, verify_project_access
 from app.modules.correspondence.schemas import (
     CorrespondenceCreate,
+    CorrespondenceListResponse,
     CorrespondenceResponse,
     CorrespondenceUpdate,
 )
@@ -56,7 +58,31 @@ def _get_service(session: SessionDep) -> CorrespondenceService:
     return CorrespondenceService(session)
 
 
+def _compute_correspondence_fields(item: object) -> tuple[bool, int | None]:
+    """Compute ``is_overdue`` and ``days_until_due`` from the response deadline.
+
+    A record is overdue when it still awaits a reply (``status`` is ``open`` or
+    ``awaiting_response``) and its ``response_required_by`` date has passed.
+    ``days_until_due`` is signed - negative once the deadline is behind us - and
+    is ``None`` when no deadline was set. Date-only arithmetic keeps "due today"
+    from reading as overdue just because the clock has moved past midnight UTC.
+    """
+    due_raw = getattr(item, "response_required_by", None)
+    if not due_raw:
+        return False, None
+    try:
+        due = datetime.fromisoformat(str(due_raw))
+    except (ValueError, TypeError):
+        return False, None
+    today = datetime.now(UTC).date()
+    days_until_due = (due.date() - today).days
+    status_val = getattr(item, "status", "open")
+    is_overdue = status_val in ("open", "awaiting_response") and today > due.date()
+    return is_overdue, days_until_due
+
+
 def _to_response(item: object) -> CorrespondenceResponse:
+    is_overdue, days_until_due = _compute_correspondence_fields(item)
     return CorrespondenceResponse(
         id=item.id,  # type: ignore[attr-defined]
         project_id=item.project_id,  # type: ignore[attr-defined]
@@ -71,6 +97,11 @@ def _to_response(item: object) -> CorrespondenceResponse:
         linked_document_ids=item.linked_document_ids or [],  # type: ignore[attr-defined]
         linked_transmittal_id=item.linked_transmittal_id,  # type: ignore[attr-defined]
         linked_rfi_id=item.linked_rfi_id,  # type: ignore[attr-defined]
+        status=getattr(item, "status", "open") or "open",
+        response_required_by=getattr(item, "response_required_by", None),
+        contract_clause_ref=getattr(item, "contract_clause_ref", None),
+        is_overdue=is_overdue,
+        days_until_due=days_until_due,
         notes=item.notes,  # type: ignore[attr-defined]
         created_by=item.created_by,  # type: ignore[attr-defined]
         attachments=getattr(item, "attachments", None) or [],
@@ -80,7 +111,7 @@ def _to_response(item: object) -> CorrespondenceResponse:
     )
 
 
-@router.get("/", response_model=list[CorrespondenceResponse])
+@router.get("/", response_model=CorrespondenceListResponse)
 async def list_correspondences(
     session: SessionDep,
     project_id: uuid.UUID = Query(...),
@@ -89,18 +120,35 @@ async def list_correspondences(
     limit: int = Query(default=50, ge=1, le=100),
     direction: str | None = Query(default=None),
     type_filter: str | None = Query(default=None, alias="type"),
+    status_filter: str | None = Query(
+        default=None,
+        alias="status",
+        pattern=r"^(open|awaiting_response|responded|closed)$",
+    ),
     _perm: None = Depends(RequirePermission("correspondence.read")),
     service: CorrespondenceService = Depends(_get_service),
-) -> list[CorrespondenceResponse]:
+) -> CorrespondenceListResponse:
+    """List correspondence for a project, one page plus the matching total.
+
+    The service already counts the whole filtered set to build the page; this
+    returns that count instead of discarding it, so a caller can tell a
+    complete log from a truncated one.
+    """
     await verify_project_access(project_id, user_id, session)
-    items, _ = await service.list_correspondences(
+    items, total = await service.list_correspondences(
         project_id,
         offset=offset,
         limit=limit,
         direction=direction,
         correspondence_type=type_filter,
+        status=status_filter,
     )
-    return [_to_response(c) for c in items]
+    return CorrespondenceListResponse(
+        items=[_to_response(c) for c in items],
+        total=total,
+        offset=offset,
+        limit=limit,
+    )
 
 
 @router.post("/", response_model=CorrespondenceResponse, status_code=201)

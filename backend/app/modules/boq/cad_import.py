@@ -14,9 +14,11 @@ Workflow:
 """
 
 import asyncio
+import contextlib
 import logging
 import os
 import sys
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -201,11 +203,46 @@ if _ddc_bin:
     logger.info("DDC toolkit converters found at %s", _ddc_bin)
 
 
+# The libraries every Windows converter folder carries beside its exe.
+# All four formats ship the same three files - byte for byte the same
+# blobs - so their absence is not a per-format quirk of the layout, it is
+# a folder holding part of what we installed.
+_WINDOWS_COMPANION_FILES: tuple[str, ...] = ("Qt6Core.dll", "Qt6Gui.dll", "Qt6Widgets.dll")
+
+
+def missing_companion_files(exe_path: Path) -> list[str]:
+    """Names of the Windows companion libraries absent from the exe's folder.
+
+    A rollback on Windows cannot delete a file another process holds open,
+    and the installer's rollbacks pass ``ignore_errors=True``, so a failed
+    install can leave a folder with the exe in it and little else. Nothing
+    downstream noticed: resolution accepted any file over 1 KB. Windows
+    then walks the rest of its search order for the missing libraries and
+    can bind the converter to an unrelated build elsewhere on the machine,
+    which is what error 0xC000007B looks like from the outside.
+
+    Keyed on the ``.exe`` suffix and not on the host platform: the Linux
+    build is a single ELF binary that resolves its dependencies through
+    the loader path and has no library beside it by design.
+    """
+    if exe_path.suffix.lower() != ".exe":
+        return []
+    folder = exe_path.parent
+    return [name for name in _WINDOWS_COMPANION_FILES if not (folder / name).exists()]
+
+
 def find_converter(extension: str) -> Path | None:
     """Find the converter executable for a given file extension.
 
     Searches through ``CONVERTER_SEARCH_PATHS`` in order and returns the
     first existing executable path, or ``None`` if no converter is found.
+
+    A Windows folder holding the exe without the Qt libraries beside it is
+    a partial install, and it used to win the search purely by sitting
+    earlier in the order. Such a candidate is now kept back: a complete
+    tree anywhere wins, and the partial one is returned only when there is
+    nothing better, so this never answers ``None`` where it used to answer
+    a path. Reporting the partial folder is the health check's job.
 
     Args:
         extension: Lowercase file extension without dot (e.g. ``"rvt"``).
@@ -296,12 +333,23 @@ def find_converter(extension: str) -> Path | None:
         if cand.exists() and cand.stat().st_size > 1024:
             return cand
 
+    partial: Path | None = None
     for search_path in search_paths:
         exe_path = search_path / exe_name
         if exe_path.exists() and exe_path.stat().st_size > 1024:
-            return exe_path
+            if not missing_companion_files(exe_path):
+                return exe_path
+            if partial is None:
+                partial = exe_path
 
-    return None
+    if partial is not None:
+        logger.warning(
+            "Converter %s at %s is missing %s - that folder holds part of an install",
+            exe_name,
+            partial,
+            ", ".join(missing_companion_files(partial)),
+        )
+    return partial
 
 
 # ── Automatic converter provisioning (zero-user-action download) ──────────
@@ -341,6 +389,13 @@ _CONVERTER_INSTALL_ROOT: Path = Path.home() / ".openestimator" / "converters"
 # the RVT (RvtExporter) converter, .dxf by the DWG (DwgExporter)
 # converter. ``ensure_converter`` resolves through this so an upload of an
 # alias provisions and runs the binary that actually reads it.
+#
+# The .dxf entry is now only about WHICH BINARY reads a DXF if one is being
+# used at all. It is no longer the route a DXF upload takes: ``dxf_native``
+# reads the drawing in-process, and ``convert_cad_to_excel`` sends it there
+# before any of this is consulted. Deleting the entry outright would still be
+# wrong, because it is what lets an explicitly installed DWG converter be
+# found for a .dxf on the health and capability paths.
 _CONVERTER_FORMAT_ALIASES: dict[str, str] = {
     "rfa": "rvt",
     "dxf": "dwg",
@@ -406,7 +461,7 @@ class _ConverterInstallLock:
         if not _is_windows():
             import fcntl
 
-            self._fd = os.open(str(self._lock_path), os.O_RDWR | os.O_CREAT, 0o644)
+            self._fd = os.open(str(self._lock_path), os.O_RDWR | os.O_CREAT, 0o600)
             while True:
                 try:
                     fcntl.flock(self._fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -422,7 +477,7 @@ class _ConverterInstallLock:
         # Windows: exclusive-create poll loop.
         while True:
             try:
-                self._fd = os.open(str(self._lock_path), os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o644)
+                self._fd = os.open(str(self._lock_path), os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
                 return self
             except FileExistsError:
                 # Reclaim a stale lock left by a crashed holder. Staleness
@@ -694,14 +749,74 @@ _HEALTH_TTL_SEC = 300
 # the binary up". The values appear as both signed (Python's negative-int
 # representation of an unsigned u32) and unsigned in the wild, so we
 # match both.
+#
+# Anything not listed here falls through to the healthy branch, so a code
+# missing from this set is not a worse message - it is the banner reporting
+# a converter as working while Windows refuses to start it. That is exactly
+# what happened with 0xC000007B, which a user hit on the DGN converter while
+# the status card showed no problem at all.
+#
+# The four codes are one family: the image is unusable before its first
+# instruction runs. 0xC000007B is the odd one out in cause - it is a bitness
+# mismatch, not an absent file - so it carries its own wording below.
+_WINDOWS_STATUS_DLL_NOT_FOUND = 0xC0000135
+_WINDOWS_STATUS_DLL_INIT_FAILED = 0xC0000142
+_WINDOWS_STATUS_INVALID_IMAGE_FORMAT = 0xC000007B
+_WINDOWS_STATUS_ENTRYPOINT_NOT_FOUND = 0xC0000139
+
+
+def _both_signs(code: int) -> tuple[int, int]:
+    """Return an NTSTATUS as the unsigned and signed ints subprocess may report."""
+    return code, code - 0x1_0000_0000
+
+
 _WINDOWS_DLL_LOAD_FAILURES: frozenset[int] = frozenset(
-    {
-        -1073741515,  # 0xC0000135 STATUS_DLL_NOT_FOUND
-        -1073741502,  # 0xC0000142 STATUS_DLL_INIT_FAILED
-        3221225781,  # 0xC0000135 unsigned
-        3221225794,  # 0xC0000142 unsigned
-    }
+    code
+    for status in (
+        _WINDOWS_STATUS_DLL_NOT_FOUND,
+        _WINDOWS_STATUS_DLL_INIT_FAILED,
+        _WINDOWS_STATUS_INVALID_IMAGE_FORMAT,
+        _WINDOWS_STATUS_ENTRYPOINT_NOT_FOUND,
+    )
+    for code in _both_signs(status)
 )
+
+
+@contextlib.contextmanager
+def _windows_loader_errors_stay_quiet() -> Iterator[None]:
+    """Stop Windows putting its own modal dialog in front of the application.
+
+    When the loader cannot start an image it shows a "Bad Image" message box
+    and blocks until somebody clicks OK. The box belongs to the operating
+    system, so the application never learns it exists: our own health message
+    is written to a card the user cannot see behind it, and the reporter of
+    this defect saw a system dialog naming a DLL rather than anything we wrote.
+
+    A child process inherits the error mode of its parent, and
+    SEM_FAILCRITICALERRORS is documented as the setting a service should hold,
+    so setting it here is what makes the failure come back as an exit code we
+    can explain. The previous mode is restored, because the flag is
+    process-wide and this module does not own the process.
+
+    No-op off Windows, where a loader failure already arrives as an exit code
+    and a line on stderr.
+    """
+    if not sys.platform.startswith("win"):
+        yield
+        return
+    import ctypes
+
+    sem_failcriticalerrors = 0x0001
+    kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+    previous = kernel32.SetErrorMode(sem_failcriticalerrors)
+    try:
+        # SetErrorMode replaces rather than merges, so put back whatever the
+        # host process had once we are done.
+        kernel32.SetErrorMode(previous | sem_failcriticalerrors)
+        yield
+    finally:
+        kernel32.SetErrorMode(previous)
+
 
 # Linux ld.so failure markers. When a shared dependency (`libQt6Core.so.6`
 # or one of the `ddc-deps-*` packages) is missing, glibc's `ld.so` writes
@@ -747,6 +862,30 @@ def smoke_test_converter(extension: str, force: bool = False) -> ConverterHealth
         _HEALTH_CACHE[extension] = result
         return result
 
+    # A folder with the exe but not the libraries we ship beside it is a
+    # partial install, and it reads as a healthy one from every check we
+    # had: the file is there and it is bigger than 1 KB. Say so before
+    # spawning anything, because whether the binary starts from such a
+    # folder depends on what else is installed on the machine, and a
+    # converter that starts by borrowing another program's libraries is
+    # not an install we can support either way.
+    absent = missing_companion_files(exe_path)
+    if absent:
+        result = {
+            "status": "failed",
+            "message": (
+                f"{exe_path.parent} holds {exe_path.name} but not {', '.join(absent)}, "
+                f"so that folder has only part of a converter in it. Windows will look "
+                f"for those libraries everywhere else on the machine and may start the "
+                f"converter against an unrelated copy. Press Uninstall and then Install "
+                f"so the folder is rebuilt from empty."
+            ),
+            "suggested_actions": ["reinstall_converter", "manual_install_from_github"],
+            "checked_at": now,
+        }
+        _HEALTH_CACHE[extension] = result
+        return result
+
     try:
         import subprocess
 
@@ -756,27 +895,48 @@ def smoke_test_converter(extension: str, force: bool = False) -> ConverterHealth
         # native CAD format and leave the model stuck at
         # ``ddc_smoke_failed`` even when the binary was correctly
         # installed.  Drop the explicit ``stdin=PIPE``.
-        proc = subprocess.run(
-            [str(exe_path)],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            cwd=str(exe_path.parent),
-            env=_converter_subprocess_env(exe_path),
-            input=b"\n",
-            timeout=8,
-        )
+        with _windows_loader_errors_stay_quiet():
+            proc = subprocess.run(
+                [str(exe_path)],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                cwd=str(exe_path.parent),
+                env=_converter_subprocess_env(exe_path),
+                input=b"\n",
+                timeout=8,
+            )
         rc = proc.returncode
 
         if rc in _WINDOWS_DLL_LOAD_FAILURES:
+            unsigned = rc & 0xFFFFFFFF
+            if unsigned == _WINDOWS_STATUS_INVALID_IMAGE_FORMAT:
+                # The loader found the image and refused it. This branch used
+                # to assert that every library was present and one of them was
+                # built for the other word size, and told the user to download
+                # the converter again. Both halves were wrong. Every file we
+                # publish for every converter is 64-bit, and has been in every
+                # version we have released, so the word-size claim describes
+                # nothing we ship; and downloading again cannot remove a file
+                # that should not be in the folder. What clears the folder is
+                # Uninstall, or deleting it.
+                diagnosis = (
+                    f"Windows found {exe_path.name} and then refused to start it "
+                    f"(error 0x{unsigned:08x}). Every file we publish for this converter is 64-bit, "
+                    f"in every version we have released, so a folder that fails this way is either "
+                    f"missing something we ship or holding something we do not. Press Uninstall and "
+                    f"then Install so the folder is rebuilt from empty, or delete {exe_path.parent} "
+                    f"yourself and install again. If it comes back, send us the converter path shown "
+                    f"here and a listing of that folder with file sizes."
+                )
+            else:
+                diagnosis = (
+                    f"{exe_path.name} exists on disk but cannot load - a required Qt6 / Visual C++ DLL is "
+                    f"missing or the wrong version (Windows error 0x{unsigned:08x}). The Qt6 plugins probably "
+                    f"did not download cleanly during install."
+                )
             result = {
                 "status": "failed",
-                "message": (
-                    f"{exe_path.name} exists on disk but cannot load - a "
-                    f"required Qt6 / Visual C++ DLL is missing "
-                    f"(Windows error 0x{rc & 0xFFFFFFFF:08x}). The Qt6 "
-                    f"plugins probably did not download cleanly during "
-                    f"install."
-                ),
+                "message": diagnosis,
                 "suggested_actions": [
                     "reinstall_converter",
                     "install_vc_redist",
@@ -1529,6 +1689,18 @@ async def convert_cad_to_excel(
     Returns:
         Path to the generated Excel file, or ``None`` on failure.
     """
+    # Formats the platform reads in-process never touch a converter binary.
+    #
+    # Decided on the file's OWN suffix rather than on ``extension``, because
+    # callers pre-resolve the alias: ``takeoff.router`` passes
+    # ``_CONVERTER_FORMAT_ALIASES.get(ext, ext)``, so a .dxf upload arrives
+    # here labelled "dwg" and a check on the label would never fire. The file
+    # on disk is the thing being read, so the file decides.
+    from app.modules.boq.dxf_native import convert_dxf_to_excel, is_natively_readable
+
+    if is_natively_readable(input_path.suffix):
+        return await asyncio.to_thread(convert_dxf_to_excel, input_path, output_dir)
+
     # Resolve the converter, auto-downloading it on first use if missing.
     # ``ensure_converter`` is idempotent and concurrency-safe; on an
     # unsupported platform (or a failed download) it raises
@@ -1868,7 +2040,9 @@ def _norm_col(name: str) -> str:
     """
     import re
 
-    s = str(name).strip().lower()
+    # Cap length before the super-linear cleanup regexes below; a real quantity
+    # column name is short, so this never truncates legitimate input.
+    s = str(name)[:256].strip().lower()
     s = s.replace("²", "2").replace("³", "3")
     # Drop a trailing unit qualifier in brackets/parens: "volume (m3)",
     # "area [m2]", "weight {kg}".

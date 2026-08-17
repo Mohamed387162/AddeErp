@@ -10,6 +10,9 @@ from typing import Any
 
 from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm.attributes import set_committed_value
+from sqlalchemy.orm.util import identity_key
+from sqlalchemy.sql.elements import ClauseElement
 
 from app.modules.resources.models import (
     Assignment,
@@ -77,7 +80,15 @@ class ResourceRepository:
         stmt = update(Resource).where(Resource.id == resource_id).values(**fields)
         await self.session.execute(stmt)
         await self.session.flush()
-        self.session.expire_all()
+        instance = self.session.identity_map.get(identity_key(Resource, resource_id))
+        if instance is None:
+            return
+        computed = [name for name, value in fields.items() if isinstance(value, ClauseElement)]
+        for name, value in fields.items():
+            if name not in computed:
+                set_committed_value(instance, name, value)
+        if computed:
+            self.session.expire(instance, computed)
 
     async def delete(self, resource_id: uuid.UUID) -> None:
         resource = await self.get_by_id(resource_id)
@@ -130,7 +141,15 @@ class SkillRepository:
         stmt = update(Skill).where(Skill.id == skill_id).values(**fields)
         await self.session.execute(stmt)
         await self.session.flush()
-        self.session.expire_all()
+        instance = self.session.identity_map.get(identity_key(Skill, skill_id))
+        if instance is None:
+            return
+        computed = [name for name, value in fields.items() if isinstance(value, ClauseElement)]
+        for name, value in fields.items():
+            if name not in computed:
+                set_committed_value(instance, name, value)
+        if computed:
+            self.session.expire(instance, computed)
 
     async def delete(self, skill_id: uuid.UUID) -> None:
         skill = await self.get_by_id(skill_id)
@@ -252,7 +271,15 @@ class CertificationRepository:
         stmt = update(Certification).where(Certification.id == cert_id).values(**fields)
         await self.session.execute(stmt)
         await self.session.flush()
-        self.session.expire_all()
+        instance = self.session.identity_map.get(identity_key(Certification, cert_id))
+        if instance is None:
+            return
+        computed = [name for name, value in fields.items() if isinstance(value, ClauseElement)]
+        for name, value in fields.items():
+            if name not in computed:
+                set_committed_value(instance, name, value)
+        if computed:
+            self.session.expire(instance, computed)
 
     async def delete(self, cert_id: uuid.UUID) -> None:
         cert = await self.get_by_id(cert_id)
@@ -325,7 +352,15 @@ class AvailabilityWindowRepository:
         stmt = update(AvailabilityWindow).where(AvailabilityWindow.id == window_id).values(**fields)
         await self.session.execute(stmt)
         await self.session.flush()
-        self.session.expire_all()
+        instance = self.session.identity_map.get(identity_key(AvailabilityWindow, window_id))
+        if instance is None:
+            return
+        computed = [name for name, value in fields.items() if isinstance(value, ClauseElement)]
+        for name, value in fields.items():
+            if name not in computed:
+                set_committed_value(instance, name, value)
+        if computed:
+            self.session.expire(instance, computed)
 
     async def delete(self, window_id: uuid.UUID) -> None:
         window = await self.get_by_id(window_id)
@@ -353,8 +388,54 @@ class AssignmentRepository:
         offset: int = 0,
         limit: int = 200,
         status: str | None = None,
+        activity_id: uuid.UUID | None = None,
     ) -> tuple[list[Assignment], int]:
         base = select(Assignment).where(Assignment.resource_id == resource_id)
+        if status is not None:
+            base = base.where(Assignment.status == status)
+        if activity_id is not None:
+            base = base.where(Assignment.activity_id == activity_id)
+
+        count_stmt = select(func.count()).select_from(base.subquery())
+        total = (await self.session.execute(count_stmt)).scalar_one()
+
+        stmt = base.order_by(Assignment.start_at.desc()).offset(offset).limit(limit)
+        result = await self.session.execute(stmt)
+        return list(result.scalars().all()), total
+
+    async def list_for_activity(
+        self,
+        activity_id: uuid.UUID,
+        *,
+        project_id: uuid.UUID,
+        offset: int = 0,
+        limit: int = 500,
+        status: str | None = None,
+    ) -> tuple[list[Assignment], int]:
+        """Every assignment booked against one schedule activity, in one project.
+
+        This is the Gantt direction of the link: given a bar, who is on it.
+
+        ``project_id`` is required, not an optional filter. It is the scope the
+        caller's access was verified against, and it belongs in the WHERE
+        clause: applied to a page after the fact it would hand back short
+        pages, skip rows, and a total describing a set wider than the one
+        returned. An assignment carrying no project is not reachable this way.
+
+        Args:
+            activity_id: The schedule activity the assignments hang off.
+            project_id: Project the caller has already been granted access to.
+            offset: Rows to skip.
+            limit: Maximum rows to return.
+            status: Optional assignment status filter.
+
+        Returns:
+            The page of assignments and the total row count before paging.
+        """
+        base = select(Assignment).where(
+            Assignment.activity_id == activity_id,
+            Assignment.project_id == project_id,
+        )
         if status is not None:
             base = base.where(Assignment.status == status)
 
@@ -471,7 +552,15 @@ class AssignmentRepository:
         stmt = update(Assignment).where(Assignment.id == assignment_id).values(**fields)
         await self.session.execute(stmt)
         await self.session.flush()
-        self.session.expire_all()
+        instance = self.session.identity_map.get(identity_key(Assignment, assignment_id))
+        if instance is None:
+            return
+        computed = [name for name, value in fields.items() if isinstance(value, ClauseElement)]
+        for name, value in fields.items():
+            if name not in computed:
+                set_committed_value(instance, name, value)
+        if computed:
+            self.session.expire(instance, computed)
 
     async def delete(self, assignment_id: uuid.UUID) -> None:
         assignment = await self.get_by_id(assignment_id)
@@ -569,7 +658,15 @@ class ResourceRequestRepository:
         stmt = update(ResourceRequest).where(ResourceRequest.id == req_id).values(**fields)
         await self.session.execute(stmt)
         await self.session.flush()
-        self.session.expire_all()
+        instance = self.session.identity_map.get(identity_key(ResourceRequest, req_id))
+        if instance is None:
+            return
+        computed = [name for name, value in fields.items() if isinstance(value, ClauseElement)]
+        for name, value in fields.items():
+            if name not in computed:
+                set_committed_value(instance, name, value)
+        if computed:
+            self.session.expire(instance, computed)
 
     async def delete(self, req_id: uuid.UUID) -> None:
         req = await self.get_by_id(req_id)
@@ -609,7 +706,15 @@ class ResourceLinkRepository:
         stmt = update(ResourceLink).where(ResourceLink.id == link_id).values(**fields)
         await self.session.execute(stmt)
         await self.session.flush()
-        self.session.expire_all()
+        instance = self.session.identity_map.get(identity_key(ResourceLink, link_id))
+        if instance is None:
+            return
+        computed = [name for name, value in fields.items() if isinstance(value, ClauseElement)]
+        for name, value in fields.items():
+            if name not in computed:
+                set_committed_value(instance, name, value)
+        if computed:
+            self.session.expire(instance, computed)
 
     async def delete(self, link_id: uuid.UUID) -> None:
         link = await self.get_by_id(link_id)

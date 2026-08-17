@@ -12,9 +12,10 @@ import logging
 import uuid
 from datetime import date
 
-from sqlalchemy import func, select, update
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.orm_write import apply_update
 from app.modules.i18n_foundation.models import (
     Country,
     ExchangeRate,
@@ -174,10 +175,7 @@ class ExchangeRateRepository:
             data["metadata_"] = data.pop("metadata")
 
         if data:
-            stmt = update(ExchangeRate).where(ExchangeRate.id == rate_id).values(**data)
-            await self.session.execute(stmt)
-            await self.session.flush()
-            self.session.expire_all()
+            await apply_update(self.session, ExchangeRate, rate_id, **data)
 
         return await self.session.get(ExchangeRate, rate_id)
 
@@ -371,10 +369,7 @@ class WorkCalendarRepository:
             data["metadata_"] = data.pop("metadata")
 
         if data:
-            stmt = update(WorkCalendar).where(WorkCalendar.id == calendar_id).values(**data)
-            await self.session.execute(stmt)
-            await self.session.flush()
-            self.session.expire_all()
+            await apply_update(self.session, WorkCalendar, calendar_id, **data)
 
         return await self.session.get(WorkCalendar, calendar_id)
 
@@ -424,7 +419,11 @@ class TaxConfigRepository:
     ) -> list[TaxConfiguration]:
         """Get all currently active tax configurations for a country.
 
-        Active means effective_to is NULL or effective_to >= today's date.
+        Active means today falls inside the row's effective window: its
+        ``effective_from`` is NULL or already past, AND its ``effective_to`` is
+        NULL or not yet past. A rate announced for a future date is stored
+        ahead of time - it is scheduled, not active, and must not be handed to
+        a caller pricing work today.
 
         Args:
             country_code: Two-letter ISO country code.
@@ -437,6 +436,7 @@ class TaxConfigRepository:
             select(TaxConfiguration)
             .where(
                 TaxConfiguration.country_code == country_code.upper(),
+                (TaxConfiguration.effective_from.is_(None)) | (TaxConfiguration.effective_from <= today),
                 (TaxConfiguration.effective_to.is_(None)) | (TaxConfiguration.effective_to >= today),
             )
             .order_by(TaxConfiguration.tax_name)
@@ -483,9 +483,6 @@ class TaxConfigRepository:
             data["metadata_"] = data.pop("metadata")
 
         if data:
-            stmt = update(TaxConfiguration).where(TaxConfiguration.id == config_id).values(**data)
-            await self.session.execute(stmt)
-            await self.session.flush()
-            self.session.expire_all()
+            await apply_update(self.session, TaxConfiguration, config_id, **data)
 
         return await self.session.get(TaxConfiguration, config_id)

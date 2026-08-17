@@ -7,57 +7,22 @@ import { CustomBranding } from './CustomBranding';
 import { useTranslation } from 'react-i18next';
 import clsx from 'clsx';
 import {
-  LayoutDashboard,
   FolderOpen,
   Table2,
   CalendarDays,
-  Database,
-  Bot,
-  Layers,
   Boxes,
-  Compass,
-  Box,
-  ShieldCheck,
-  FileText,
-  FileBarChart,
-  Package,
   Settings,
   Info,
-  TrendingUp,
-  Phone,
   ChevronDown,
   ChevronRight,
-  Ruler,
   Sparkles,
-  MessageSquare,
   X,
-  FileEdit,
-  Replace,
-  ShieldAlert,
-  ClipboardCheck,
   ClipboardList,
-  PenTool,
-  PencilRuler,
-  ListChecks,
-  Camera,
-  ScanLine,
-  TableProperties,
-  Wallet,
-  HardHat,
   Users,
   HelpCircle,
-  Route,
-  AlertOctagon,
-  CircleDot,
-  FileCheck,
-  Mail,
-  Send,
   History,
-  BrainCircuit,
-  SlidersHorizontal,
   Plus,
   Search,
-  FileSearch,
   Pin,
   PinOff,
   Eye,
@@ -65,38 +30,10 @@ import {
   Pencil,
   Check,
   Github,
-  HardDrive,
-  Mailbox,
-  Link2,
-  // 18-Modules Wave icons
-  Wrench,
-  Timer,
-  Truck,
-  Factory,
-  BookOpen,
-  Globe,
-  FileSignature,
-  Briefcase,
-  Scale,
-  GitBranch,
-  Building2,
-  ShoppingCart,
-  BadgeCheck,
-  Shield,
-  Leaf,
-  BarChart3,
-  LineChart,
-  Radar,
-  ScrollText,
-  Network,
-  CalendarRange,
-  Gauge,
-  Wand2,
-  PackageCheck,
   Loader2,
-  ScanEye,
   type LucideIcon,
 } from 'lucide-react';
+import { navGroups, type NavItem } from './navCatalog';
 import { useAuthStore } from '@/stores/useAuthStore';
 import { useModuleStore } from '@/stores/useModuleStore';
 import { apiGet } from '@/shared/lib/api';
@@ -111,6 +48,7 @@ import { APP_VERSION } from '@/shared/lib/version';
 import { useSidebarBadges } from '@/shared/hooks/useSidebarBadges';
 import { useHiddenModules } from '@/shared/hooks/useHiddenModules';
 import { useIsRTL } from '@/shared/hooks/useIsRTL';
+import { useI18nReady } from '@/shared/lib/useI18nReady';
 import {
   useSidebarCollapseStore,
   SIDEBAR_WIDTH_FULL,
@@ -123,639 +61,13 @@ import {
 } from '@/features/projects/useProjectProfile';
 
 
-interface NavItem {
-  labelKey: string;
-  to: string;
-  icon: LucideIcon;
-  badge?: string;
-  highlight?: boolean;
-  moduleKey?: string;
-  advancedOnly?: boolean; // Hidden in simple mode
-  tourId?: string; // data-tour attribute for onboarding
-  /** Optional "when to use this" one-liner. Surfaced in the row's hover
-   *  tooltip after the label so look-alike modules (the three procurement
-   *  flows, see #280) are easy to tell apart at a glance. `defaultHelp` is
-   *  the English fallback shown until the `helpKey` lands in every locale. */
-  helpKey?: string;
-  defaultHelp?: string;
-  /** Optional role gate — hide the entry unless the JWT role matches.
-   *  Used for admin-only items like the Audit Log (`audit.view`
-   *  permission, MANAGER+ on the backend). */
-  roleGate?: ('admin' | 'manager' | 'editor' | 'viewer')[];
-  /** Hide entirely unless the current JWT role is `admin`. Distinct
-   *  from `roleGate` (which is a multi-role allow-list) — `adminOnly`
-   *  is the simple "developer / internal tool" gate matched to the
-   *  `<AdminOnly>` route wrapper in App.tsx. Used for surfaces like
-   *  the Architecture Map that should never appear in a customer's
-   *  sidebar. */
-  adminOnly?: boolean;
-}
 
-interface NavGroup {
-  id: string;
-  labelKey: string;
-  /** Human English fallback shown until the `labelKey` locale string is
-   *  added (the locale keys for the v6.10.0 group labels are wired in a
-   *  later i18n pass). Passed to i18next as `defaultValue` so the header
-   *  never renders a raw key. */
-  defaultLabel?: string;
-  descriptionKey?: string;
-  /** English fallback for `descriptionKey`, shown as a small note under the
-   *  group header until the locale string is added (mirrors `defaultLabel`).
-   *  Used by the Procurement group to explain which sourcing flow to pick. */
-  defaultDescription?: string;
-  items: NavItem[];
-  defaultOpen: boolean;
-  hideInSimple?: boolean; // Entire group hidden in simple mode
-  /** Render a thin horizontal divider above this group. Used to peel
-   *  reference/setup groups (Regional, Modules, Settings) away from
-   *  the project-work surface above. */
-  separator?: boolean;
-  /** Registry key used to pull dynamic module nav items into this group,
-   *  when it differs from `id`. The render loop calls
-   *  `getModuleNavItems(group.dynamicGroupKey ?? group.id)`. Used by
-   *  `grp_reality`, whose stable internal id is `grp_reality` but whose
-   *  module-injection contract (so `oe_pointcloud`'s manifest can add its
-   *  own row) is the shorter `reality` key documented in the point-cloud
-   *  plan (`docs/strategy/POINTCLOUD_AND_SPATIAL_PLAN.md`, section 4). */
-  dynamicGroupKey?: string;
-}
+/** An admin-grid tile. Extends NavItem with an optional `onClick`: when set,
+ *  the tile runs that action in place instead of navigating to `to`. Used for
+ *  the "Edit menu" tile, whose `to` is a non-routable sentinel. */
+type AdminGridItem = NavItem & { onClick?: () => void };
 
-// Navigation groups — collapsible thematic sections (v6.10.0 redesign).
-//
-// The flat / oversized menu was regrouped into 19 thematic groups of
-// 3-5 routes each, collapsed by default. Every route the app exposes
-// lands in exactly one group — no route is lost. The group containing
-// the active route auto-expands; per-group open/closed state persists
-// to localStorage (see COLLAPSED_KEY).
-//
-// Source-of-truth audit: every `to` here is cross-checked against
-// `App.tsx` <Route path="…"/> entries — no broken links. Two routes the
-// old flat menu had dropped (`/benchmarks` Cost Benchmarks, and
-// `/collaboration`) are re-surfaced here, along with the module-registry
-// surface that never had a sidebar home because its manifest declared a
-// `tools` group that did not exist (`/sustainability`), now a static row
-// with module-key gating. (`/risk-analysis` was a third such surface but
-// was retired in the Monte Carlo IA merge #71 and now redirects to /risks.)
-//
-// Group ids are deliberately unique and do NOT reuse the old `ai` / `tools`
-// ids that module manifests inject into via `getModuleNavItems(group.id)`.
-// Those manifest items (pipelines, sustainability) are now listed statically
-// instead, so there is no dynamic duplication. The one dynamic group kept
-// verbatim is `regional` (Regional Exchange) — it still pulls its rows from
-// the module registry and keeps its conditional render.
-//
-// Group labels use `t('sidebar.group.<slug>', { defaultValue: '<EN>' })`.
-// The locale keys are added by a later pass; until then the English
-// default renders. Item labelKeys reuse the existing locale strings.
-const navGroups: NavGroup[] = [
-  // ── 1. OVERVIEW (always visible) ───────────────────────────────────
-  // The few entry points every user touches every session.
-  {
-    id: 'grp_overview',
-    labelKey: 'sidebar.group.overview',
-    defaultLabel: 'Overview',
-    defaultOpen: true,
-    items: [
-      { labelKey: 'nav.dashboard', to: '/', icon: LayoutDashboard },
-      { labelKey: 'projects.title', to: '/projects', icon: FolderOpen, tourId: 'projects' },
-      // Cases (playbooks) - guided, cross-module worked examples. Sits in
-      // Overview so the "learn by example" entry is discoverable from the top,
-      // and above Project files so the "learn by example" entry is seen first.
-      { labelKey: 'nav.cases', to: '/cases', icon: Route },
-      { labelKey: 'nav.project_files', to: '/files', icon: HardDrive },
-    ],
-  },
-  // ── 2. TAKEOFF ─────────────────────────────────────────────────────
-  // Quantity extraction across every source: 2D drawings (quantities, PDF
-  // measurements, DWG takeoff) and the 3D BIM model (BIM 3D Takeoff). Comes
-  // before Estimating - you measure quantities first, then price them. The
-  // pure spatial surfaces (geo, point cloud, CAD-BIM explorer) stay in the
-  // "Reality Capture & 3D" group below.
-  {
-    id: 'grp_takeoff',
-    labelKey: 'sidebar.group.takeoff',
-    defaultLabel: 'Takeoff',
-    defaultOpen: true,
-    items: [
-      { labelKey: 'nav.pdf_measurements', to: '/takeoff?tab=measurements', icon: Ruler },
-      { labelKey: 'nav.dwg_takeoff', to: '/dwg-takeoff', icon: PencilRuler },
-      { labelKey: 'nav.bim_viewer', to: '/bim', icon: Box },
-      { labelKey: 'nav.quantities', to: '/quantities', icon: Ruler },
-    ],
-  },
-  // ── 3. ESTIMATING ──────────────────────────────────────────────────
-  // The project's cost work-product: BOQ, the BIM↔catalogue match, the
-  // AI estimate and the estimation intelligence dashboard.
-  {
-    id: 'grp_estimating',
-    labelKey: 'sidebar.group.estimating',
-    defaultLabel: 'Estimating',
-    defaultOpen: true,
-    items: [
-      { labelKey: 'boq.title', to: '/boq', icon: Table2, tourId: 'boq' },
-      { labelKey: 'nav.match_elements', to: '/match-elements', icon: Link2, badge: 'BETA' },
-      { labelKey: 'nav.estimation_dashboard', to: '/project-intelligence', icon: BrainCircuit },
-      { labelKey: 'nav.rom_estimate', to: '/rom-estimate', icon: Gauge },
-      { labelKey: 'nav.methodologies', to: '/methodologies', icon: SlidersHorizontal },
-    ],
-  },
-  // ── 3b. ESTIMATE DETAIL ────────────────────────────────────────────
-  // The advanced refinements layered on top of the BOQ: the basis of
-  // estimate, preliminaries and allowances. Split out of Estimating so
-  // that group stays at five rows (all advanced-mode only).
-  {
-    id: 'grp_estimate_detail',
-    labelKey: 'sidebar.group.estimate_detail',
-    defaultLabel: 'Estimate Detail',
-    defaultOpen: true,
-    hideInSimple: true,
-    items: [
-      { labelKey: 'nav.estimate_basis', to: '/estimate-basis', icon: FileText, advancedOnly: true },
-      { labelKey: 'nav.preliminaries', to: '/preliminaries', icon: ClipboardList, advancedOnly: true },
-      { labelKey: 'nav.allowances', to: '/allowances', icon: Wallet, advancedOnly: true },
-      { labelKey: 'nav.design_options', to: '/design-options', icon: Scale, advancedOnly: true },
-    ],
-  },
-  // ── 4. COST DATA ───────────────────────────────────────────────────
-  // Cross-project reference data: cost databases, catalogues, assemblies,
-  // and the cost-benchmark surface (re-added - it was dropped before).
-  {
-    id: 'grp_cost_data',
-    labelKey: 'sidebar.group.cost_data',
-    defaultLabel: 'Cost Data',
-    defaultOpen: true,
-    items: [
-      { labelKey: 'costs.title', to: '/costs', icon: Database, tourId: 'costs' },
-      { labelKey: 'catalog.title', to: '/catalog', icon: Boxes },
-      { labelKey: 'nav.cost_explorer', to: '/cost-explorer', icon: Compass },
-      { labelKey: 'nav.assemblies', to: '/assemblies', icon: Layers },
-      { labelKey: 'nav.benchmarks', to: '/benchmarks', icon: BarChart3, moduleKey: 'cost-benchmark', advancedOnly: true },
-    ],
-  },
-  // ── 5. REALITY CAPTURE & 3D ─────────────────────────────────────────
-  // The 3D / spatial cluster: the geo overlay (site/spatial context),
-  // point-cloud reality capture (laser scan / photogrammetry / LiDAR) and
-  // the CAD-BIM data explorer. The BIM 3D model viewer moved up to Takeoff
-  // (it is a quantity-extraction surface). This is the founder-requested
-  // dedicated home for spatial surfaces (point-cloud plan
-  // `docs/strategy/POINTCLOUD_AND_SPATIAL_PLAN.md`, section 4); it
-  // supersedes the earlier "no separate sidebar section" note for this
-  // spatial context only. `oe_pointcloud`'s frontend manifest injects its
-  // own rows here via `getModuleNavItems('reality')` (the group's
-  // `dynamicGroupKey`).
-  {
-    id: 'grp_reality',
-    labelKey: 'sidebar.group.reality',
-    defaultLabel: 'Reality Capture & 3D',
-    dynamicGroupKey: 'reality',
-    defaultOpen: true,
-    items: [
-      { labelKey: 'sidebar.geo_hub', to: '/geo', icon: Globe, badge: 'BETA' },
-      { labelKey: 'nav.point_cloud', to: '/pointcloud', icon: ScanLine, badge: 'BETA' },
-      { labelKey: 'nav.cad_bim_explorer', to: '/data-explorer', icon: TableProperties, advancedOnly: true },
-    ],
-  },
-  // ── 6. MODEL COORDINATION ──────────────────────────────────────────
-  // Multi-model BIM/CAD coordination: clash, federations, rule packs,
-  // EIR matrix. Distinct from Takeoff so quantity-only users skip it.
-  {
-    id: 'grp_coordination',
-    labelKey: 'sidebar.group.coordination',
-    defaultLabel: 'Model Coordination',
-    defaultOpen: true,
-    hideInSimple: true,
-    items: [
-      { labelKey: 'nav.coordination_hub', to: '/coordination', icon: LayoutDashboard, badge: 'BETA' },
-      { labelKey: 'nav.model_review', to: '/model-review', icon: ScanEye, badge: 'BETA' },
-      { labelKey: 'nav.bim_federations', to: '/bim/federations', icon: Layers },
-      { labelKey: 'nav.clash_detection', to: '/clash', icon: Radar, badge: 'BETA' },
-      { labelKey: 'nav.model_issues', to: '/bcf', icon: MessageSquare, badge: 'BETA' },
-      { labelKey: 'nav.bim_rules', to: '/bim/rules?mode=requirements', icon: SlidersHorizontal },
-      { labelKey: 'nav.eir_matrix', to: '/requirements/matrix', icon: FileCheck, advancedOnly: true, badge: 'BETA' },
-    ],
-  },
-  // ── 7. SCHEDULING ──────────────────────────────────────────────────
-  // The time plan: master schedule, advanced CPM, takt, tasks.
-  {
-    id: 'grp_scheduling',
-    labelKey: 'sidebar.group.scheduling',
-    defaultLabel: 'Scheduling',
-    defaultOpen: true,
-    hideInSimple: true,
-    items: [
-      { labelKey: 'schedule.title', to: '/schedule', icon: CalendarDays, moduleKey: 'schedule' },
-      { labelKey: 'nav.schedule_advanced', to: '/schedule-advanced', icon: LineChart, advancedOnly: true },
-      { labelKey: 'portfolio.title', to: '/portfolio', icon: Network, advancedOnly: true },
-      { labelKey: 'nav.takt', to: '/takt', icon: GitBranch, advancedOnly: true },
-      { labelKey: 'tasks.title', to: '/tasks', icon: ClipboardList },
-    ],
-  },
-  // ── 8. COST CONTROL & RISK ─────────────────────────────────────────
-  // 5D cost model, portfolio capacity/leveling and the risk register. The
-  // register hosts the Monte Carlo simulation in its own tab, so the old
-  // standalone "Risk Analysis" row was retired (IA merge #71) to keep a
-  // single Monte-Carlo entry point; `/risk-analysis` now redirects there.
-  {
-    id: 'grp_cost_control',
-    labelKey: 'sidebar.group.cost_control',
-    defaultLabel: 'Cost Control & Risk',
-    defaultOpen: true,
-    hideInSimple: true,
-    items: [
-      { labelKey: 'nav.5d_cost_model', to: '/5d', icon: TrendingUp, moduleKey: '5d', advancedOnly: true },
-      { labelKey: 'nav.capacity_planning', to: '/portfolio/capacity', icon: CalendarRange, advancedOnly: true },
-      { labelKey: 'nav.resource_leveling', to: '/portfolio/leveling', icon: Scale, advancedOnly: true },
-      { labelKey: 'nav.risk_register', to: '/risks', icon: ShieldAlert, advancedOnly: true },
-      { labelKey: 'nav.cvr', to: '/cvr', icon: Scale, advancedOnly: true },
-    ],
-  },
-  // ── 9. COMMERCIAL ──────────────────────────────────────────────────
-  // CRM lead → contract award → subcontractors. Sourcing (bid, tender,
-  // RFQ) lives in its own Procurement group below (see #280).
-  {
-    id: 'grp_commercial',
-    labelKey: 'sidebar.group.commercial',
-    defaultLabel: 'Commercial',
-    defaultOpen: true,
-    // Visible in Simple mode too. A user reported "there is no contracts
-    // module" because this whole group was hidden outside Advanced mode
-    // (hideInSimple). The group now shows with Contracts always visible;
-    // CRM and Subcontractors stay advanced-only so Simple mode surfaces
-    // just the core commercial entry point without extra clutter.
-    items: [
-      { labelKey: 'nav.crm', to: '/crm', icon: Briefcase, advancedOnly: true },
-      { labelKey: 'nav.contracts', to: '/contracts', icon: FileSignature },
-      { labelKey: 'nav.subcontractors', to: '/subcontractors', icon: HardHat, advancedOnly: true },
-    ],
-  },
-  // ── 10. PROCUREMENT ────────────────────────────────────────────────
-  // The three sourcing flows kept deliberately separate but gathered in
-  // one place, each labelled for when to use it, plus the supplier price
-  // book they all draw from (#280). Order runs lightest to most formal.
-  {
-    id: 'grp_procurement',
-    labelKey: 'sidebar.group.procurement',
-    defaultLabel: 'Procurement',
-    defaultOpen: true,
-    hideInSimple: true,
-    items: [
-      {
-        labelKey: 'procurement.title',
-        to: '/procurement',
-        icon: Package,
-        advancedOnly: true,
-        helpKey: 'sidebar.help.procurement',
-        defaultHelp: 'Quick vendor quotes (RFQ) through to purchase orders.',
-      },
-      {
-        labelKey: 'nav.bid_management',
-        to: '/bid-management',
-        icon: Scale,
-        helpKey: 'sidebar.help.bid_management',
-        defaultHelp:
-          'Formal bidding with bidder invitations, a questions board and bid leveling.',
-      },
-      {
-        labelKey: 'tendering.title',
-        to: '/tendering',
-        icon: FileText,
-        moduleKey: 'tendering',
-        advancedOnly: true,
-        helpKey: 'sidebar.help.tendering',
-        defaultHelp:
-          'Priced from a bill of quantities; writes the winning rates back into the BOQ.',
-      },
-      {
-        labelKey: 'nav.supplier_catalogs',
-        to: '/supplier-catalogs',
-        icon: ShoppingCart,
-        helpKey: 'sidebar.help.supplier_catalogs',
-        defaultHelp: 'Vendor price lists that the quotes and bids draw from.',
-      },
-    ],
-  },
-  // ── 10b. CHANGE ────────────────────────────────────────────────────
-  // The change-management workflow (variations, MoC, change orders) and
-  // the analytics it feeds (change-intelligence, value). Split out of the
-  // old "Procurement & Change" group so procurement reads clean (#280),
-  // then split again from the capture/records surfaces (now "Records &
-  // Capture" below) so neither group carries too many items.
-  {
-    id: 'grp_change',
-    labelKey: 'sidebar.group.change',
-    defaultLabel: 'Change',
-    defaultOpen: true,
-    hideInSimple: true,
-    items: [
-      { labelKey: 'nav.variations', to: '/variations', icon: GitBranch },
-      { labelKey: 'moc.title', to: '/moc', icon: Replace, advancedOnly: true },
-      { labelKey: 'nav.change_orders', to: '/changeorders', icon: FileEdit, advancedOnly: true },
-      { labelKey: 'nav.change_intelligence', to: '/change-intelligence', icon: BrainCircuit, advancedOnly: true },
-      { labelKey: 'nav.value', to: '/value', icon: TrendingUp, advancedOnly: true },
-    ],
-  },
-  // ── 10c. RECORDS & CAPTURE ──────────────────────────────────────────
-  // The surfaces that capture project record (phone log, connectors,
-  // reconciliation, inbound) plus cross-record search. Kept distinct from
-  // "Change" above so each group stays short and scannable.
-  {
-    id: 'grp_records',
-    labelKey: 'sidebar.group.records',
-    defaultLabel: 'Records & Capture',
-    defaultOpen: true,
-    hideInSimple: true,
-    items: [
-      { labelKey: 'nav.phone_log', to: '/phone-log', icon: Phone, advancedOnly: true },
-      { labelKey: 'nav.connectors', to: '/connectors', icon: HardDrive, advancedOnly: true },
-      { labelKey: 'nav.reconciliation', to: '/reconciliation', icon: Link2, advancedOnly: true },
-      {
-        labelKey: 'nav.inbound_capture',
-        to: '/inbound',
-        icon: Mailbox,
-        advancedOnly: true,
-        adminOnly: true,
-      },
-      { labelKey: 'nav.find_records', to: '/find', icon: FileSearch, advancedOnly: true },
-    ],
-  },
-  // ── 11. FIELD OPERATIONS ───────────────────────────────────────────
-  // Day-to-day site: diary, field reports, service tickets, the
-  // subcontractor portal. The /portal/payments route is intentionally
-  // NOT listed here: it is the external, magic-link-authed surface for
-  // subcontractors (no app shell) and is reached only through the link
-  // in their invitation email. Internal staff manage payment
-  // applications via Progress Claims under /contracts.
-  {
-    id: 'grp_field',
-    labelKey: 'sidebar.group.field',
-    defaultLabel: 'Field Operations',
-    defaultOpen: true,
-    hideInSimple: true,
-    items: [
-      { labelKey: 'nav.daily_diary', to: '/daily-diary', icon: BookOpen },
-      { labelKey: 'nav.field_reports', to: '/field-reports', icon: ClipboardList, advancedOnly: true },
-      { labelKey: 'nav.field_time', to: '/field-time', icon: Timer, advancedOnly: true },
-    ],
-  },
-  // ── 11b. ON SITE ───────────────────────────────────────────────────
-  // Site-facing operations: service tickets, site logistics and the
-  // external subcontractor / client portal. The /portal/payments route is
-  // intentionally NOT listed: it is the magic-link-authed surface for
-  // subcontractors (no app shell), reached only via their invitation email.
-  {
-    id: 'grp_site',
-    labelKey: 'sidebar.group.on_site',
-    defaultLabel: 'On Site',
-    defaultOpen: true,
-    hideInSimple: true,
-    items: [
-      { labelKey: 'nav.service', to: '/service', icon: Wrench },
-      { labelKey: 'nav.site_logistics', to: '/site-logistics', icon: Truck },
-      { labelKey: 'nav.portal', to: '/portal', icon: Globe },
-    ],
-  },
-  // ── 12. RESOURCES & ASSETS ─────────────────────────────────────────
-  // Crews, equipment, payroll, the physical asset register.
-  {
-    id: 'grp_resources',
-    labelKey: 'sidebar.group.resources',
-    defaultLabel: 'Resources & Assets',
-    defaultOpen: true,
-    hideInSimple: true,
-    items: [
-      { labelKey: 'nav.equipment', to: '/equipment', icon: Truck },
-      { labelKey: 'nav.resources', to: '/resources', icon: Users },
-      { labelKey: 'nav.payroll', to: '/payroll', icon: Wallet, advancedOnly: true },
-      { labelKey: 'nav.assets', to: '/assets', icon: Package },
-      // Off-site / prefab production sits with resources (it is a production
-      // resource surface). Moved out of Model Coordination while it is being
-      // wired to BOQ/assembly/BIM; see grp_rate_buildup note on the beta cohort.
-      { labelKey: 'nav.prefab', to: '/prefab', icon: Factory, advancedOnly: true },
-    ],
-  },
-  // ── 13. QUALITY ────────────────────────────────────────────────────
-  // Validation, inspections, NCR, punchlist — "the work passes".
-  {
-    id: 'grp_quality',
-    labelKey: 'sidebar.group.quality',
-    defaultLabel: 'Quality',
-    defaultOpen: true,
-    hideInSimple: true,
-    items: [
-      { labelKey: 'nav.issues', to: '/issues', icon: CircleDot },
-      { labelKey: 'validation.title', to: '/validation', icon: ShieldCheck, moduleKey: 'validation' },
-      { labelKey: 'inspections.title', to: '/inspections', icon: ClipboardCheck },
-      { labelKey: 'construction_control.title', to: '/construction-control', icon: ClipboardList },
-      { labelKey: 'ncr.title', to: '/ncr', icon: AlertOctagon },
-      { labelKey: 'nav.punchlist', to: '/punchlist', icon: ListChecks },
-    ],
-  },
-  // ── 13b. HANDOVER & COMMISSIONING ──────────────────────────────────
-  // Finishing the job cleanly: commissioning, close-out and the forms /
-  // checklists that back them. Split out of Quality so each group stays
-  // short and scannable.
-  {
-    id: 'grp_handover',
-    labelKey: 'sidebar.group.handover',
-    defaultLabel: 'Handover & Commissioning',
-    defaultOpen: true,
-    hideInSimple: true,
-    items: [
-      { labelKey: 'nav.commissioning', to: '/commissioning', icon: ClipboardCheck },
-      { labelKey: 'closeout.title', to: '/closeout', icon: PackageCheck },
-      { labelKey: 'nav.forms', to: '/forms', icon: ClipboardList },
-    ],
-  },
-  // ── 14. SAFETY & ESG ───────────────────────────────────────────────
-  // Safety, HSE, QMS plus the ESG surfaces (carbon, sustainability —
-  // the latter re-surfaced from the module registry).
-  {
-    id: 'grp_safety',
-    labelKey: 'sidebar.group.safety',
-    defaultLabel: 'Safety & ESG',
-    defaultOpen: true,
-    hideInSimple: true,
-    items: [
-      { labelKey: 'safety.title', to: '/safety', icon: HardHat },
-      { labelKey: 'nav.hse_advanced', to: '/hse-advanced', icon: Shield, advancedOnly: true },
-      { labelKey: 'nav.qms', to: '/qms', icon: BadgeCheck, advancedOnly: true },
-    ],
-  },
-  // ── 14b. ESG & CARBON ──────────────────────────────────────────────
-  // Environmental, social and governance reporting: embodied and
-  // operational carbon, the sustainability hub and the ESG dashboard.
-  {
-    id: 'grp_esg',
-    labelKey: 'sidebar.group.esg',
-    defaultLabel: 'ESG & Carbon',
-    defaultOpen: true,
-    hideInSimple: true,
-    items: [
-      { labelKey: 'nav.carbon', to: '/carbon', icon: Leaf, advancedOnly: true },
-      { labelKey: 'nav.sustainability', to: '/sustainability', icon: Leaf, moduleKey: 'sustainability', advancedOnly: true },
-      { labelKey: 'nav.esg', to: '/esg', icon: Leaf, advancedOnly: true },
-    ],
-  },
-  // ── 15. COMMUNICATION ──────────────────────────────────────────────
-  // Contacts, meetings, RFIs, correspondence, and the real-time
-  // collaboration surface (re-added — it was dropped before).
-  {
-    id: 'grp_communication',
-    labelKey: 'sidebar.group.communication',
-    defaultLabel: 'Communication',
-    defaultOpen: true,
-    hideInSimple: true,
-    items: [
-      { labelKey: 'contacts.title', to: '/contacts', icon: Users },
-      { labelKey: 'meetings.title', to: '/meetings', icon: CalendarDays },
-      { labelKey: 'rfi.title', to: '/rfi', icon: HelpCircle, advancedOnly: true },
-      { labelKey: 'correspondence.title', to: '/correspondence', icon: Mail, advancedOnly: true },
-      { labelKey: 'nav.collaboration', to: '/collaboration', icon: Users, moduleKey: 'collaboration', advancedOnly: true },
-    ],
-  },
-  // ── 16. DOCUMENTS ──────────────────────────────────────────────────
-  // Outbound paperwork + the CDE binder, project photos, drawing markups.
-  {
-    id: 'grp_documents',
-    labelKey: 'sidebar.group.documents',
-    defaultLabel: 'Documents',
-    defaultOpen: true,
-    hideInSimple: true,
-    items: [
-      { labelKey: 'submittals.title', to: '/submittals', icon: FileCheck, advancedOnly: true },
-      { labelKey: 'transmittals.title', to: '/transmittals', icon: Send, advancedOnly: true },
-      { labelKey: 'cde.title', to: '/cde', icon: Database },
-      { labelKey: 'nav.photos', to: '/photos', icon: Camera },
-      { labelKey: 'nav.markups', to: '/markups', icon: PenTool },
-    ],
-  },
-  // ── 17. REAL ESTATE ────────────────────────────────────────────────
-  // Developer workflows: property dev, accommodation, dashboards, the
-  // two long-lived settings catalogues (house types, doc templates).
-  {
-    id: 'grp_real_estate',
-    labelKey: 'sidebar.group.real_estate',
-    defaultLabel: 'Real Estate',
-    defaultOpen: true,
-    hideInSimple: true,
-    items: [
-      { labelKey: 'nav.property_dev', to: '/property-dev', icon: Building2 },
-      { labelKey: 'nav.accommodation', to: '/accommodation', icon: Building2, badge: 'BETA' },
-      { labelKey: 'nav.property_dev_dashboards', to: '/property-dev/dashboards', icon: BarChart3, advancedOnly: true },
-      { labelKey: 'nav.property_dev_house_types', to: '/property-dev/settings/house-types', icon: Building2, advancedOnly: true },
-      { labelKey: 'nav.property_dev_doc_templates', to: '/property-dev/settings/document-templates', icon: FileText, advancedOnly: true },
-    ],
-  },
-  // ── 18. FINANCE ────────────────────────────────────────────────────
-  // Money roll-up: finance, reports, reporting dashboards.
-  {
-    id: 'grp_finance',
-    labelKey: 'sidebar.group.finance',
-    defaultLabel: 'Finance',
-    defaultOpen: true,
-    hideInSimple: true,
-    items: [
-      { labelKey: 'finance.title', to: '/finance', icon: Wallet, advancedOnly: true },
-      { labelKey: 'nav.analytics', to: '/analytics', icon: LineChart, advancedOnly: true },
-      { labelKey: 'nav.reports', to: '/reports', icon: FileBarChart, advancedOnly: true },
-      { labelKey: 'nav.reporting_dashboards', to: '/reporting', icon: BarChart3, advancedOnly: true },
-    ],
-  },
-  // ── 19. CONTROLS & BI ──────────────────────────────────────────────
-  // Project controls, BI dashboards, the model snapshots (parquet/CAD-BIM
-  // baseline) tool, and the admin-only architecture map.
-  {
-    id: 'grp_controls_bi',
-    labelKey: 'sidebar.group.controls_bi',
-    defaultLabel: 'Controls & BI',
-    defaultOpen: true,
-    hideInSimple: true,
-    items: [
-      { labelKey: 'nav.project_controls', to: '/project-controls', icon: Gauge, advancedOnly: true },
-      { labelKey: 'nav.bi_dashboards', to: '/bi-dashboards', icon: BarChart3, advancedOnly: true },
-      { labelKey: 'nav.snapshots', to: '/dashboards', icon: TrendingUp, advancedOnly: true },
-      // Architecture Map — internal/dev tool, admin-only so a regular
-      // customer's sidebar isn't cluttered with the dependency graph.
-      // The route itself is also wrapped in <AdminOnly> in App.tsx.
-      { labelKey: 'nav.architecture_map', to: '/architecture', icon: GitBranch, advancedOnly: true, adminOnly: true },
-    ],
-  },
-  // ── 19b. RATE BUILD-UP ─────────────────────────────────────────────
-  // The unit-rate build-up cohort: production norms (resource demand per
-  // quantity), all-in labour rates, material waste factors, price escalation,
-  // and the resource statement they feed. Sits right above the AI surfaces
-  // because rate build-up is core estimating work. Still badged beta per item
-  // until each is wired into the position resource split
-  // (`metadata_["resources"]`) / assembly components. Ordered as the build-up
-  // actually flows: norm -> rate -> waste -> escalation -> summary.
-  {
-    id: 'grp_rate_buildup',
-    labelKey: 'sidebar.group.rate_buildup',
-    defaultLabel: 'Rate Build-up',
-    defaultOpen: true,
-    hideInSimple: true,
-    separator: true,
-    items: [
-      { labelKey: 'nav.norm_expansion', to: '/norm-expansion', icon: ListChecks, advancedOnly: true },
-      { labelKey: 'nav.labor_rates', to: '/labor-rates', icon: HardHat, advancedOnly: true },
-      { labelKey: 'nav.waste_factors', to: '/waste-factors', icon: Ruler, advancedOnly: true },
-      { labelKey: 'nav.price_index', to: '/price-index', icon: TrendingUp, advancedOnly: true },
-      { labelKey: 'nav.resource_summary', to: '/resource-summary', icon: Package, advancedOnly: true },
-    ],
-  },
-  // ── 20. AUTOMATION & AI ────────────────────────────────────────────
-  // AI agents, advisor, ERP chat, and the pipeline builder (listed
-  // statically — its manifest group `ai` no longer matches any group id,
-  // so there is no dynamic duplication).
-  {
-    id: 'grp_automation_ai',
-    labelKey: 'sidebar.group.automation_ai',
-    defaultLabel: 'Automation & AI',
-    defaultOpen: true,
-    hideInSimple: true,
-    items: [
-      { labelKey: 'nav.ai_agents', to: '/ai-agents', icon: Bot, badge: 'BETA' },
-      { labelKey: 'nav.ai_advisor', to: '/advisor', icon: MessageSquare },
-      { labelKey: 'nav.erp_chat', to: '/chat', icon: MessageSquare },
-      { labelKey: 'nav.pipelines', to: '/pipelines', icon: GitBranch, moduleKey: 'pipelines', advancedOnly: true, badge: 'BETA' },
-    ],
-  },
-  // ── 20a. AI ESTIMATING (beta, in development) ──────────────────────
-  // AI-assisted drafting: the AI estimate, the AI estimator and the
-  // estimate copilot. They work but are still beta and lean on the core
-  // BOQ, so they sit down here with the other AI surfaces rather than at
-  // the top of Estimating. Collapsed by default to keep them low-key.
-  {
-    id: 'grp_estimating_ai',
-    labelKey: 'sidebar.group.estimating_ai',
-    defaultLabel: 'AI Estimating',
-    defaultOpen: false,
-    hideInSimple: true,
-    items: [
-      { labelKey: 'nav.ai_estimate', to: '/ai-estimate', icon: Sparkles, badge: 'BETA' },
-      { labelKey: 'nav.ai_estimator', to: '/ai-estimator', icon: Wand2, badge: 'BETA' },
-      { labelKey: 'nav.estimate_copilot', to: '/estimate-copilot', icon: Bot, badge: 'BETA' },
-    ],
-  },
-  // ── REGIONAL EXCHANGE (setup-only, dynamic) ────────────────────────
-  // Separator marks the boundary between the project-work groups above
-  // and the reference/setup surfaces below. Rows are injected purely
-  // from the module registry via `getModuleNavItems('regional')`; the
-  // group renders only when at least one regional module is enabled
-  // (conditional render preserved from the previous design).
-  {
-    id: 'regional',
-    labelKey: 'modules.cat_regional',
-    descriptionKey: 'modules.cat_regional_desc',
-    defaultOpen: true,
-    hideInSimple: true,
-    separator: true,
-    items: [
-      // All regional exchange modules injected dynamically from module registry
-    ],
-  },
-];
+
 
 // Admin / setup surfaces — rendered as a 2-column button grid pinned
 // at the bottom of the sidebar (below the scroll area, above the
@@ -771,22 +83,19 @@ const navGroups: NavGroup[] = [
 // a single Governance tile sits right after Modules in the flow.
 // Integrations is intentionally absent: it lives under Settings →
 // Integrations, so a tile would duplicate it.
+// Modules (/modules) and Governance (/governance) intentionally no longer
+// appear as their own sidebar tiles - they are reached from inside Settings
+// (Settings -> Modules / Governance links), which declutters the left menu.
+// Their routes stay live, so any deep link or the Settings entries still work.
+// Audit Log used to sit here as a role-gated tile. It moved into Settings
+// (Settings -> Audit log, Manager+ only) so the admin grid stays short and
+// the security surfaces live together under Settings. Its route
+// (`/admin/audit-log`) stays live for deep links. The slot it vacated now
+// holds the "Edit menu" action tile (see `editMenuGridItem` below), which
+// opens the sidebar customiser in place.
 const adminGridItems: NavItem[] = [
   { labelKey: 'sidebar.admin_grid.settings', to: '/settings', icon: Settings },
   { labelKey: 'sidebar.admin_grid.users', to: '/users', icon: Users },
-  { labelKey: 'sidebar.admin_grid.modules', to: '/modules', icon: Package },
-  {
-    labelKey: 'sidebar.admin_grid.governance',
-    to: '/governance',
-    icon: Scale,
-    roleGate: ['admin', 'manager'],
-  },
-  {
-    labelKey: 'sidebar.admin_grid.audit',
-    to: '/admin/audit-log',
-    icon: ScrollText,
-    roleGate: ['admin', 'manager'],
-  },
   { labelKey: 'sidebar.admin_grid.about', to: '/about', icon: Info },
 ];
 
@@ -865,6 +174,12 @@ const ROUTE_BACKEND_MODULE: Record<string, string> = {
   // Commercial
   '/crm': 'oe_crm',
   '/contracts': 'oe_contracts',
+  '/payment-clock': 'oe_payment_clock',
+  '/tax-withholding': 'oe_tax_withholding',
+  '/einvoice-clearance': 'oe_einvoice_clearance',
+  '/cost-match': 'oe_cost_match',
+  '/full-evm': 'oe_full_evm',
+  '/fx': 'oe_fx',
   '/subcontractors': 'oe_subcontractors',
   '/bid-management': 'oe_bid_management',
   '/tendering': 'oe_tendering',
@@ -872,6 +187,7 @@ const ROUTE_BACKEND_MODULE: Record<string, string> = {
   '/moc': 'oe_moc',
   '/supplier-catalogs': 'oe_supplier_catalogs',
   '/design-options': 'oe_design_options',
+  '/formwork': 'oe_formwork',
   // Real estate development
   '/property-dev': 'oe_property_dev',
   '/accommodation': 'oe_accommodation',
@@ -911,6 +227,7 @@ const ROUTE_BACKEND_MODULE: Record<string, string> = {
   '/submittals': 'oe_submittals',
   '/transmittals': 'oe_transmittals',
   '/correspondence': 'oe_correspondence',
+  '/inbound-email': 'oe_inbound_email',
   '/collaboration': 'oe_collaboration',
   // Documentation
   '/cde': 'oe_cde',
@@ -932,6 +249,19 @@ const ROUTE_BACKEND_MODULE: Record<string, string> = {
   '/commissioning': 'oe_commissioning',
   '/esg': 'oe_esg',
   '/forms': 'oe_forms',
+  // Delivery-lifecycle registers (v11.11 backend, surfaced in this wave).
+  '/site-prep': 'oe_site_prep',
+  '/site-inventory': 'oe_site_inventory',
+  '/temporary-works': 'oe_temporary_works',
+  '/interface-management': 'oe_interface_management',
+  '/defects-liability': 'oe_defects_liability',
+  // International delivery / authority modules (frontends added this wave).
+  '/authority-submissions': 'oe_authority_submission',
+  '/review-authority': 'oe_review_authority',
+  '/signing': 'oe_signing',
+  '/source-data': 'oe_source_data',
+  '/project-route': 'oe_project_route',
+  '/site-supervision': 'oe_site_supervision',
 };
 
 // localStorage key for collapsed state
@@ -1078,9 +408,19 @@ function pickActiveRoute(
 
 export function Sidebar({ onClose }: { onClose?: () => void }) {
   const { t } = useTranslation();
+  // The sidebar mounts at app boot, outside any Suspense boundary, exactly
+  // like the Header. Under StrictMode's double-mount, `useTranslation`'s own
+  // store subscription can be churned away and miss the bundle-added event
+  // when a lazy locale chunk lands, freezing the nav on the English fallback.
+  // This external-store subscription survives the remount and forces a
+  // re-render whenever a bundle is merged; the returned value is unused.
+  useI18nReady();
   const navigate = useNavigate();
   const location = useLocation();
   const { isModuleEnabled } = useModuleStore();
+  // Subscribed separately so the module-count summary at the foot of the nav
+  // recomputes whenever a module is switched on or off.
+  const enabledModules = useModuleStore((s) => s.enabledModules);
   // Hidden whole-sections (nav groups) the user has switched off via the
   // "Edit menu". Persisted in useModuleStore alongside module state; here we
   // read the list and the bulk setter the Save action commits to.
@@ -1132,8 +472,11 @@ export function Sidebar({ onClose }: { onClose?: () => void }) {
   // Role-gate the admin grid. Items without a `roleGate` always show;
   // gated items only render when the current JWT role matches. The
   // backend `RequirePermission` decorator still enforces real access —
-  // this is just to keep the sidebar tidy for non-admin users.
-  const visibleAdminGridItems = adminGridItems.filter(
+  // this is just to keep the sidebar tidy for non-admin users. The
+  // hidden-state filter is applied further down (once `editMode` and
+  // `hiddenModules` are in scope) so these bottom tiles can be hidden and
+  // restored through the same Edit menu gesture as the nav rows.
+  const roleVisibleAdminGridItems = adminGridItems.filter(
     (item) => !item.roleGate || (userRole && (item.roleGate as string[]).includes(userRole)),
   );
 
@@ -1231,6 +574,89 @@ export function Sidebar({ onClose }: { onClose?: () => void }) {
   // and every row) drops out entirely; in edit mode this is empty so the
   // group still renders — dimmed — and the user can switch it back on.
   const effectiveHiddenGroups = editMode ? [] : hiddenGroups;
+
+  // Bottom admin/setup tiles (Settings, Users, Modules, Governance, Audit,
+  // About). In edit mode we render every role-visible tile so hidden ones
+  // can be toggled back on; in normal mode the ones the user hid drop out.
+  // They share the same `hiddenModules` route list as the nav rows, so a
+  // hidden tile counts toward the "{N} hidden" badge and the single
+  // Save/Cancel gesture covers rows, sections and these tiles together.
+  const visibleAdminGridItems = editMode
+    ? roleVisibleAdminGridItems
+    : roleVisibleAdminGridItems.filter((item) => !hiddenModules.includes(item.to));
+
+  // "Edit menu" action tile — fills the slot the Audit Log tile vacated when
+  // it moved into Settings. Clicking it opens the sidebar customiser in place
+  // (the same edit gesture whose Save / Cancel controls appear below the nav
+  // list). It is an action, not a route, so it carries `onClick` and a
+  // non-routable `to` sentinel, and it is dropped in edit mode (you are
+  // already editing). Slotted just before the About tile so the grid reads
+  // Settings · Users · Edit menu · About.
+  const editMenuGridItem: AdminGridItem = {
+    labelKey: 'sidebar.edit_menu',
+    to: '__edit_menu__',
+    icon: Pencil,
+    onClick: enterEditMode,
+  };
+  const adminGridWithEdit: AdminGridItem[] = useMemo(() => {
+    if (editMode) return visibleAdminGridItems;
+    const aboutIdx = visibleAdminGridItems.findIndex((item) => item.to === '/about');
+    if (aboutIdx === -1) return [...visibleAdminGridItems, editMenuGridItem];
+    return [
+      ...visibleAdminGridItems.slice(0, aboutIdx),
+      editMenuGridItem,
+      ...visibleAdminGridItems.slice(aboutIdx),
+    ];
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [editMode, visibleAdminGridItems, enterEditMode]);
+
+  // Module counter shown at the foot of the nav (before the "Add module"
+  // tile): how many module rows are visible in the menu right now versus how
+  // many the platform offers this user. "Total" counts every leaf menu row
+  // (static + dynamically registered module rows) the user is allowed to see
+  // (admin-only dev surfaces excluded for non-admins), regardless of whether
+  // it is currently switched on or hidden. "Shown" applies the same normal-mode
+  // visibility filter the nav render uses, so the pair updates live as modules
+  // are enabled/disabled or hidden/shown via Edit menu. It intentionally
+  // mirrors the predicate in the `navGroups.map` below; keep the two in step.
+  const moduleCounts = useMemo(() => {
+    let total = 0;
+    let shown = 0;
+    for (const group of navGroups) {
+      const groupHidden = hiddenGroups.includes(group.id);
+      const groupHiddenInSimple = Boolean(group.hideInSimple) && !isAdvanced;
+      const dynamicItems = getModuleNavItems(group.dynamicGroupKey ?? group.id).map((mi) => ({
+        to: mi.to,
+        moduleKey: mi.to.slice(1),
+        advancedOnly: mi.advancedOnly,
+        adminOnly: false,
+      }));
+      const staticItems = group.items.map((it) => ({
+        to: it.to,
+        moduleKey: it.moduleKey,
+        advancedOnly: it.advancedOnly,
+        adminOnly: it.adminOnly,
+      }));
+      for (const item of [...staticItems, ...dynamicItems]) {
+        // Admin-only rows are internal/dev surfaces, not product modules, so
+        // they do not count toward the platform total for a regular user.
+        if (item.adminOnly && userRole !== 'admin') continue;
+        total += 1;
+        const visible =
+          !groupHidden &&
+          !groupHiddenInSimple &&
+          (!item.moduleKey || isModuleEnabled(item.moduleKey)) &&
+          (!item.advancedOnly || isAdvanced) &&
+          !isRouteBackendDisabled(item.to) &&
+          !hiddenModules.includes(item.to);
+        if (visible) shown += 1;
+      }
+    }
+    return { total, shown };
+    // `enabledModules` is a dep so the count reacts to enable/disable; it feeds
+    // `isModuleEnabled` even though that function reference is stable.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isAdvanced, userRole, hiddenModules, hiddenGroups, enabledModules, isRouteBackendDisabled]);
 
   // Custom-module request dialog — opens from the "Request a custom
   // module" CTA at the bottom of the nav (below the "+ Add module"
@@ -1596,7 +1022,7 @@ export function Sidebar({ onClose }: { onClose?: () => void }) {
                 >
                   <SidebarItem
                     item={item}
-                    label={t(item.labelKey)}
+                    label={t(item.labelKey, { defaultValue: item.defaultLabel })}
                     onClick={onClose}
                     badge={badgeMap[item.to]}
                     isPinned={true}
@@ -1742,7 +1168,7 @@ export function Sidebar({ onClose }: { onClose?: () => void }) {
                     >
                       <SidebarItem
                         item={item}
-                        label={t(item.labelKey)}
+                        label={t(item.labelKey, { defaultValue: item.defaultLabel })}
                         onClick={onClose}
                         badge={badgeMap[item.to]}
                         seq={seq}
@@ -1763,68 +1189,116 @@ export function Sidebar({ onClose }: { onClose?: () => void }) {
             </Fragment>
           );
         })}
-        {/* Menu editor controls — sit just above the add-module tiles so
-             users see them after scanning their actual menu. Iconified
-             mode hides this row entirely (no room for text and the
-             editor is mouse-driven on the visible labels anyway). In
-             normal mode: a small "Edit menu" ghost button + a "{N}
-             hidden" badge when applicable. In edit mode the buttons
-             flip to Save / Cancel. */}
-        {!iconified && (
+        {/* Menu editor controls — sit just above the add-module tiles.
+             Iconified mode hides this row entirely (no room for text and the
+             editor is mouse-driven on the visible labels anyway). The "Edit
+             menu" entry point now lives in the admin grid tile below, so in
+             normal mode this row only surfaces a "{N} hidden — show" restore
+             chip when the user has hidden something; otherwise it renders
+             nothing. In edit mode the row holds the Save / Cancel controls. */}
+        {/* Normal-mode restore chip: a single "{N} hidden — show" control that
+             reopens the editor so hidden items can be switched back on. The
+             Save / Cancel controls for edit mode are NOT here - they live in a
+             pinned bar directly beneath the "Edit menu" tile below (see the
+             admin grid), so the user always finds them without scrolling to
+             the end of the module list. */}
+        {!iconified && !editMode && hiddenModules.length + hiddenGroups.length > 0 && (
           <div className="pt-3 pb-1 px-3">
-            {editMode ? (
-              <div className="flex items-center gap-1.5 w-full">
-                <button
-                  type="button"
-                  onClick={saveEditMode}
-                  className="flex-1 flex items-center justify-center gap-1 rounded-lg border border-oe-blue/30 bg-oe-blue/10 px-2.5 py-2 text-xs font-medium text-oe-blue hover:bg-oe-blue/15 transition-colors"
-                >
-                  <Check size={12} strokeWidth={2.25} />
-                  <span>{t('sidebar.save', { defaultValue: 'Save' })}</span>
-                </button>
-                <button
-                  type="button"
-                  onClick={cancelEditMode}
-                  className="flex-1 flex items-center justify-center gap-1 rounded-lg border border-border-light bg-surface-secondary/60 px-2.5 py-2 text-xs font-medium text-content-secondary hover:bg-surface-secondary hover:text-content-primary transition-colors"
-                >
-                  <X size={12} strokeWidth={2.25} />
-                  <span>{t('sidebar.cancel', { defaultValue: 'Cancel' })}</span>
-                </button>
-                {editingHidden.length + editingHiddenGroups.length > 0 && (
-                  <span className="shrink-0 text-2xs text-content-tertiary tabular-nums">
-                    {t('sidebar.hidden_count', {
-                      defaultValue: '{{count}} hidden',
-                      count: editingHidden.length + editingHiddenGroups.length,
-                    })}
-                  </span>
-                )}
-              </div>
-            ) : (
-              <div className="flex items-center gap-1.5 w-full">
-                <button
-                  type="button"
-                  onClick={enterEditMode}
-                  className="flex-1 flex items-center justify-center gap-1.5 rounded-lg border border-dashed border-border-light bg-surface-secondary/30 px-2.5 py-2 text-xs font-medium text-content-secondary hover:border-content-tertiary hover:bg-surface-secondary hover:text-content-primary transition-colors"
-                  title={t('sidebar.edit_menu_hint', {
-                    defaultValue: "Hide items you don't use",
-                  })}
-                >
-                  <Pencil size={12} strokeWidth={2} />
-                  <span>{t('sidebar.edit_menu', { defaultValue: 'Edit menu' })}</span>
-                </button>
-                {hiddenModules.length + hiddenGroups.length > 0 && (
-                  <span
-                    className="shrink-0 rounded-full bg-surface-tertiary/70 px-1.5 py-px text-[10px] font-medium text-content-tertiary tabular-nums"
-                    title={t('sidebar.show_hidden', { defaultValue: 'Show hidden' })}
-                  >
-                    {t('sidebar.hidden_count', {
-                      defaultValue: '{{count}} hidden',
-                      count: hiddenModules.length + hiddenGroups.length,
-                    })}
-                  </span>
-                )}
-              </div>
+            <button
+              type="button"
+              onClick={enterEditMode}
+              className="flex w-full items-center justify-center gap-1.5 rounded-lg border border-dashed border-border-light bg-surface-secondary/30 px-2.5 py-1.5 text-[11px] font-medium text-content-secondary hover:border-content-tertiary hover:bg-surface-secondary hover:text-content-primary transition-colors"
+              title={t('sidebar.show_hidden', { defaultValue: 'Show hidden' })}
+            >
+              <Eye size={12} strokeWidth={2} />
+              <span>
+                {t('sidebar.hidden_count', {
+                  defaultValue: '{{count}} hidden',
+                  count: hiddenModules.length + hiddenGroups.length,
+                })}
+              </span>
+            </button>
+          </div>
+        )}
+        {/* Module counter — a small live "{shown} of {total} modules" chip
+             right before the Add-module tile, so a user can see at a glance
+             how many modules are open in this menu and how many the platform
+             offers in total. Updates automatically as modules are enabled /
+             disabled or hidden / shown. Iconified mode shows a compact
+             "shown/total" so the number is never lost. */}
+        <div className={clsx('pt-2 pb-0.5', iconified ? 'px-1' : 'px-3')}>
+          <div
+            className={clsx(
+              'flex items-center justify-center rounded-lg bg-surface-secondary/40 text-content-secondary',
+              iconified ? 'px-1 py-1 gap-0.5' : 'gap-1.5 px-2.5 py-1.5',
             )}
+            title={t('sidebar.module_count_title', {
+              defaultValue: '{{shown}} of {{total}} modules are shown in this menu',
+              shown: moduleCounts.shown,
+              total: moduleCounts.total,
+            })}
+          >
+            <Boxes
+              size={iconified ? 13 : 12}
+              strokeWidth={2}
+              className="shrink-0 text-content-tertiary"
+              aria-hidden
+            />
+            {iconified ? (
+              <span className="text-[9px] font-semibold tabular-nums leading-none text-content-secondary">
+                {moduleCounts.shown}/{moduleCounts.total}
+              </span>
+            ) : (
+              <span className="text-[11px] font-medium tabular-nums">
+                <span className="font-semibold text-content-primary">{moduleCounts.shown}</span>
+                <span className="text-content-tertiary"> / {moduleCounts.total} </span>
+                {t('sidebar.module_count_label', { defaultValue: 'modules' })}
+              </span>
+            )}
+            {/* Manage-modules shortcut — a small gear button immediately to the
+                 right of the "{shown} / {total} modules" count that jumps to the
+                 Modules settings page, where modules can be switched on / off.
+                 Hidden in iconified mode where horizontal room is tight. */}
+            {!iconified && (
+              <NavLink
+                to="/modules"
+                onClick={onClose}
+                title={t('sidebar.manage_modules', { defaultValue: 'Manage modules' })}
+                aria-label={t('sidebar.manage_modules', { defaultValue: 'Manage modules' })}
+                className="ml-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-md text-content-tertiary hover:bg-surface-secondary hover:text-content-primary transition-colors"
+              >
+                <Settings size={12} strokeWidth={2} aria-hidden />
+              </NavLink>
+            )}
+          </div>
+        </div>
+        {/* Edit-menu shortcut — deliberately the same action as the "Edit menu"
+             tile in the admin grid further down, repeated here directly under
+             the module count. That grid sits below the entire nav list, so on a
+             long menu it is off screen at exactly the moment a user has just
+             scrolled past thirty rows and concluded there are too many. Both
+             entry points call `enterEditMode`, so whichever one is found first
+             behaves identically. Dropped in edit mode, where the Save / Cancel
+             bar has already taken over. */}
+        {!editMode && (
+          <div className={clsx('pt-1.5 pb-0.5', iconified ? 'px-1 flex justify-center' : 'px-3')}>
+            <button
+              type="button"
+              onClick={enterEditMode}
+              title={t('sidebar.edit_menu', { defaultValue: 'Edit menu' })}
+              aria-label={iconified ? t('sidebar.edit_menu', { defaultValue: 'Edit menu' }) : undefined}
+              className={clsx(
+                'flex items-center rounded-lg border border-border-light bg-surface-secondary/30 text-content-secondary hover:border-content-tertiary hover:bg-surface-secondary hover:text-content-primary transition-colors',
+                iconified ? 'h-7 w-7 justify-center' : 'w-full justify-center gap-1.5 px-2.5 py-1.5',
+              )}
+            >
+              <Pencil size={12} strokeWidth={2} aria-hidden />
+              {!iconified && (
+                <span className="text-[11px] font-medium">
+                  {t('sidebar.edit_menu', { defaultValue: 'Edit menu' })}
+                </span>
+              )}
+            </button>
           </div>
         )}
         {/* Add-a-module CTA — dashed-border tile with a plus icon. Sits at
@@ -1929,11 +1403,48 @@ export function Sidebar({ onClose }: { onClose?: () => void }) {
           )}
         />
         <AdminGrid
-          items={visibleAdminGridItems}
+          items={adminGridWithEdit}
           activeRoute={activeRoute}
           iconified={iconified}
           onNavigate={onClose}
+          editMode={editMode}
+          hiddenSet={editingHidden}
+          onToggleHidden={toggleItemHidden}
         />
+
+        {/* Menu-editor action bar - pinned directly beneath the "Edit menu"
+            tile so Save / Cancel stay in view the whole time the user is
+            editing, instead of being buried at the end of the scrolling
+            module list where they were easy to miss. Expanded sidebar only;
+            iconified mode has no room and the editor needs the labels. */}
+        {!iconified && editMode && (
+          <div className="mt-2.5 flex items-center gap-1.5">
+            <button
+              type="button"
+              onClick={saveEditMode}
+              className="flex-1 flex items-center justify-center gap-1 rounded-lg border border-oe-blue/30 bg-oe-blue/10 px-2.5 py-2 text-xs font-medium text-oe-blue hover:bg-oe-blue/15 transition-colors"
+            >
+              <Check size={12} strokeWidth={2.25} />
+              <span>{t('sidebar.save', { defaultValue: 'Save' })}</span>
+            </button>
+            <button
+              type="button"
+              onClick={cancelEditMode}
+              className="flex-1 flex items-center justify-center gap-1 rounded-lg border border-border-light bg-surface-secondary/60 px-2.5 py-2 text-xs font-medium text-content-secondary hover:bg-surface-secondary hover:text-content-primary transition-colors"
+            >
+              <X size={12} strokeWidth={2.25} />
+              <span>{t('sidebar.cancel', { defaultValue: 'Cancel' })}</span>
+            </button>
+            {editingHidden.length + editingHiddenGroups.length > 0 && (
+              <span className="shrink-0 text-2xs text-content-tertiary tabular-nums">
+                {t('sidebar.hidden_count', {
+                  defaultValue: '{{count}} hidden',
+                  count: editingHidden.length + editingHiddenGroups.length,
+                })}
+              </span>
+            )}
+          </div>
+        )}
 
         {/* Update notification — compact clickable card in the sidebar; the
             whole card opens a full-screen modal with highlights + install
@@ -2382,12 +1893,11 @@ function SidebarItem({
         ) : (
           <Icon size={compact ? 14 : 16} strokeWidth={isActive ? 2 : 1.75} className="shrink-0" />
         )}
-        {/* Hover-tooltip via title falls back to the full label even when
-            CSS truncates with an ellipsis. The visible width is now
-            264px (was 232) so most labels render in full at default
-            zoom; this is the safety net for narrow sidebars / dense
-            translations / large-text accessibility settings. */}
-        <span className="truncate" title={label}>
+        {/* German compound words (Leistungsverzeichnisse, Element-Abnahme)
+            overflow a single 264px line, so labels may wrap onto a second
+            line instead of clipping mid-word. The title tooltip stays as
+            the safety net for labels that exceed even two lines. */}
+        <span className="min-w-0 line-clamp-2 break-words leading-snug" title={label}>
           {label}
         </span>
         {/* Right-edge cluster — kbd hint first, badges last, so the
@@ -2523,11 +2033,24 @@ function AdminGrid({
   activeRoute,
   iconified,
   onNavigate,
+  editMode,
+  hiddenSet,
+  onToggleHidden,
 }: {
-  items: NavItem[];
+  /** Admin-grid tiles. Most are plain routes (`to`); a tile may instead
+   *  carry an `onClick` to run an in-place action (e.g. the "Edit menu"
+   *  tile that opens the sidebar customiser) rather than navigate. */
+  items: AdminGridItem[];
   activeRoute?: string | null;
   iconified?: boolean;
   onNavigate?: () => void;
+  /** When true, each tile becomes a hide/show target: clicking it toggles
+   *  the tile's hidden state instead of navigating, it dims while hidden,
+   *  and an Eye / EyeOff indicator shows its state. Mirrors the per-row
+   *  editor on the nav list so the whole menu curates in one gesture. */
+  editMode?: boolean;
+  hiddenSet?: string[];
+  onToggleHidden?: (route: string) => void;
 }) {
   const { t } = useTranslation();
   const navigate = useNavigate();
@@ -2540,7 +2063,30 @@ function AdminGrid({
         {items.map((item) => {
           const Icon = item.icon;
           const isActive = activeRoute === item.to;
-          const label = t(item.labelKey);
+          const label = t(item.labelKey, { defaultValue: item.defaultLabel });
+          const tileClass = clsx(
+            'relative flex h-9 w-9 items-center justify-center rounded-md transition-colors duration-fast ease-oe',
+            isActive
+              ? 'bg-oe-blue/[0.14] text-oe-blue shadow-[inset_0_0_0_1px_rgba(0,122,255,0.18)] dark:bg-oe-blue/25'
+              : 'text-content-secondary hover:bg-surface-secondary hover:text-content-primary',
+          );
+          // Action tiles (e.g. "Edit menu") run in place — render a button so
+          // they never navigate and don't close the drawer.
+          if (item.onClick) {
+            return (
+              <li key={item.to}>
+                <button
+                  type="button"
+                  onClick={item.onClick}
+                  title={label}
+                  aria-label={label}
+                  className={tileClass}
+                >
+                  <Icon size={16} strokeWidth={1.75} aria-hidden />
+                </button>
+              </li>
+            );
+          }
           return (
             <li key={item.to}>
               <NavLink
@@ -2548,14 +2094,7 @@ function AdminGrid({
                 onClick={onNavigate}
                 title={label}
                 aria-label={label}
-                className={() =>
-                  clsx(
-                    'relative flex h-9 w-9 items-center justify-center rounded-md transition-colors duration-fast ease-oe',
-                    isActive
-                      ? 'bg-oe-blue/[0.14] text-oe-blue shadow-[inset_0_0_0_1px_rgba(0,122,255,0.18)] dark:bg-oe-blue/25'
-                      : 'text-content-secondary hover:bg-surface-secondary hover:text-content-primary',
-                  )
-                }
+                className={() => tileClass}
               >
                 <Icon size={16} strokeWidth={isActive ? 2 : 1.75} aria-hidden />
               </NavLink>
@@ -2569,36 +2108,66 @@ function AdminGrid({
   // Expanded mode: 2×N grid. Each tile is a real <button> so keyboard
   // focus + Enter activation Just Work; we navigate imperatively so the
   // button retains semantics (NavLink renders as <a>, which would
-  // confuse screen readers that expect a button grid).
+  // confuse screen readers that expect a button grid). In edit mode the
+  // tile stops navigating and instead toggles its own hidden state, dims
+  // while hidden and shows an Eye / EyeOff indicator — the bottom-cluster
+  // twin of the per-row editor above.
   return (
     <ul className="grid grid-cols-2 gap-1">
       {items.map((item) => {
         const Icon = item.icon;
         const isActive = activeRoute === item.to;
-        const label = t(item.labelKey);
+        const label = t(item.labelKey, { defaultValue: item.defaultLabel });
+        const editable = editMode && !!onToggleHidden;
+        const isHidden = editable ? (hiddenSet?.includes(item.to) ?? false) : false;
+        const editLabel = isHidden
+          ? t('sidebar.show_item', { defaultValue: 'Show {{label}}', label })
+          : t('sidebar.hide_item', { defaultValue: 'Hide {{label}}', label });
         return (
           <li key={item.to}>
             <button
               type="button"
               onClick={() => {
+                if (editable) {
+                  onToggleHidden!(item.to);
+                  return;
+                }
+                // Action tile (e.g. "Edit menu") runs in place; keep the
+                // drawer open so the customiser it toggles stays visible.
+                if (item.onClick) {
+                  item.onClick();
+                  return;
+                }
                 navigate(item.to);
                 onNavigate?.();
               }}
-              aria-label={label}
-              aria-current={isActive ? 'page' : undefined}
-              title={label}
+              aria-label={editable ? editLabel : label}
+              aria-current={!editMode && isActive ? 'page' : undefined}
+              aria-pressed={editable ? isHidden : undefined}
+              title={editable ? editLabel : label}
               className={clsx(
                 'group flex h-8 w-full items-center justify-start gap-1.5 rounded-md border px-2 text-left transition-colors duration-fast ease-oe',
                 'focus:outline-none focus-visible:ring-2 focus-visible:ring-oe-blue/40',
-                isActive
+                isActive && !editMode
                   ? 'border-transparent bg-oe-blue/[0.14] text-oe-blue shadow-[inset_0_0_0_1px_rgba(0,122,255,0.18)] dark:bg-oe-blue/25'
-                  : 'border-border-light/60 bg-surface-primary text-content-secondary hover:bg-surface-secondary hover:text-content-primary hover:border-border-medium',
+                  : 'border-border-light/60 bg-surface-primary text-content-secondary hover:bg-surface-secondary hover:text-content-primary hover:border-border-medium dark:border-border-light/40 dark:bg-transparent dark:hover:bg-surface-secondary/60',
+                isHidden && 'opacity-50',
               )}
             >
-              <Icon size={14} strokeWidth={isActive ? 2 : 1.75} aria-hidden className="shrink-0" />
+              <Icon
+                size={14}
+                strokeWidth={isActive && !editMode ? 2 : 1.75}
+                aria-hidden
+                className="shrink-0"
+              />
               <span className="min-w-0 flex-1 text-[11px] font-medium leading-none whitespace-nowrap overflow-hidden text-ellipsis">
                 {label}
               </span>
+              {editable && (
+                <span aria-hidden className="shrink-0 text-content-quaternary">
+                  {isHidden ? <EyeOff size={11} strokeWidth={2} /> : <Eye size={11} strokeWidth={2} />}
+                </span>
+              )}
             </button>
           </li>
         );

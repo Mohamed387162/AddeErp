@@ -40,12 +40,14 @@ import {
   DateDisplay,
   Skeleton,
   ModuleGuideButton,
+  CollapsibleSection,
 } from '@/shared/ui';
 import { PageHeader } from '@/shared/ui/PageHeader';
 import { payrollGuide } from './payrollGuide';
 import { RequiresProject } from '@/shared/auth/RequiresProject';
 import { useToastStore } from '@/stores/useToastStore';
 import { useProjectContextStore } from '@/stores/useProjectContextStore';
+import { useActiveProjectId } from '@/shared/hooks/useActiveProjectId';
 import { getErrorMessage } from '@/shared/lib/api';
 import {
   fetchPayrollBatches,
@@ -153,12 +155,12 @@ function HowPayrollWorks() {
   ];
 
   return (
-    <Card padding="md">
-      <h2 className="flex items-center gap-1.5 text-sm font-semibold text-content-primary">
-        <Network size={15} className="text-oe-blue" />
-        {t('payroll.flow_title', { defaultValue: 'How payroll fits together' })}
-      </h2>
-      <p className="mt-1 text-xs text-content-tertiary">
+    <CollapsibleSection
+      storageKey="payroll.how"
+      icon={<Network size={15} className="text-oe-blue" />}
+      title={t('payroll.flow_title', { defaultValue: 'How payroll fits together' })}
+    >
+      <p className="text-xs text-content-tertiary">
         {t('payroll.flow_intro', {
           defaultValue:
             'Payroll turns the hours worked on site into a posted, reconciled labour cost. Start by generating a draft batch from the latest field hours.',
@@ -214,7 +216,7 @@ function HowPayrollWorks() {
           <ModLink to="/reports">{t('payroll.mod_reports', { defaultValue: 'Reports' })}</ModLink>
         </span>
       </div>
-    </Card>
+    </CollapsibleSection>
   );
 }
 
@@ -415,7 +417,7 @@ export default function PayrollPage() {
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const addToast = useToastStore((s) => s.addToast);
-  const activeProjectId = useProjectContextStore((s) => s.activeProjectId);
+  const activeProjectId = useActiveProjectId();
   const activeProjectName = useProjectContextStore((s) => s.activeProjectName);
   const projectId = activeProjectId ?? '';
 

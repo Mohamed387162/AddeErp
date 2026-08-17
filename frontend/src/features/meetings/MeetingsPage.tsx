@@ -17,6 +17,7 @@ import {
   Circle,
   XCircle,
   Clock,
+  CalendarClock,
   FileDown,
   FileUp,
   Loader2,
@@ -58,6 +59,7 @@ import { useConfirm } from '@/shared/hooks/useConfirm';
 import { useCreateShortcut } from '@/shared/hooks/useCreateShortcut';
 import { DateDisplay } from '@/shared/ui/DateDisplay';
 import { apiGet, extractErrorMessageFromBody, triggerDownload } from '@/shared/lib/api';
+import { formatDuration } from '@/shared/lib/duration';
 import { useToastStore } from '@/stores/useToastStore';
 import { useProjectContextStore } from '@/stores/useProjectContextStore';
 import { useAuthStore } from '@/stores/useAuthStore';
@@ -90,6 +92,8 @@ import { ActionRegisterPanel } from './ActionRegisterPanel';
 import { MinutesDialog } from './MinutesDialog';
 import { RecurringSeriesDialog } from './RecurringSeriesDialog';
 import { meetingsGuide } from './meetingsGuide';
+import { InsightsPanel, InsightsToggleButton, useModuleInsights } from '@/features/insights';
+import { buildMeetingsInsights } from './meetingsInsights';
 
 /* -- Constants ------------------------------------------------------------- */
 
@@ -114,6 +118,13 @@ const STATUS_CONFIG: Record<
   MeetingStatus,
   { variant: 'neutral' | 'blue' | 'success' | 'error' | 'warning'; cls: string }
 > = {
+  // Draft has to look unlike scheduled. Without an entry here the lookup below
+  // fell through to the scheduled styling, so a meeting that cannot be
+  // completed yet was painted the same blue as one that can.
+  draft: {
+    variant: 'neutral',
+    cls: 'bg-surface-secondary text-content-secondary',
+  },
   scheduled: { variant: 'blue', cls: '' },
   in_progress: { variant: 'warning', cls: '' },
   completed: { variant: 'success', cls: '' },
@@ -183,7 +194,7 @@ const MEETING_TYPE_CARD_CONFIG: Record<
   },
 };
 
-const MEETING_STATUSES: MeetingStatus[] = ['scheduled', 'in_progress', 'completed', 'cancelled'];
+const MEETING_STATUSES: MeetingStatus[] = ['draft', 'scheduled', 'in_progress', 'completed', 'cancelled'];
 
 /* -- Create Meeting Modal -------------------------------------------------- */
 
@@ -1657,6 +1668,7 @@ const MeetingRow = React.memo(function MeetingRow({
   meeting,
   onComplete,
   onExportPdf,
+  onSchedule,
   onEdit,
   onDelete,
   isExporting,
@@ -1664,6 +1676,7 @@ const MeetingRow = React.memo(function MeetingRow({
 }: {
   meeting: Meeting;
   onComplete: (id: string) => void;
+  onSchedule: (id: string) => void;
   onExportPdf: (id: string) => void;
   onEdit: (meeting: Meeting) => void;
   onDelete: (meeting: Meeting) => void;
@@ -1818,7 +1831,11 @@ const MeetingRow = React.memo(function MeetingRow({
                       {item.duration_minutes > 0 && (
                         <span className="text-xs text-content-tertiary ml-2 flex items-center gap-0.5 inline-flex">
                           <Clock size={10} />
-                          {item.duration_minutes}m
+                          {/* #174: this printed the stored minutes with a fixed
+                              "min" suffix at any size, so a half-day workshop
+                              read "240 min". The shared formatter picks the
+                              unit: "4h", "1h 30m", "45m". */}
+                          {formatDuration(t, item.duration_minutes, 'min', { parts: 2 })}
                         </span>
                       )}
                     </div>
@@ -1872,7 +1889,9 @@ const MeetingRow = React.memo(function MeetingRow({
                 })}
               </p>
               <div className="flex flex-wrap gap-1.5">
-                {(meeting.document_ids ?? []).map((docId) => (
+                {/* The meeting carries document ids only, no filenames, so the
+                    chip is numbered rather than showing a chopped-up id. */}
+                {(meeting.document_ids ?? []).map((docId, idx) => (
                   <a
                     key={docId}
                     href={getMeetingDocumentDownloadUrl(docId)}
@@ -1881,9 +1900,15 @@ const MeetingRow = React.memo(function MeetingRow({
                     onClick={(e) => e.stopPropagation()}
                     className="inline-flex items-center gap-1 rounded-md border border-border-light bg-surface-primary px-2 py-1 text-xs text-content-primary hover:border-oe-blue hover:text-oe-blue transition-colors"
                     data-testid="meeting-row-attachment-chip"
+                    title={docId}
                   >
                     <FileText size={10} />
-                    <span className="font-mono truncate max-w-[140px]">{docId.slice(0, 8)}</span>
+                    <span className="truncate max-w-[140px]">
+                      {t('meetings.attachment_n', {
+                        defaultValue: 'Attachment {{n}}',
+                        n: idx + 1,
+                      })}
+                    </span>
                     <Download size={10} />
                   </a>
                 ))}
@@ -1893,6 +1918,19 @@ const MeetingRow = React.memo(function MeetingRow({
 
           {/* Actions */}
           <div className="flex items-center gap-2 pt-1 flex-wrap">
+            {meeting.status === 'draft' && (
+              <Button
+                variant="primary"
+                size="sm"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onSchedule(meeting.id);
+                }}
+              >
+                <CalendarClock size={14} className="mr-1.5" />
+                {t('meetings.action_schedule', { defaultValue: 'Schedule Meeting' })}
+              </Button>
+            )}
             {(meeting.status === 'scheduled' || meeting.status === 'in_progress') && (
               <Button
                 variant="primary"
@@ -1972,6 +2010,7 @@ const MeetingRow = React.memo(function MeetingRow({
           {showMinutes && (
             <MinutesDialog
               meetingId={meeting.id}
+              projectId={meeting.project_id}
               meetingTitle={meeting.title}
               onClose={() => setShowMinutes(false)}
             />
@@ -2060,6 +2099,17 @@ export function MeetingsPage() {
     return { total, scheduled, completed, inProgress };
   }, [meetings]);
 
+  // Module Insights - the toggleable KPI and chart panel for this module. Its
+  // charts are built client-side from the meetings already loaded; when the
+  // project has none the panel draws nothing rather than inventing rows to fill
+  // it. Declared among the top-level hooks, above the single return below, so
+  // hook order stays stable on every render.
+  const insights = useModuleInsights('meetings', { defaultOpen: true });
+  const { datasets: insightDatasets, builtins: insightBuiltins } = useMemo(
+    () => buildMeetingsInsights(meetings, '', t),
+    [meetings, t],
+  );
+
   // Invalidation
   const invalidateAll = useCallback(() => {
     qc.invalidateQueries({ queryKey: ['meetings'] });
@@ -2125,6 +2175,29 @@ export function MeetingsPage() {
       addToast({
         type: 'error',
         title: t('meetings.update_failed', { defaultValue: 'Failed to update meeting' }),
+        message: e.message,
+      }),
+  });
+
+  // Moving a draft on to scheduled. It reuses the update endpoint rather than
+  // asking for one of its own, because the API validates the hop against its
+  // own transition table and draft -> scheduled is the only way forward.
+  // Meetings made in this app are created scheduled; this is for the ones that
+  // arrive as drafts from an import, the API or a generated module, which had
+  // no way to be completed at all.
+  const scheduleMut = useMutation({
+    mutationFn: (id: string) => updateMeeting(id, { status: 'scheduled' }),
+    onSuccess: () => {
+      invalidateAll();
+      addToast({
+        type: 'success',
+        title: t('meetings.scheduled_ok', { defaultValue: 'Meeting scheduled' }),
+      });
+    },
+    onError: (e: Error) =>
+      addToast({
+        type: 'error',
+        title: t('meetings.schedule_failed', { defaultValue: 'Failed to schedule meeting' }),
         message: e.message,
       }),
   });
@@ -2235,6 +2308,11 @@ export function MeetingsPage() {
         title: formData.title,
         meeting_type: formData.meeting_type,
         meeting_date: formData.date?.split('T')[0] || formData.date,
+        // The API defaults to draft when no status is sent, and a draft cannot
+        // be completed until it is scheduled. This form has just collected a
+        // date, a chair and an agenda, so the meeting it describes is
+        // scheduled. Left unsent, every meeting made here was stuck.
+        status: 'scheduled',
         location: formData.location || undefined,
         // Prefer the picked contact id; fall back to the typed name so a
         // guest chair (not in the directory) is still recorded.
@@ -2319,6 +2397,7 @@ export function MeetingsPage() {
         subtitle={t('meetings.subtitle', { defaultValue: 'Schedule, track, and document project meetings with action items' })}
         actions={
           <>
+            <InsightsToggleButton open={insights.open} onClick={insights.toggle} />
             <ModuleGuideButton content={meetingsGuide} />
             <Button
               variant="secondary"
@@ -2353,6 +2432,18 @@ export function MeetingsPage() {
             </Button>
           </>
         }
+      />
+
+      <InsightsPanel
+        open={insights.open}
+        title={t('meetings.insights.title', { defaultValue: 'Meeting insights' })}
+        datasets={insightDatasets}
+        builtins={insightBuiltins}
+        custom={insights.custom}
+        onAdd={insights.addCustom}
+        onUpdate={insights.updateCustom}
+        onRemove={insights.removeCustom}
+        onCollapse={() => insights.setOpen(false)}
       />
 
       {/* Canonical module info card — pain-named title + workflow body.
@@ -2550,6 +2641,7 @@ export function MeetingsPage() {
                   key={meeting.id}
                   meeting={meeting}
                   onComplete={handleComplete}
+                  onSchedule={(id) => scheduleMut.mutate(id)}
                   onExportPdf={handleExportPdf}
                   onEdit={(m) => setEditingMeeting(m)}
                   onDelete={handleDelete}

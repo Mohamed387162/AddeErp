@@ -9,6 +9,8 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_validator
 
+from app.modules.einvoice.rules import VAT_CATEGORY_CODES
+
 
 # ── v3 §10 money serialisation helper ─────────────────────────────────────
 # Mirrors backend/app/modules/boq/schemas.py - money fields are stored /
@@ -91,11 +93,31 @@ class InvoiceLineItemCreate(BaseModel):
     # posts onto the matching cost-spine budget row.
     cost_line_id: UUID | None = Field(default=None)
     sort_order: int = Field(default=0, ge=0)
+    # EN 16931 per-line VAT. Left unset the exporter falls back to the
+    # invoice-level rate, which is only right when every line shares one rate.
+    vat_rate: str | None = Field(default=None, max_length=10)
+    vat_category: str | None = Field(default=None, max_length=4)
 
     @field_validator("quantity", "unit_rate", "amount")
     @classmethod
     def _check_non_negative_decimal(cls, v: str) -> str:
         return _validate_non_negative_decimal(v)
+
+    @field_validator("vat_rate")
+    @classmethod
+    def _check_vat_rate(cls, v: str | None) -> str | None:
+        return None if v is None else _validate_non_negative_decimal(v)
+
+    @field_validator("vat_category")
+    @classmethod
+    def _check_vat_category(cls, v: str | None) -> str | None:
+        """Reject a category code no receiver's validator would accept (BR-CL-18)."""
+        if v is None:
+            return None
+        code = v.strip().upper()
+        if code not in VAT_CATEGORY_CODES:
+            raise ValueError(f"vat_category must be one of {', '.join(sorted(VAT_CATEGORY_CODES))}, got {v!r}")
+        return code
 
 
 class InvoiceCreate(BaseModel):
@@ -202,11 +224,16 @@ class InvoiceLineItemResponse(BaseModel):
     cost_category: str | None = None
     cost_line_id: UUID | None = None
     sort_order: int = 0
+    vat_rate: str | None = None
+    vat_category: str | None = None
     created_at: datetime
     updated_at: datetime
 
     _coerce_decimal = field_validator("quantity", "unit_rate", "amount", mode="before")(
         lambda cls, v: _decimal_to_str(v)
+    )
+    _coerce_vat_rate = field_validator("vat_rate", mode="before")(
+        lambda cls, v: None if v is None else _decimal_to_str(v)
     )
 
 
@@ -945,3 +972,51 @@ class CashFlowResponse(BaseModel):
     net_change: str
     closing_cash: str
     ties_out: bool
+
+
+# -- Retention / withholding ledger ----------------------------------------
+
+
+class RetentionRollupResponse(BaseModel):
+    """Held / released / outstanding retainage for one scope (group or total).
+
+    Money is Decimal-as-string. The ``*_pct`` ratios are guarded: ``None`` when
+    the denominator (held or scheduled retainage) is zero, so the UI renders
+    "n/a" rather than a bogus 0%.
+
+    Basis of each figure:
+    ``scheduled`` = sum of invoice retention_amount (planned hold-back);
+    ``held_to_date`` = sum of payment withholding_amount;
+    ``released_to_date`` = held retainage whose release date has been reached as
+    of ``as_of``; ``outstanding`` = held minus released (clamped at zero).
+    """
+
+    currency_code: str = ""
+    direction: str = ""
+    contact_id: str | None = None
+    counterparty_name: str | None = None
+    scheduled: str = "0"
+    held_to_date: str = "0"
+    released_to_date: str = "0"
+    outstanding: str = "0"
+    payment_count: int = 0
+    released_pct: str | None = None
+    outstanding_pct: str | None = None
+    held_vs_scheduled_pct: str | None = None
+    earliest_release_date: str | None = None
+    latest_release_date: str | None = None
+
+
+class RetentionLedgerResponse(BaseModel):
+    """Project retention / withholding ledger.
+
+    ``groups`` are per-counterparty lines (each within one currency and
+    direction); ``totals`` roll them up per (currency, direction). ``as_of`` is
+    the release-date cutoff used to classify retainage as released. Nothing is
+    blended across currencies or across payable / receivable.
+    """
+
+    project_id: UUID
+    as_of: str | None = None
+    groups: list[RetentionRollupResponse] = Field(default_factory=list)
+    totals: list[RetentionRollupResponse] = Field(default_factory=list)

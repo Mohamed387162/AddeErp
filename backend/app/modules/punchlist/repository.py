@@ -11,8 +11,14 @@ from datetime import UTC, datetime
 
 from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm.attributes import set_committed_value
+from sqlalchemy.orm.util import identity_key
+from sqlalchemy.sql.elements import ClauseElement
 
 from app.modules.punchlist.models import PunchItem
+
+#: Statuses that count as still-to-action work in the summary aggregates.
+LIVE_STATUSES = ("open", "in_progress")
 
 
 class PunchListRepository:
@@ -70,7 +76,15 @@ class PunchListRepository:
         stmt = update(PunchItem).where(PunchItem.id == item_id).values(**fields)
         await self.session.execute(stmt)
         await self.session.flush()
-        self.session.expire_all()
+        instance = self.session.identity_map.get(identity_key(PunchItem, item_id))
+        if instance is None:
+            return
+        computed = [name for name, value in fields.items() if isinstance(value, ClauseElement)]
+        for name, value in fields.items():
+            if name not in computed:
+                set_committed_value(instance, name, value)
+        if computed:
+            self.session.expire(instance, computed)
 
     async def delete(self, item_id: uuid.UUID) -> None:
         """Hard delete a punch item."""
@@ -127,11 +141,35 @@ class PunchListRepository:
             )
         ).all()
 
+        # "Live" is open or in progress, the same two states the summary's
+        # open count adds up. Assigned items are deliberately not counted,
+        # so this tile and the open tile beside it never disagree.
+        urgent_open = (
+            await self.session.execute(
+                select(func.count(PunchItem.id)).where(
+                    PunchItem.project_id == project_id,
+                    PunchItem.status.in_(LIVE_STATUSES),
+                    PunchItem.priority.in_(("critical", "high")),
+                )
+            )
+        ).scalar_one()
+
+        open_created_rows = (
+            await self.session.execute(
+                select(PunchItem.created_at).where(
+                    PunchItem.project_id == project_id,
+                    PunchItem.status.in_(LIVE_STATUSES),
+                )
+            )
+        ).all()
+
         return {
             "total": int(total),
             "by_status": {row[0]: row[1] for row in status_rows},
             "by_priority": {row[0]: row[1] for row in priority_rows},
             "closed_timestamps": list(closed_rows),
+            "urgent_open": int(urgent_open),
+            "open_created_at": [row[0] for row in open_created_rows],
         }
 
     async def count_overdue(self, project_id: uuid.UUID) -> int:

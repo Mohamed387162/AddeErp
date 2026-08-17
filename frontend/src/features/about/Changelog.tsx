@@ -38,6 +38,251 @@ interface ChangelogEntry {
 // date, title and meaning intact; trim the prose, not the facts.
 const CHANGELOG: ChangelogEntry[] = [
   {
+    version: '14.8.1',
+    date: '2026-08-12',
+    tag: 'NEW',
+    summary:
+      'The file module is called Documents in all forty languages, and a module can introduce itself in the reader\'s own language. An electronic invoice reads the buyer address from the contact it already names, raises its buyer findings on the screen that now holds the buyer, follows the German profile rules to the letter, and refuses an address that is only a country. Desktop releases answer for their own signatures: a backfill can sign bytes that already shipped, and an unsigned Windows build says so. Lists stop looking complete when they are merely full, totals survive the page envelope, the product serves its own typefaces, and the Spanish and Portuguese locales got their diacritics and their own documented wording back.',
+  },
+  {
+    version: '14.8.0',
+    date: '2026-08-11',
+    tag: 'NEW',
+    summary:
+      'A foreman with no signal records the day on the device and it reaches the office exactly once, because every logical day carries a key minted on the device and a redelivery returns the timesheet the first delivery produced rather than writing a second one. The seller identity, tax registration and bank account an electronic invoice cannot be issued without now have a screen, are held once for the company and merged beneath whatever an individual invoice says, and the account is checked against its own ISO 7064 check digits on the way in. An invoice no longer names Germany for a firm that never chose a country, so an invoice with no buyer country is refused under BR-11 instead of exporting a false statement about where a legal person is established. Overdue deadline notifications reach the managers again after one unresolvable row had been silencing the whole sweep on every tick, and Portuguese now reads as European Portuguese rather than Brazilian.',
+  },
+  {
+    version: '14.7.0',
+    date: '2026-08-11',
+    tag: 'NEW',
+    summary:
+      'A register can be described inside the product and installed into the running server a moment later, into a module directory belonging to the instance so an upgrade cannot carry it away, with every generated file on screen before anything is written. The three statutory modules that shipped over the API with no screens now have them, along with cost matching, currencies, earned value and the inbound email reader, so every mounted module has a way in from the product. An electronic invoice is checked against the rules a receiver will actually cite and can finally be issued from a screen, carries a different VAT rate on every line, and relates its embedded XML as an alternative the way Factur-X and ZUGFeRD require. A tender in Chile, Colombia and Brazil is priced the way each country reads it, a currency with no minor unit stops printing cents on a public tender, a DXF opens without the converter binary it never needed, a worker day is costed once from whichever field surface recorded it, an upgrade started from inside the product stops reporting a failure while it is still running, and the platform reads in 40 languages, up from 29.',
+  },
+  {
+    version: '14.6.0',
+    date: '2026-08-06',
+    tag: 'FIX',
+    summary:
+      'Tabbing from the unit column to quantity in a bill of quantities no longer opens the editor and closes it in the same keystroke, and Shift with Tab now walks backwards in all three hand-written editors instead of forwards. An inspection shows who carried it out by name rather than as an identifier, on the list, in the drawer and in the spreadsheet export, resolving against parties first and people second and keeping a typed name as typed.',
+  },
+  {
+    version: '14.5.0',
+    date: '2026-08-05',
+    tag: 'NEW',
+    summary:
+      'A firm can write its own cases instead of only reading ours, the credentials register can finally be opened from inside the product, and the securities that make a contract enforceable are held against the contract itself. Three modules ship for work that crosses borders: invoices filed where a government has to clear them, statutory withholding taken the way the governing statute defines it, and payment deadlines treated the way security of payment law treats them, all three over the API with their screens still to come. A drawing opened in DWG Take Off matches the file it came from again, approving a timesheet no longer fails because of the daywork sheet written after it, and roughly 320 new strings per language reach all 29 languages. The macOS start failure reported against 14.4.0 is not fixed here: the shipped file was read binary by binary and the explanation we had for it is wrong, which is said plainly rather than shipped as a fix.',
+  },
+  {
+    version: '14.4.0',
+    date: '2026-08-04',
+    tag: 'FIX',
+    summary:
+      'An upgrade that crosses several releases applies again, after a foreign key name too long for PostgreSQL rolled back every pending revision and left the contracts feature uninstallable there. The sheet register has a screen worth opening, a re-uploaded drawing set now retires the sheets it replaces instead of leaving two of each number both claiming to be current, and the list is ordered and counted in a way the database has to repeat. The assistant reaches live project data whatever provider is behind it, an assembly applied from a template no longer folds an unconverted amount into a converted total, and DWG Take Off frames a drawing by its geometry rather than by its labels, keeps block definitions out of the sheet picker and stops rendering a right angle as ninety radians. The worked example in the bill of quantities paste box shows its columns again, after every tab and newline in it had lost its backslash in English as well as in twelve translations, and the sheets register no longer labels a superseded sheet as the current one in twelve languages.',
+  },
+  {
+    version: '14.3.0',
+    date: '2026-08-04',
+    tag: 'NEW',
+    summary:
+      'The parties to a contract can now be seen, added and removed from the contract itself, and the panel says which of the rows the signature block is built from. A contract with nobody in a signing role no longer has a signatory invented from its own title, the compliance gate no longer closes itself and the drawer behind it on any click inside, and removing a party no longer answers with a not found error.',
+  },
+  {
+    version: '14.2.2',
+    date: '2026-08-03',
+    tag: 'FIX',
+    summary:
+      'Counted labels now carry every plural form the language they appear in actually uses, instead of dropping to English when one form is missing, and three of them no longer assemble their own English sentence in code before a translator can see it. Demo records that named companies trading in the real world have been rewritten with invented names, the seeded catalogue no longer ships codes with a DEMO prefix, and the money field tooltips are translated.',
+  },
+  {
+    version: '14.2.1',
+    date: '2026-08-03',
+    tag: 'FIX',
+    summary:
+      'The desktop app starts its own database on Linux again. On Linux, PostgreSQL names its loadable modules the same way Python names an extension, so the tool that freezes the backend threw all of them away on the way into the Linux installer and the app stopped at "Starting the local database". The build now reads that directory itself and refuses to produce an installer without them.',
+  },
+  {
+    version: '14.2.0',
+    date: '2026-08-03',
+    tag: 'FIX',
+    summary:
+      'Choosing a project now moves the whole dashboard onto it, cost items imported without a currency have been given the one their region implies, and analytics panels say there is not enough data instead of drawing a chart of one row. The demo estate reads like a project rather than a fixture, and several hundred strings that were reaching every language as English are translated.',
+  },
+  {
+    version: '14.1.0',
+    date: '2026-08-01',
+    tag: 'NEW',
+    summary:
+      'Six registers became places to decide something rather than only look at data, with rates priced as of a date, bids put on the same basis before one is picked, and a matching engine that stores a run for a person to rule on. Stamp templates no longer cross between projects, budget lines carry their own project currency, self-hosted upgrades work again, and module analytics leaves an empty panel empty instead of filling it with plausible looking figures.',
+  },
+  {
+    version: '14.0.0',
+    date: '2026-07-29',
+    tag: 'NEW',
+    summary:
+      'Mesh models open in the browser instead of waiting on the server, and rearranging measurements in PDF takeoff no longer runs out of room after enough drops into the same slot. Browsers stop offering saved card details on the add-section field, long catalogue names keep their tail visible in both pickers, the assemblies drag handle is visible before you hover it, and the quickstart Docker build survives a registry that stops answering.',
+  },
+  {
+    version: '12.9.0',
+    date: '2026-07-28',
+    tag: 'FIX',
+    summary:
+      'The vector service now installs under the platform data directory instead of the account home, so a container no longer needs its ownership corrected by hand before CAD to cost matching will work, and a permission problem names the path and the reason. Twenty-one record updates stopped marking every loaded object stale, which had been raising errors far from the code that caused them, and the desktop diagnostic no longer reports a healthy PDF reader as broken.',
+  },
+  {
+    version: '12.8.0',
+    date: '2026-07-28',
+    tag: 'NEW',
+    summary:
+      'Measurements in PDF takeoff can be arranged freely: dropped below a row and not only above it, dragged into another group, and whole group blocks moved, with the arrangement surviving a reload. Purchase orders and invoices now leave the audit rows they were missing, agreed variation orders count as committed cost, forms save only the fields you actually edited, and the vector service explains why it will not start instead of returning a bare error.',
+  },
+  {
+    version: '12.7.0',
+    date: '2026-07-27',
+    tag: 'NEW',
+    summary:
+      'Progress percentages now roll up from the individual positions and weight by design quantity instead of taking the highest reading anywhere, so figures quoted from older reports need regenerating. Large models start drawing almost immediately, purchase orders and subcontracts are checked before they commit money, and the desktop update button no longer answers with command line usage text.',
+  },
+  {
+    version: '12.6.1',
+    date: '2026-07-25',
+    tag: 'FIX',
+    summary:
+      'Live notifications and shared editing presence work again: both real-time channels were refusing every connection, so the notification bell only updated on reload and two people on the same position could not see each other. The handshake is now covered by a test in the database gate so it cannot break unnoticed again.',
+  },
+  {
+    version: '12.6.0',
+    date: '2026-07-24',
+    tag: 'NEW',
+    summary:
+      'Case studies now open the running demo on the exact module the story is about, so a 4D sequence case lands on the schedule board and a 5D cost model case lands on the BOQ. Sign-in keeps your intended destination too: arriving at the login screen from a deep link returns you to that page after you sign in instead of dropping you on the dashboard.',
+  },
+  {
+    version: '12.5.0',
+    date: '2026-07-24',
+    tag: 'NEW',
+    summary:
+      'Every module register can show a Module Insights panel with key counts, a breakdown chart and a build-your-own chart maker, now across dozens of registers, and the long how-it-works explainers fold into a single expandable line. Deadlines gains a cross-module overdue register with an escalation sweep, file approvals gets its own register page with Excel export and workflow notifications, and documents can reconcile a sheet set against the drawing index. Fixes include the correct router base under the /demo prefix, the BOQ resources toggle firing on the first click, and cost bases no longer doubling work names.',
+  },
+  {
+    version: '12.4.0',
+    date: '2026-07-23',
+    tag: 'NEW',
+    summary:
+      'The Common Data Environment can adopt an ISO 19650 approval preset and clone it into an editable project route, wired through the setup wizard with a preset library and a training case. Correspondence, RFI and inbound items get a Create task action that pre-fills from the source and tags the task with where it came from. Reporting adds a COBie facility export over the whole asset register, and e-signatures move onto a pluggable provider interface. The six international modules link out to their files, schedule and change orders, and every public case page now carries the home-page header.',
+  },
+  {
+    version: '12.3.0',
+    date: '2026-07-23',
+    tag: 'NEW',
+    summary:
+      'Six delivery and authority modules that had a backend but no screens are now fully usable: authority submissions, authority review cycles with an evidence dossier, an e-signature registry, a source-data register, a work-type route classifier and site supervision, each with its guide and worked cases. The Bill of Quantities grid follows the dark theme, PDF takeoff restores and shares the current sheet through the URL, and the scale auto-detect strip stays quiet when idle or once a page is calibrated.',
+  },
+  {
+    version: '12.2.0',
+    date: '2026-07-22',
+    tag: 'NEW',
+    summary:
+      'Model review keeps the 3D model in view while checks run, instead of the viewer ballooning off screen when a long report renders. The pipeline builder gains ten ready-to-run templates, a saved-workflow picker that used to be reachable only by URL, and seven new node types, and it now flags steps wired to nothing. Point cloud adds a Groups tool that captures a region with its point count, volume and plan area and sends the quantity straight into a BOQ. Kyrgyz joins the interface languages as a full translation, bringing the count to twenty-eight.',
+  },
+  {
+    version: '12.1.0',
+    date: '2026-07-21',
+    tag: 'NEW',
+    summary:
+      'Approval routes get a tenant-wide preset library and a dry-run simulator, interface management links to RFIs and schedule activities, and the CDE adds ISO 19650 roles with a per-project go-live readiness score. National cost bases translate into the market language with a per-row revision id, cases show a compact process row, BOQ positions renumber freely, and the multi-tenant RLS policy is hardened.',
+  },
+  {
+    version: '12.0.1',
+    date: '2026-07-19',
+    tag: 'NEW',
+    summary:
+      'Patch release. Corrects a frontend type-build error introduced in 12.0.0 that stopped the container image from building, with no functional or behavioural change.',
+  },
+  {
+    version: '12.0.0',
+    date: '2026-07-19',
+    tag: 'NEW',
+    summary:
+      'Model review now runs twenty more automatic checks over an imported model, from missing element properties and dimensions to duplicate marks and classification coverage, all shown in the review panel and folded into the completeness score. New screens surface analytics that were computed but never shown: a physical progress page with an actual against planned S-curve and quantity variance, contract gain share, security coverage and milestone schedule panels, and a finance retention ledger, each translated into every language.',
+  },
+  {
+    version: '11.18.0',
+    date: '2026-07-18',
+    tag: 'NEW',
+    summary:
+      'Bills of quantities now export back to FIEBDC-3 (BC3), the Spanish and Latin American construction budget format, with the full chapter and item hierarchy, codes, units, quantities and rates, and a clean round-trip through the BC3 reader. The in-app error log also scrubs a wider set of secrets, including bare session tokens, before anything reaches local storage or a downloaded bug report.',
+  },
+  {
+    version: '11.17.0',
+    date: '2026-07-18',
+    tag: 'NEW',
+    summary:
+      'Security hardening across the outbound connectors and several server-side parsers. The Slack, Teams and Discord webhook connectors re-check the target address at send time, so a webhook pointed at an internal address is refused, not only when it is saved. Status probes no longer echo raw exception text and return a short, stable message instead. The schedule, change order, smart view, formula and email parsers cap the length they inspect before the pattern runs. Browser-stored BIM shortcuts and selection sets reject reserved keys, and the desktop download page escapes the release tag it reads from the public API.',
+  },
+  {
+    version: '11.16.2',
+    date: '2026-07-18',
+    tag: 'NEW',
+    summary:
+      'The longer case introduction now shows in every interface language. Fourteen guided cases carried this paragraph in English only; it is now translated into all twenty-seven other locales so each case reads in one language.',
+  },
+  {
+    version: '11.16.1',
+    date: '2026-07-18',
+    tag: 'NEW',
+    summary:
+      'The step blocks on the case detail page are more compact: smaller padding, title and body text, a tighter gap between the text and the data-flow column, and shorter connectors, so each step takes less room and the page reads denser with less empty space.',
+  },
+  {
+    version: '11.16.0',
+    date: '2026-07-18',
+    tag: 'NEW',
+    summary:
+      'The case detail page lays its header out in two columns on wide screens, with the case identity on the left and a compact control panel (progress, start, reset and the sample-project picker) on the right, so it reads shorter and denser. The featured article card in the sidebar now shows only its title and expands to reveal the summary and link when you hover or focus it.',
+  },
+  {
+    version: '11.15.0',
+    date: '2026-07-18',
+    tag: 'NEW',
+    summary:
+      'Match a selected element to a priced cost position from inside every viewer. In the BIM, PDF takeoff and DWG takeoff viewers, pick an element and the panel reads its properties, searches every loaded cost catalogue and ranks the positions that fit; accept one to create a priced BOQ line for that element and link it back in a single step.',
+  },
+  {
+    version: '11.14.0',
+    date: '2026-07-18',
+    tag: 'NEW',
+    summary:
+      'The sidebar Edit menu now hides and restores the bottom shortcut buttons (Settings, Users, Modules, Governance, Audit log, About) too, not just the main menu rows. The defects liability and interface management registers, which had shipped in English only, are now fully translated into every interface language.',
+  },
+  {
+    version: '11.13.0',
+    date: '2026-07-18',
+    tag: 'SECURITY',
+    summary:
+      'Two security fixes from disclosed reports: the in-app upgrade endpoint now requires an authenticated admin, and self-hosted AI provider URLs (Ollama, vLLM) are validated against internal and cloud-metadata targets before they are fetched. The PDF takeoff viewer also gets a shorter calibrate label, no stray draw previews during a scale calibration and a toolbar that collapses by its own width, and the cases are recolored per category with the case page reworked to lead with its title and steps.',
+  },
+  {
+    version: '11.12.0',
+    date: '2026-07-17',
+    tag: 'NEW',
+    summary:
+      'Assemblies become parametric: name the values that drive a recipe (an input, a constant, or one calculated from the others), give any component a quantity formula over them, and a preview shows the exact per-line quantities and rate the bill will get before you apply it. The five delivery registers from 11.11 now have their own pages in the app, and a desktop security advisory is cleared.',
+  },
+  {
+    version: '11.11.1',
+    date: '2026-07-16',
+    tag: 'FIX',
+    summary:
+      'A packaging fix for 11.11.0: a test type annotation tripped the strict frontend build in the release pipeline, so the installers and wheel did not publish. Same feature set, build corrected.',
+  },
+  {
+    version: '11.11.0',
+    date: '2026-07-16',
+    tag: 'NEW',
+    summary:
+      'Five new registers cover work that usually lives in spreadsheets: temporary works with its permit-to-load and permit-to-strike gates, the interface register between work packages, the defects liability period with its retention-release readiness signal, pre-construction site readiness, and on-site material stock. This release also stops the desktop app implying your data is lost when offline (it keeps saving locally, only live multi-user collaboration pauses), reopens external links in the system browser, adds a wider spread of project analytics, and closes cross-tenant access gaps on several endpoints.',
+  },
+  {
     version: '11.10.0',
     date: '2026-07-16',
     tag: 'NEW',

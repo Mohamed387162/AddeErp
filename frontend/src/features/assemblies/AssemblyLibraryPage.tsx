@@ -11,12 +11,15 @@ import { PageHeader } from '@/shared/ui/PageHeader';
 import { useToastStore } from '@/stores/useToastStore';
 import { useProjectContextStore } from '@/stores/useProjectContextStore';
 import { useDisplayQuantity } from '@/shared/hooks/useDisplayQuantity';
+import { unitGlyph } from '@/shared/lib/unitLabels';
+import { currencyFractionDigits } from '@/shared/lib/money';
 import { projectsApi } from '@/features/projects/api';
 
 import {
   assembliesApi,
   type AssemblyTemplate,
   type AppliedTemplateResponse,
+  type AppliedTemplateCurrencySubtotal,
   type ResourceType,
 } from './api';
 
@@ -48,6 +51,26 @@ const CATEGORY_BADGE: Record<string, BadgeVariant> = {
   mep: 'success',
   earthwork: 'warning',
 };
+
+/** Minimal `t` shape used by the label helpers below (repo convention). */
+type Translate = (key: string, opts?: { defaultValue?: string }) => string;
+
+/** Localized category label — reuses the filter-chip keys, falling back to a
+ *  capitalized raw value for any category without a dedicated key. */
+function categoryLabel(cat: string, t: Translate): string {
+  if (!cat) return '';
+  const cap = cat.charAt(0).toUpperCase() + cat.slice(1);
+  return t(`assemblies.library.category_${cat}`, { defaultValue: cap });
+}
+
+/** Localized resource-role label — reuses the editor's type_*_full keys so a
+ *  template component's role (material / labor / …) reads in the user's
+ *  language instead of a raw English token. */
+function roleLabel(role: string, t: Translate): string {
+  if (!role) return '';
+  const cap = role.charAt(0).toUpperCase() + role.slice(1);
+  return t(`assemblies.type_${role}_full`, { defaultValue: cap });
+}
 
 /* -- Page ---------------------------------------------------------------- */
 
@@ -230,7 +253,7 @@ function TemplateCard({
           <h3 className="line-clamp-2 text-sm font-semibold text-zinc-900 dark:text-zinc-100">
             {localisedName}
           </h3>
-          <Badge variant={badgeColor}>{template.category}</Badge>
+          <Badge variant={badgeColor}>{categoryLabel(template.category, t)}</Badge>
         </div>
 
         <div className="flex flex-wrap gap-1.5">
@@ -253,7 +276,7 @@ function TemplateCard({
             {t('assemblies.library.components', 'components')}
           </span>
           <span className="font-mono text-zinc-700 dark:text-zinc-300">
-            {t('assemblies.library.per_unit', 'per')} {template.unit}
+            {t('assemblies.library.per_unit', 'per')} {unitGlyph(template.unit)}
           </span>
         </div>
       </div>
@@ -266,6 +289,72 @@ function TemplateCard({
 interface ProjectLite {
   id: string;
   name: string;
+}
+
+/**
+ * The preview table's totals row.
+ *
+ * `grandTotal` is null whenever the preview spans more than one currency: the
+ * server refuses to name a total it could only reach by adding two currencies
+ * together. That null must be branched on, never coerced — `Number(null)` is 0
+ * and `Number(undefined)` is NaN, so the obvious one-liner prints a confident
+ * "0.00" for a preview whose real total is unknown, which is a worse answer
+ * than the blended number this whole change removed.
+ *
+ * Exported so the null branch can be rendered on its own in a test, the way
+ * `ComponentRow` is exported from the editor page.
+ */
+export function PreviewTotalsFooter({
+  grandTotal,
+  currencyLabel,
+  buckets,
+}: {
+  grandTotal: number | null;
+  currencyLabel: string;
+  buckets: AppliedTemplateCurrencySubtotal[];
+}) {
+  const { t } = useTranslation();
+
+  if (grandTotal != null) {
+    return (
+      <tfoot>
+        <tr className="font-semibold">
+          <td colSpan={3} className="py-2 text-right">
+            {t('assemblies.library.grand_total', 'Grand total')}
+          </td>
+          <td className="py-2 text-right font-mono">
+            {`${Number(grandTotal).toFixed(currencyFractionDigits(currencyLabel))} ${currencyLabel}`.trim()}
+          </td>
+        </tr>
+      </tfoot>
+    );
+  }
+
+  // Each currency on its own line, the way MultiCurrencyTotal already does it.
+  return (
+    <tfoot>
+      <tr>
+        <td colSpan={4} className="pt-2 text-right text-[11px] font-normal text-zinc-500 dark:text-zinc-400">
+          {t(
+            'assemblies.library.no_single_total',
+            'No single total: this preview covers more than one currency, and part of it could not be converted.'
+          )}
+        </td>
+      </tr>
+      {buckets.map((sub) => (
+        <tr key={sub.currency || 'unset'} className="font-semibold">
+          <td colSpan={3} className="py-1 text-right">
+            {sub.currency
+              ? t('assemblies.library.subtotal_in', 'Subtotal in {{currency}}', { currency: sub.currency })
+              : t('assemblies.library.subtotal_currency_not_set', 'Subtotal, currency not set')}
+          </td>
+          <td className="py-1 text-right font-mono">
+            {`${Number(sub.amount).toFixed(currencyFractionDigits(sub.currency))} ${sub.currency}`.trim()}
+          </td>
+        </tr>
+      ))}
+    </tfoot>
+  );
 }
 
 function TemplateDrawer({
@@ -420,6 +509,16 @@ function TemplateDrawer({
     (projects?.find((p) => p.id === projectId) as { currency?: string } | undefined)?.currency ||
     '';
 
+  // A component row shows its own money. The server sends each matched item's
+  // currency because it is not necessarily the response's target: a component
+  // the platform could not convert keeps its native figure, and labelling it
+  // with the target code would be the exact misreading this fix removes.
+  const rowCurrency = (c: { currency?: string }) => (c.currency || '').trim() || currencyLabel;
+
+  // Per-currency buckets. Present on any current server; guarded because a
+  // stale cached bundle can outlive a deploy.
+  const currencyBuckets = result?.totals_by_currency ?? [];
+
   return (
     <div className="fixed inset-0 z-50 flex justify-end bg-black/40">
       <div
@@ -436,7 +535,8 @@ function TemplateDrawer({
               {localisedName}
             </h2>
             <p className="mt-1 text-xs text-zinc-500 dark:text-zinc-400">
-              {template.category} · per {template.unit} · {template.component_count}{' '}
+              {categoryLabel(template.category, t)} · {t('assemblies.library.per_unit', 'per')}{' '}
+              {unitGlyph(template.unit)} · {template.component_count}{' '}
               {t('assemblies.library.components', 'components')}
             </p>
           </div>
@@ -499,10 +599,10 @@ function TemplateDrawer({
                 <li key={idx} className="flex items-center justify-between px-3 py-2 text-sm">
                   <div>
                     <div className="text-zinc-800 dark:text-zinc-200">{c.description}</div>
-                    <div className="text-xs text-zinc-500">{c.role}</div>
+                    <div className="text-xs text-zinc-500">{roleLabel(c.role, t)}</div>
                   </div>
                   <div className="text-right font-mono text-xs text-zinc-600 dark:text-zinc-400">
-                    {c.factor} {c.unit}
+                    {c.factor} {unitGlyph(c.unit)}
                   </div>
                 </li>
               ))}
@@ -645,28 +745,23 @@ function TemplateDrawer({
                         </td>
                         <td className="py-1.5 pr-2 text-right font-mono">
                           {matched
-                            ? `${q.convertRate(Number(c.unit_rate), c.unit || '').toFixed(2)} ${currencyLabel}`.trim()
+                            ? `${q.convertRate(Number(c.unit_rate), c.unit || '').toFixed(currencyFractionDigits(rowCurrency(c)))} ${rowCurrency(c)}`.trim()
                             : '—'}
                         </td>
                         <td className="py-1.5 text-right font-mono">
                           {matched
-                            ? `${c.total.toFixed(2)} ${currencyLabel}`.trim()
+                            ? `${c.total.toFixed(currencyFractionDigits(rowCurrency(c)))} ${rowCurrency(c)}`.trim()
                             : '—'}
                         </td>
                       </tr>
                     );
                   })}
                 </tbody>
-                <tfoot>
-                  <tr className="font-semibold">
-                    <td colSpan={3} className="py-2 text-right">
-                      {t('assemblies.library.grand_total', 'Grand total')}
-                    </td>
-                    <td className="py-2 text-right font-mono">
-                      {`${Number(result.grand_total).toFixed(2)} ${currencyLabel}`.trim()}
-                    </td>
-                  </tr>
-                </tfoot>
+                <PreviewTotalsFooter
+                  grandTotal={result.grand_total}
+                  currencyLabel={currencyLabel}
+                  buckets={currencyBuckets}
+                />
               </table>
 
               {/* Persist step — the honest "this actually writes something"

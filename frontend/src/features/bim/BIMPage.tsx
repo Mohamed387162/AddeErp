@@ -13,7 +13,7 @@
  * Route: /projects/:projectId/bim  or  /bim
  */
 
-import { useState, useMemo, useCallback, useEffect, useRef } from 'react';
+import { Fragment, useState, useMemo, useCallback, useEffect, useRef } from 'react';
 import clsx from 'clsx';
 import { useTranslation } from 'react-i18next';
 import { useParams, useNavigate, useSearchParams } from 'react-router-dom';
@@ -59,7 +59,9 @@ import {
   Palette,
   Footprints,
 } from 'lucide-react';
-import { Badge, EmptyState, Breadcrumb, ConfirmDialog, ModuleHelpButton, ModuleGuideButton, DismissibleInfo, IntroRichText } from '@/shared/ui';
+import { Badge, EmptyState, Breadcrumb, ConfirmDialog, ModuleHelpButton, ModuleGuideButton, DismissibleInfo, IntroRichText, ProjectFilePicker, projectDocumentToFile } from '@/shared/ui';
+import { BIM_VIEWER_FORMATS } from '@/shared/lib/projectFileFormats';
+import type { DocumentItem } from '@/features/documents/api';
 import { bimGuide } from './bimGuide';
 import { useConfirm } from '@/shared/hooks/useConfirm';
 import { useDisplayQuantity } from '@/shared/hooks/useDisplayQuantity';
@@ -94,6 +96,17 @@ import LinkActivityToBIMModal from './LinkActivityToBIMModal';
 import LinkRequirementToBIMModal from './LinkRequirementToBIMModal';
 import MeshImportDialog from './meshImport/MeshImportDialog';
 import { isMeshImportFile } from './meshImport/loaders';
+import {
+  BIM_MODEL_EXTENSIONS,
+  DATA_ACCEPT,
+  DATA_EXTENSIONS as TABULAR_EXTENSIONS,
+  HANDOFF_EXTENSIONS,
+  MESH_ACCEPT,
+  RAW_GEOMETRY_EXTENSIONS as RAW_GEOMETRY_FORMATS,
+  UPLOAD_ACCEPT,
+  UPLOAD_FORMATS,
+  type UploadTier,
+} from './uploadFormats';
 import type { BIMGroupFilterCriteria } from './api';
 import { Filter, Search } from 'lucide-react';
 import { SmartViewsPanel } from '@/features/smart_views/SmartViewsPanel';
@@ -124,15 +137,27 @@ import {
 
 /* ── Helpers ─────────────────────────────────────────────────────────── */
 
-const CAD_EXTENSIONS = new Set(['.rvt', '.ifc']);
-const DATA_EXTENSIONS = new Set(['.csv', '.xlsx', '.xls']);
+/* Every extension list on this screen derives from ``./uploadFormats``. The
+   routing sets below are the same lists as Sets so the handlers can test
+   membership; they are built from the export rather than retyped, because the
+   retyped copy is what let the badge row drift out of step with the picker. */
+const CAD_EXTENSIONS = new Set<string>(BIM_MODEL_EXTENSIONS);
+const DATA_EXTENSIONS = new Set<string>(TABULAR_EXTENSIONS);
 /** Extensions handled by the DWG Takeoff module - not accepted in BIM Hub. */
-const DWG_EXTENSIONS = new Set(['.dwg', '.dxf']);
-/** Mesh geometry formats parsed in-browser by the mesh importer. */
-const MESH_IMPORT_ACCEPT = '.obj,.3ds,.dae,.gltf,.glb,.fbx,.lwo,.stl,.ply,.usd,.usdz';
+const DWG_EXTENSIONS = new Set<string>(HANDOFF_EXTENSIONS);
 /** Geometry formats the backend accepts raw alongside a data file (advanced
  *  mode). Anything else in the geometry slot is routed to the mesh importer. */
-const RAW_GEOMETRY_EXTENSIONS = new Set(['.dae', '.glb', '.gltf']);
+const RAW_GEOMETRY_EXTENSIONS = new Set<string>(RAW_GEOMETRY_FORMATS);
+
+/** Badge treatment per tier. Colour carries the meaning the note spells out:
+ *  blue imports as BIM, green is geometry only, amber leaves for another
+ *  module. The old row painted .dwg blue beside .rvt, which promised a BIM
+ *  import it never performed. */
+const TIER_BADGE_CLASS: Record<UploadTier, string> = {
+  bim: 'bg-oe-blue/10 text-oe-blue border-oe-blue/20',
+  mesh: 'bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border-emerald-500/20',
+  handoff: 'bg-amber-500/10 text-amber-600 dark:text-amber-400 border-amber-500/20',
+};
 
 function getFileExtension(filename: string): string {
   const dot = filename.lastIndexOf('.');
@@ -496,6 +521,13 @@ function UploadPanel({
   const [dataFile, setDataFile] = useState<File | null>(null);
   const [geometryFile, setGeometryFile] = useState<File | null>(null);
   const [meshImportFile, setMeshImportFile] = useState<File | null>(null);
+  /** "Open from project files": lists the models already stored in this
+   *  project that the BIM viewer can take. Picking one downloads the bytes
+   *  and hands them to `handleFileSelect`, the same entry point a local pick
+   *  and a drag-drop both use, so RVT/IFC conversion, mesh import and the
+   *  DWG handoff all keep behaving identically. */
+  const [showProjectFilePicker, setShowProjectFilePicker] = useState(false);
+  const [pickingFileId, setPickingFileId] = useState<string | null>(null);
   const [installPromptState, setInstallPromptState] =
     useState<InstallPromptState | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -548,6 +580,35 @@ function UploadPanel({
     setUploadError(ext === '.rvt' ? t('bim.upload_rvt_note') : null);
     if (!modelName) setModelName(f.name.replace(/\.[^.]+$/, ''));
   }, [modelName, t, addToast, navigate, projectId, discipline]);
+
+  /** Adopt a model already stored in the project's Files area. The bytes are
+   *  downloaded and pushed through `handleFileSelect`, so a picked file takes
+   *  exactly the same route as a dropped one - including the DWG handoff to
+   *  DWG Takeoff and the in-browser mesh import. */
+  const handlePickProjectFile = useCallback(
+    async (doc: DocumentItem) => {
+      setPickingFileId(doc.id);
+      try {
+        const picked = await projectDocumentToFile(doc);
+        setShowProjectFilePicker(false);
+        handleFileSelect(picked);
+      } catch (err) {
+        addToast({
+          type: 'error',
+          title: t('project_files.pick_failed_title', { defaultValue: 'Could not open that file' }),
+          message:
+            err instanceof Error
+              ? err.message
+              : t('project_files.pick_failed_msg', {
+                  defaultValue: 'The file could not be read from the project. Try again.',
+                }),
+        });
+      } finally {
+        setPickingFileId(null);
+      }
+    },
+    [handleFileSelect, addToast, t],
+  );
 
   const resetForm = useCallback(() => {
     setFile(null); setDataFile(null); setGeometryFile(null); setModelName(''); setUploadError(null);
@@ -819,7 +880,14 @@ function UploadPanel({
             htmlFor="bim-upload-file-input"
             role="button"
             tabIndex={0}
-            aria-label={t('bim.upload_dropzone_aria_mesh', { defaultValue: 'Upload BIM or 3D mesh file (RVT, IFC, DWG, glTF, GLB, OBJ, DAE, 3DS, FBX, LWO, STL, PLY, USD)' })}
+            aria-label={t('bim.upload_dropzone_aria_mesh', { defaultValue: 'Upload a BIM model, drawing or 3D mesh file' })}
+            /* The label names the action; the badge row below supplies the
+               formats as a description, so focusing the drop zone announces the
+               generated list instead of a hand-typed one that goes stale. The
+               row is absent once a file is picked and the description then
+               resolves to nothing, which is correct: the list has stopped
+               being the useful thing to say. */
+            aria-describedby="bim-upload-formats-list"
             onKeyDown={(e) => {
               if (e.key === 'Enter' || e.key === ' ') {
                 e.preventDefault();
@@ -844,19 +912,51 @@ function UploadPanel({
               <>
                 <div className="w-12 h-12 rounded-xl bg-surface-secondary border border-border-light flex items-center justify-center"><FileUp size={22} className="text-content-quaternary" /></div>
                 <p className="text-sm font-medium text-content-primary">{t('bim.upload_drop_here')}</p>
+                {/* This names two of the fifteen formats directly above the row
+                    that lists all of them, so the enumeration is redundant.
+
+                    14 of the 29 locales also carry a "max 500 MB" here that
+                    English lost. That number is false on this input: the model
+                    upload calls stream_upload_to_temp() with no max_bytes and
+                    the helper defaults to None, so there is no application
+                    cap on it at all. The 500 MB is MAX_BIM_GEOMETRY_BYTES,
+                    which bounds the geometry slot of the advanced two-slot
+                    upload, not this one.
+
+                    The size claim is being dropped from those 14 locales
+                    rather than corrected. Do not replace it with "no limit":
+                    nobody has checked whether the proxy or the ASGI layer caps
+                    the request body, and swapping a false limit for a false
+                    absence of one is not an improvement. */}
                 <p className="text-[10px] text-content-quaternary">{t('bim.upload_size_hint')}</p>
-                <div className="flex flex-wrap items-center justify-center gap-1.5 mt-1">
-                  <span className="text-[9px] font-mono px-1 py-0.5 rounded bg-oe-blue/10 text-oe-blue border border-oe-blue/20">.rvt</span>
-                  <span className="text-[9px] font-mono px-1 py-0.5 rounded bg-oe-blue/10 text-oe-blue border border-oe-blue/20">.ifc</span>
-                  <span className="text-[9px] font-mono px-1 py-0.5 rounded bg-oe-blue/10 text-oe-blue border border-oe-blue/20">.dwg</span>
-                  <span className="text-[9px] font-mono px-1 py-0.5 rounded bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border border-emerald-500/20">.glb</span>
-                  <span className="text-[9px] font-mono px-1 py-0.5 rounded bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border border-emerald-500/20">.obj</span>
-                  <span className="text-[9px] font-mono px-1 py-0.5 rounded bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border border-emerald-500/20">.stl</span>
-                  <span className="text-[9px] font-mono px-1 py-0.5 rounded bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border border-emerald-500/20">{t('bim.mesh_import.more_formats', { defaultValue: '+ more' })}</span>
+                {/* Every accepted extension, not a sample. The row this
+                    replaced showed six of fifteen and hid the rest behind a
+                    "+ more" span with no handler, which read as a control and
+                    answered nothing. */}
+                <div id="bim-upload-formats-list" data-testid="bim-upload-formats" className="flex flex-wrap items-center justify-center gap-1.5 mt-1">
+                  {UPLOAD_FORMATS.map((fmt) => (
+                    /* The trailing space is a real text node and it is load
+                       bearing. CSS gap separates the badges visually but does
+                       not reach the accessible description, so without it the
+                       whole row is announced as one run-on token. */
+                    <Fragment key={fmt.ext}>
+                      <span
+                        className={`text-[9px] font-mono px-1 py-0.5 rounded border ${TIER_BADGE_CLASS[fmt.tier]}`}
+                      >
+                        {fmt.ext}
+                      </span>{' '}
+                    </Fragment>
+                  ))}
                 </div>
+                <p className="text-[10px] text-content-quaternary leading-relaxed max-w-[17rem]">
+                  {t('bim.upload_format_note', {
+                    defaultValue:
+                      'IFC and RVT import with full properties, quantities and classifications. Mesh formats (glTF, OBJ, STL, DAE, FBX, PLY, 3DS) are geometry only - view and measure, no BIM data.',
+                  })}
+                </p>
               </>
             )}
-            <input id="bim-upload-file-input" ref={fileInputRef} type="file" accept={`.rvt,.ifc,.dwg,.dxf,${MESH_IMPORT_ACCEPT}`} className="hidden" onChange={(e) => { const f = e.target.files?.[0]; if (f) handleFileSelect(f); }} />
+            <input id="bim-upload-file-input" ref={fileInputRef} type="file" accept={UPLOAD_ACCEPT} className="hidden" onChange={(e) => { const f = e.target.files?.[0]; if (f) handleFileSelect(f); }} />
           </label>
         ) : (
           <div className="grid grid-cols-2 gap-3">
@@ -865,14 +965,14 @@ function UploadPanel({
               <span className="text-[11px] font-medium text-content-primary">{t('bim.upload_advanced_element_data')}</span>
               <span className="text-[9px] text-content-quaternary">{t('bim.upload_advanced_element_data_hint')}</span>
               {dataFile && <Badge variant="blue" size="sm">{dataFile.name}</Badge>}
-              <input ref={dataInputRef} type="file" accept=".csv,.xlsx,.xls" className="hidden" onChange={(e) => { setDataFile(e.target.files?.[0] ?? null); if (e.target.files?.[0] && !modelName) setModelName(e.target.files[0].name.replace(/\.\w+$/, '')); }} />
+              <input ref={dataInputRef} type="file" accept={DATA_ACCEPT} className="hidden" onChange={(e) => { setDataFile(e.target.files?.[0] ?? null); if (e.target.files?.[0] && !modelName) setModelName(e.target.files[0].name.replace(/\.\w+$/, '')); }} />
             </label>
             <label className="flex flex-col items-center gap-2 border-2 border-dashed border-border-medium rounded-xl p-4 text-center cursor-pointer hover:border-oe-blue/50 hover:bg-surface-secondary transition-all">
               <FileBox size={20} className="text-content-quaternary" />
               <span className="text-[11px] font-medium text-content-primary">{t('bim.upload_advanced_geometry')}</span>
               <span className="text-[9px] text-content-quaternary">{t('bim.upload_advanced_geometry_hint')}</span>
               {geometryFile && <Badge variant="blue" size="sm">{geometryFile.name}</Badge>}
-              <input ref={geoInputRef} type="file" accept={MESH_IMPORT_ACCEPT} className="hidden" onChange={(e) => {
+              <input ref={geoInputRef} type="file" accept={MESH_ACCEPT} className="hidden" onChange={(e) => {
                 const f = e.target.files?.[0] ?? null;
                 // .dae/.glb/.gltf are accepted raw by the backend as an
                 // accompanying geometry file (existing advanced workflow).
@@ -889,6 +989,31 @@ function UploadPanel({
             </label>
           </div>
         )}
+
+        {/* Second way in: a model already filed in this project's Files area.
+            Sits OUTSIDE the drop-zone <label> on purpose - a button nested in
+            that label would also trigger the hidden file input. The local
+            upload above is untouched; this only spares the user from hunting
+            down a file the project already holds. */}
+        <button
+          type="button"
+          onClick={() => setShowProjectFilePicker(true)}
+          disabled={!projectId}
+          data-testid="bim-open-from-project-files"
+          className="inline-flex w-full items-center justify-center gap-1.5 rounded-lg border border-border-medium bg-surface-primary px-3 py-2 text-xs font-semibold text-content-secondary transition-colors hover:border-oe-blue/40 hover:text-oe-blue disabled:cursor-not-allowed disabled:opacity-50"
+        >
+          <FolderOpen size={14} />
+          {t('project_files.open_from_project', { defaultValue: 'Open from project files' })}
+        </button>
+
+        <ProjectFilePicker
+          open={showProjectFilePicker}
+          onClose={() => setShowProjectFilePicker(false)}
+          projectId={projectId}
+          accepted={BIM_VIEWER_FORMATS}
+          onPick={handlePickProjectFile}
+          busyId={pickingFileId}
+        />
 
         <div>
           <label className="block text-[10px] font-semibold text-content-tertiary mb-1.5 uppercase tracking-wider">{t('bim.upload_model_name_label')}</label>
@@ -1529,7 +1654,12 @@ function LandingPage({ projectId, onUploadComplete: _onUploadComplete, breadcrum
             <div className="flex flex-col">
               <div className="rounded-2xl bg-white dark:bg-gray-800/60 border border-border-light shadow-lg shadow-black/5 dark:shadow-black/20 p-6 flex flex-col h-full">
                 <label
-                  aria-label={t('bim.landing_dropzone_aria', { defaultValue: 'Drop a BIM model file here or click to browse. Supported formats: .rvt, .ifc, .csv, .xlsx' })}
+                  aria-label={t('bim.landing_dropzone_aria', { defaultValue: 'Drop a BIM model, drawing or 3D mesh file here, or click to browse' })}
+                  /* Same arrangement as the modal drop zone: semantic name,
+                     formats supplied by the badge row as a description. The
+                     old label promised CSV and Excel to a screen reader on the
+                     one element whose handler rejects both. */
+                  aria-describedby="bim-landing-formats-list"
                   onDrop={(e) => {
                     e.preventDefault();
                     const f = e.dataTransfer.files?.[0];
@@ -1569,18 +1699,49 @@ function LandingPage({ projectId, onUploadComplete: _onUploadComplete, breadcrum
                       </div>
                       <div>
                         <p className="text-sm font-semibold text-content-primary">{t('bim.landing_drop_here')}</p>
-                        <p className="text-xs text-content-tertiary mt-1">{t('bim.landing_size_hint')}</p>
+                        {/* bim.landing_size_hint used to sit here reading
+                            "IFC, RVT, CSV, or Excel". Removed rather than
+                            reworded: it was a partial list directly above the
+                            badge row below, which lists all fifteen from the
+                            shared source, and two of the four things it named
+                            were not accepted by this input at all. CSV and
+                            Excel belong to the advanced two-slot data picker. */}
                       </div>
-                      <div className="flex items-center gap-2">
-                        <span className="text-[10px] font-mono px-2 py-1 rounded-md bg-oe-blue/8 text-oe-blue border border-oe-blue/15 font-semibold">.rvt</span>
-                        <span className="text-[10px] font-mono px-2 py-1 rounded-md bg-oe-blue/8 text-oe-blue border border-oe-blue/15 font-semibold">.ifc</span>
+                      {/* Same list as the modal row, same source. This one
+                          showed four of fifteen. */}
+                      <div id="bim-landing-formats-list" data-testid="bim-landing-formats" className="flex flex-wrap items-center justify-center gap-2">
+                        {UPLOAD_FORMATS.map((fmt) => (
+                          /* Trailing space is a text node, not decoration:
+                             the accessible description joins text content and
+                             ignores CSS gap. See the modal row. */
+                          <Fragment key={fmt.ext}>
+                            <span
+                              className={`text-[10px] font-mono px-2 py-1 rounded-md border font-semibold ${TIER_BADGE_CLASS[fmt.tier]}`}
+                            >
+                              {fmt.ext}
+                            </span>{' '}
+                          </Fragment>
+                        ))}
                       </div>
+                      {/* Was literal JSX with no t() at all, so this line
+                          shipped English to all 29 locales. The whole sentence
+                          is one value rather than assembled from fragments:
+                          the version numbers stay put but the separator and
+                          the order around them are a translator's call. */}
                       <p className="text-[10px] text-content-quaternary leading-relaxed mt-1 text-center">
-                        RVT 2015–2026 &middot; IFC 2x3, 4.0, 4.1, 4.3
+                        {t('bim.landing_version_note', {
+                          defaultValue: 'RVT 2015–2026 · IFC 2x3, 4.0, 4.1, 4.3',
+                        })}
+                      </p>
+                      <p className="text-[10px] text-content-quaternary leading-relaxed max-w-[20rem] text-center">
+                        {t('bim.upload_format_note', {
+                          defaultValue:
+                            'IFC and RVT import with full properties, quantities and classifications. Mesh formats (glTF, OBJ, STL, DAE, FBX, PLY, 3DS) are geometry only - view and measure, no BIM data.',
+                        })}
                       </p>
                     </>
                   )}
-                  <input ref={fileInputRef} type="file" accept={`.rvt,.ifc,.dwg,.dxf,${MESH_IMPORT_ACCEPT}`} className="hidden" onChange={(e) => { const f = e.target.files?.[0]; if (!f) return; if (DWG_EXTENSIONS.has(getFileExtension(f.name))) { handleLandingDwg(f); return; } if (isMeshImportFile(f.name)) { setMeshImportFile(f); if (!modelName) setModelName(f.name.replace(/\.[^.]+$/, '')); return; } setFile(f); if (!modelName) setModelName(f.name.replace(/\.[^.]+$/, '')); }} />
+                  <input ref={fileInputRef} type="file" accept={UPLOAD_ACCEPT} className="hidden" onChange={(e) => { const f = e.target.files?.[0]; if (!f) return; if (DWG_EXTENSIONS.has(getFileExtension(f.name))) { handleLandingDwg(f); return; } if (isMeshImportFile(f.name)) { setMeshImportFile(f); if (!modelName) setModelName(f.name.replace(/\.[^.]+$/, '')); return; } setFile(f); if (!modelName) setModelName(f.name.replace(/\.[^.]+$/, '')); }} />
                 </label>
                 {file && (
                   <div className="mt-4 space-y-3">
@@ -1672,7 +1833,21 @@ function LandingPage({ projectId, onUploadComplete: _onUploadComplete, breadcrum
                   {t('bim.landing_hero_subtitle')}
                 </p>
                 <p className="text-xs text-content-tertiary mt-3 leading-relaxed">
-                  {t('bim.landing_formats_detailed', { defaultValue: 'RVT 2015\u20132026 (.rvt) \u00B7 IFC 2x3, 4.0, 4.1, 4.3 (.ifc) \u00B7 CSV \u00B7 Excel. DWG \u2192 DWG Takeoff.' })}
+                  {/* Deliberately plain ASCII, and deliberately by category.
+                      The old text named neither of the two mesh tiers, which is
+                      the omission the user reported, and spelling out seven of
+                      the eleven mesh formats would just be the same defect in a
+                      new place. The four clauses map to the four tiers in
+                      uploadFormats.ts, so this stays true when a format is
+                      added.
+
+                      The escapes it used to carry were doubled in the locale
+                      files, so 25 of 29 rendered a literal backslash-u-2013
+                      rather than a dash. Keeping this line free of dashes,
+                      middle dots and arrows means there is nothing left to
+                      double. Version specifics are not lost:
+                      bim.landing_version_note carries them on the same screen. */}
+                  {t('bim.landing_formats_detailed', { defaultValue: 'RVT and IFC models, 3D mesh formats, and element data as CSV or Excel. DWG and DXF drawings are routed to DWG Takeoff.' })}
                 </p>
                 <div className="mt-4 flex items-center justify-start">
                   <div className="inline-flex flex-wrap items-center gap-2 px-4 py-2 rounded-full bg-emerald-500/10 border border-emerald-500/20">
@@ -3744,7 +3919,8 @@ export function BIMPage() {
         }
         links={[
           { label: t('bim.intro_link_boq', { defaultValue: 'Open BOQ' }), onClick: () => navigate('/boq') },
-          { label: t('bim.intro_link_explorer', { defaultValue: 'Data Explorer' }), onClick: () => navigate('/data-explorer') },
+          // #149 - name the destination the way the destination names itself.
+          { label: t('nav.cad_bim_explorer', { defaultValue: 'CAD-BIM BI Explorer' }), onClick: () => navigate('/data-explorer') },
           { label: t('bim.intro_link_rules', { defaultValue: 'Quantity rules' }), onClick: () => navigate('/bim/rules') },
         ]}
       >

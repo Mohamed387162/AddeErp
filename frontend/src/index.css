@@ -44,6 +44,24 @@
      hex values above/below. */
   --oe-blue-ch: 0 113 227;
 
+  /* Purple — the status palette ran out of hues before it ran out of states.
+     Seven invoice states share five badge variants, and the pair that had to
+     come apart is approved (blue) against sent: on the finance list they sit
+     in the same column, one row apart, and one colour for both reads as one
+     state. Blue keeps approved, which has the longer history in the UI.
+     Deliberately purple rather than the existing semantic-info cyan, which is
+     close enough to brand blue that the split would not survive a glance.
+     Measured against the surfaces it lands on:
+       Light  #6b21a8 -> 8.72:1 on #fff, 8.13:1 on the #faf5ff pill
+     Note that hue is a weak channel on its own: purple sits next to blue for
+     a red-blind reader, so the badge label stays the thing that carries the
+     meaning and this is the second cue, not the only one. */
+  --oe-purple: #9333ea;
+  --oe-purple-subtle: #faf5ff;
+  --oe-purple-text: #6b21a8;
+  /* Channel triplet for alpha modifiers - see the blue comment above. */
+  --oe-purple-ch: 147 51 234;
+
   /* Surfaces */
   --oe-bg: #ffffff;
   --oe-bg-secondary: #f5f5f7;
@@ -189,6 +207,17 @@
   --oe-blue-text: #93c5fd;
   /* Channel triplet - see the light-mode comment. Keep in sync. */
   --oe-blue-ch: 59 130 246;
+
+  /* Purple — see the light-mode comment for why this family exists. Same
+     shape as the blue pair: the tint becomes a translucent wash so it lifts
+     with whatever surface it sits on, and the text goes brighter so one class
+     clears AA in both themes. Worst case is the elevated surface:
+       Dark   #d8b4fe -> 9.03:1 on #1e2130, 7.58:1 on the flattened pill */
+  --oe-purple: #a855f7;
+  --oe-purple-subtle: rgba(168, 85, 247, 0.15);
+  --oe-purple-text: #d8b4fe;
+  /* Channel triplet - see the light-mode comment. Keep in sync. */
+  --oe-purple-ch: 168 85 247;
 
   /* Surfaces — deep blue-gray palette */
   --oe-bg: #0f1117;
@@ -603,6 +632,19 @@ h4 {
   flex: 1 1 auto;
 }
 
+/* ── Visible inline-edit affordance ─────────────────────────────────────
+   Entering cell-edit mode must be unmistakable: without this, an inline
+   editor opened by a stray click is indistinguishable from a selected
+   cell, and typing silently rewrites the value (an Ordnungszahl was once
+   overwritten exactly this way). The editing cell gets a solid accent
+   outline and a shadow so "you are now editing" is visible at a glance. */
+.ag-theme-quartz .ag-cell.ag-cell-inline-editing {
+  outline: 2px solid var(--oe-blue);
+  outline-offset: -2px;
+  border-radius: 4px;
+  box-shadow: 0 1px 6px rgb(0 0 0 / 0.18);
+}
+
 /* ── AG Grid drag handle column ───────────────────────────────────────── */
 
 .oe-drag-handle-cell {
@@ -738,6 +780,26 @@ h4 {
 
 .dark .ag-theme-quartz .ag-row.boq-row-variant-default {
   box-shadow: inset 4px 0 0 var(--color-amber-400, #fbbf24);
+}
+
+/* ── Dark mode base palette for ag-theme-quartz ──────────────────────
+   The BOQ grid uses ag-theme-quartz (not ag-theme-alpine), but only the
+   row-state accents above were dark-scoped for quartz. Without a base
+   palette override, quartz falls back to its built-in light theme under
+   .dark, leaving a white grid with near-black text. Mirrors the
+   .dark .ag-theme-alpine block above using the same --oe-* tokens so
+   both themes look identical in dark mode. */
+.dark .ag-theme-quartz {
+  --ag-background-color: var(--oe-bg);
+  --ag-header-background-color: var(--oe-bg-tertiary);
+  --ag-header-foreground-color: var(--oe-text-secondary);
+  --ag-foreground-color: var(--oe-text-primary);
+  --ag-border-color: var(--oe-border-light);
+  --ag-row-border-color: var(--oe-border-light);
+  --ag-secondary-foreground-color: var(--oe-text-secondary);
+  --ag-selected-row-background-color: var(--oe-blue-subtle);
+  --ag-odd-row-background-color: var(--oe-bg-secondary);
+  --ag-range-selection-background-color: rgba(59, 130, 246, 0.1);
 }
 
 /* ── Premium Visual Polish ──────────────────────────────────────────── */
@@ -1603,4 +1665,23 @@ html.oe-nav-pending body {
 }
 @keyframes oe-nav-spin {
   to { transform: rotate(360deg); }
+}
+
+/* ── Takeoff toolbar: collapse labels by the TOOLBAR's own width (#368) ──
+   The two-row takeoff toolbar shares its flex row with the w-72 properties
+   panel, so opening the panel narrows the toolbar even though the viewport
+   width is unchanged. A viewport media query (Tailwind's `sm:`) therefore
+   cannot tell the row is about to wrap. A container query on the toolbar's
+   own inline size can: the button labels drop to icons only once the
+   toolbar itself is too narrow to keep row 1 on a single line. */
+.takeoff-toolbar {
+  container-type: inline-size;
+}
+.takeoff-toolbar-label {
+  display: inline;
+}
+@container (max-width: 1024px) {
+  .takeoff-toolbar-label {
+    display: none;
+  }
 }

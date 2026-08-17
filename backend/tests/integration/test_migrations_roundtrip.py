@@ -50,6 +50,7 @@ Runtime: ~5-15 s per parametrized rev on a warm interpreter. Tier
 
 from __future__ import annotations
 
+import ast
 import os
 import uuid
 from collections.abc import Iterator
@@ -60,7 +61,7 @@ import pytest
 from alembic import command
 from alembic.config import Config
 from alembic.script import ScriptDirectory
-from sqlalchemy import create_engine, inspect
+from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.engine import make_url
 
 # Project paths — anchored to this file so the tests work regardless
@@ -69,9 +70,10 @@ THIS_FILE = Path(__file__).resolve()
 BACKEND_DIR = THIS_FILE.parent.parent.parent
 ALEMBIC_INI = BACKEND_DIR / "alembic.ini"
 
-# Recent revisions we want to exercise (the v250+ wave).
-# Listed newest-first so the most recent failures surface first.
-RECENT_REVISIONS: list[str] = [
+# Older revisions we keep exercising by name. These are not the newest any
+# more; they are here because each one once broke and the coverage is worth
+# keeping regardless of how far behind head it falls.
+LEGACY_REVISIONS: list[str] = [
     "v3151_cost_spine",
     "v290_dashboards_presets",
     "v280_4d_schedule_eac",
@@ -83,6 +85,103 @@ RECENT_REVISIONS: list[str] = [
     "v260_eac_v2_core",
     "v250_dashboards_snapshot",
 ]
+
+# How many revisions back from head to always round-trip.
+NEWEST_REVISION_WINDOW = 14
+
+
+def _revision_graph() -> dict[str, tuple[str, ...]]:
+    """Map every revision id to its parents, read from the files as text.
+
+    Deliberately not ``ScriptDirectory.walk_revisions``. That imports each
+    migration module, and ``v3121_geo_raster_overlay`` imports ``app.database``
+    at module level, which refuses to load without a PostgreSQL ``DATABASE_URL``.
+    Using it here would make merely collecting this file depend on a running
+    database. Parsing the headers keeps collection free of that.
+    """
+    graph: dict[str, tuple[str, ...]] = {}
+    for path in sorted((BACKEND_DIR / "alembic" / "versions").glob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        found: dict[str, object] = {}
+        for node in tree.body:
+            if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+                target, value = node.target.id, node.value
+            elif isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+                target, value = node.targets[0].id, node.value
+            else:
+                continue
+            if target not in ("revision", "down_revision") or value is None:
+                continue
+            try:
+                found[target] = ast.literal_eval(value)
+            except ValueError:  # computed, not a literal - nothing to read
+                continue
+        rev = found.get("revision")
+        if not isinstance(rev, str):
+            continue
+        down = found.get("down_revision")
+        if isinstance(down, str):
+            graph[rev] = (down,)
+        elif isinstance(down, (tuple, list)):
+            graph[rev] = tuple(str(d) for d in down)
+        else:
+            graph[rev] = ()
+    return graph
+
+
+_SCHEMA_OP_PREFIXES = ("add_", "alter_", "create_", "drop_", "rename_")
+
+
+def _changes_schema(source: str, func_name: str) -> bool:
+    """True if ``func_name`` in ``source`` calls an Alembic op that alters schema.
+
+    ``op.get_bind`` and ``op.get_context`` are how a data migration reaches the
+    connection, so their presence is not evidence of a schema change.
+    """
+    for node in ast.walk(ast.parse(source)):
+        if not isinstance(node, ast.FunctionDef) or node.name != func_name:
+            continue
+        for inner in ast.walk(node):
+            if isinstance(inner, ast.Attribute):
+                if inner.attr == "batch_alter_table" or inner.attr.startswith(_SCHEMA_OP_PREFIXES):
+                    return True
+    return False
+
+
+def _newest_revisions(count: int) -> list[str]:
+    """Return the newest ``count`` revision ids, walking down from the heads.
+
+    Derived rather than typed. This list used to be written by hand and it
+    stopped being updated: its newest entry was ``v3272`` while eight later
+    migrations sat on disk, so the suite was green having never executed a
+    single downgrade shipped in that release. A gate whose coverage is a
+    literal only covers what somebody remembered to add to the literal, and
+    the thing most likely to be forgotten is the migration written today,
+    which is also the one most likely to be wrong.
+
+    Walking the graph instead means a new revision is under test the moment
+    it lands. A revision that genuinely cannot round-trip belongs in
+    ``PG_DOWNGRADE_BROKEN_REVS`` with its reason, not outside the window.
+    """
+    graph = _revision_graph()
+    parents = {parent for parents in graph.values() for parent in parents}
+    frontier = sorted(rev for rev in graph if rev not in parents)
+
+    newest: list[str] = []
+    seen: set[str] = set()
+    while frontier and len(newest) < count:
+        rev = frontier.pop(0)
+        if rev in seen or rev not in graph:
+            continue
+        seen.add(rev)
+        newest.append(rev)
+        frontier.extend(graph[rev])
+    return newest
+
+
+# Newest-first, so the most recent failures surface first.
+_NEWEST = _newest_revisions(NEWEST_REVISION_WINDOW)
+RECENT_REVISIONS: list[str] = _NEWEST + [rev for rev in LEGACY_REVISIONS if rev not in set(_NEWEST)]
 
 # Revisions whose ``upgrade()`` and ``downgrade()`` are intentionally
 # both ``pass`` (typically alembic-generated merge nodes). They round-
@@ -98,6 +197,16 @@ NOOP_BOTH_REVS: set[str] = {
 #   "revision_id": "one-line reason"
 PG_DOWNGRADE_BROKEN_REVS: dict[str, str] = {
     # Example: "v999_example": "downgrade drops a PG-only ENUM that upgrade doesn't recreate"
+    "v260_eac_v2_core": (
+        "isolation artefact, not a broken downgrade. The cycle above stamps R and runs R's own "
+        "downgrade against a schema that is still at head, so this one tries to drop oe_eac_rule "
+        "while oe_eac_block_graph - created much later, by v3259 - still holds "
+        "fk_oe_eac_block_graph_rule_id_oe_eac_rule against it. A real head-to-v250 downgrade runs "
+        "v3259's downgrade first and frees the parent, so this body is correct in the chain it "
+        "actually runs in. Any revision whose downgrade drops a table a LATER migration references "
+        "will fail here the same way; that is the class, and telling it apart from a genuine "
+        "missing drop means asking which revision owns the dependent object, not reading the error."
+    ),
 }
 
 
@@ -463,6 +572,7 @@ def test_recent_migrations_have_real_downgrade_bodies() -> None:
     """
     versions_dir = BACKEND_DIR / "alembic" / "versions"
     bad: list[str] = []
+    skipped_data_only: list[str] = []
     for revision in RECENT_REVISIONS:
         if revision in NOOP_BOTH_REVS:
             continue
@@ -475,6 +585,19 @@ def test_recent_migrations_have_real_downgrade_bodies() -> None:
         candidates = [p for p in versions_dir.glob("*.py") if marker in p.read_text(encoding="utf-8")]
         assert candidates, f"Couldn't locate migration file for {revision}"
         src = candidates[0].read_text(encoding="utf-8")
+
+        # A migration that never touched the schema has nothing to reverse, and
+        # demanding a schema call in its downgrade() would be asking it to undo
+        # work it did not do. v3269, v3271 and v3273 are backfills: their only
+        # use of ``op`` is ``op.get_bind()`` to run data statements, and each
+        # documents its downgrade as a deliberate no-op. Deciding this from the
+        # upgrade body rather than from a list of exempt revision ids means a
+        # future backfill is judged correctly without anyone registering it,
+        # and a migration that does add a column is still held to the rule.
+        if not _changes_schema(src, "upgrade"):
+            skipped_data_only.append(revision)
+            continue
+
         _, _, after = src.partition("def downgrade()")
         if not after:
             bad.append(f"{revision}: no downgrade() function at all")
@@ -493,6 +616,9 @@ def test_recent_migrations_have_real_downgrade_bodies() -> None:
         if "op." not in meaningful and "batch_alter_table" not in meaningful:
             bad.append(f"{revision}: downgrade() has no schema-mutating call")
 
+    # Say what was not checked. An exemption nobody can see is the same shape
+    # of blind spot as the short revision list this guard used to run against.
+    print(f"data-only migrations exempt from the downgrade rule: {', '.join(skipped_data_only) or 'none'}")
     assert not bad, "Migrations with non-functional downgrade():\n  " + "\n  ".join(bad)
 
 
@@ -511,3 +637,290 @@ def test_dev_db_is_not_being_targeted(pg_throwaway: str) -> None:
     assert "oe_mig_rt_" in active_url, (
         f"Expected DATABASE_SYNC_URL to contain the throwaway DB name prefix 'oe_mig_rt_', got: {active_url!r}"
     )
+
+
+# ─────────────────────────────────────────────────────────────────────
+#  Data migrations
+#
+#  A data migration cannot be checked the way the schema ones above are.
+#  create_all builds the catalogue table empty and the seed catalogue in
+#  the source tree already carries the post-rename names, so running
+#  v3271 against a fresh test database updates zero rows and passes
+#  without executing a single branch. The rows it exists to repair only
+#  occur on a database seeded before the rename, so the test has to write
+#  that state itself.
+# ─────────────────────────────────────────────────────────────────────
+
+_SYSTEM_TABLE = "oe_formwork_system"
+
+_INSERT_SYSTEM = text(
+    f"""
+    INSERT INTO {_SYSTEM_TABLE}
+        (id, created_at, updated_at, name, system_type, supplier, material,
+         reuses_max, unit_rate, erect_strike_rate, strip_time_days, currency)
+    VALUES
+        (:id, now(), now(), :name, 'wall', :supplier, 'steel',
+         100, 65.00, 16.00, 1, '')
+    """  # noqa: S608 - table name is a module constant, not user input
+)
+
+
+def _run_revision_upgrade(sync_url: str, revision: str) -> None:
+    """Execute one revision's ``upgrade()`` body against ``sync_url``.
+
+    Not ``command.upgrade``: the database is stamped at head, so alembic
+    would consider this revision already applied and do nothing. Binding
+    the body to a connection runs the code under test directly.
+    """
+    from alembic.migration import MigrationContext
+    from alembic.operations import Operations
+
+    cfg = _make_alembic_config(sync_url)
+    module = ScriptDirectory.from_config(cfg).get_revision(revision).module
+
+    engine = create_engine(sync_url)
+    try:
+        with engine.begin() as conn:
+            context = MigrationContext.configure(conn)
+            with Operations.context(context):
+                module.upgrade()
+    finally:
+        engine.dispose()
+
+
+def _systems_by_id(sync_url: str) -> dict[str, tuple[str, str | None]]:
+    """Return ``{id: (name, supplier)}`` for every catalogue row."""
+    engine = create_engine(sync_url)
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(
+                text(f"SELECT id, name, supplier FROM {_SYSTEM_TABLE}")  # noqa: S608
+            ).all()
+    finally:
+        engine.dispose()
+    return {str(row[0]): (row[1], row[2]) for row in rows}
+
+
+def test_v3271_renames_only_the_rows_it_should(pg_throwaway: str) -> None:
+    """v3271 renames trademarked catalogue rows without touching tenant edits.
+
+    Five rows covering every branch the revision has:
+
+    * a plain trademarked row, which must be renamed and lose its supplier;
+    * the one pair carrying a non-ASCII character, which must move too - if
+      the literal in the migration ever stops byte-matching the column, this
+      is the row that catches it;
+    * a trademarked row whose supplier the tenant repointed at their own hire
+      yard, where the name must move and that supplier value must survive;
+    * a trademarked row whose replacement name is already present, which the
+      duplicate guard must leave alone;
+    * a row the tenant renamed themselves, which must not be touched at all
+      even though its supplier still reads as a brand.
+    """
+    cfg = _make_alembic_config(pg_throwaway)
+    _create_all_then_stamp(pg_throwaway, cfg)
+
+    plain = str(uuid.uuid4())
+    non_ascii = str(uuid.uuid4())
+    tenant_supplier = str(uuid.uuid4())
+    would_duplicate = str(uuid.uuid4())
+    already_present = str(uuid.uuid4())
+    tenant_renamed = str(uuid.uuid4())
+
+    seeded = [
+        {"id": plain, "name": "Doka Framax Xlife", "supplier": "Doka"},
+        {"id": non_ascii, "name": "Hünnebeck MANTO", "supplier": "Hünnebeck"},
+        {"id": tenant_supplier, "name": "PERI MAXIMO", "supplier": "Central hire yard"},
+        {"id": would_duplicate, "name": "Doka Dokadek 30", "supplier": "Doka"},
+        {"id": already_present, "name": "Aluminium slab deck panel", "supplier": None},
+        {"id": tenant_renamed, "name": "Site-built wall shutter", "supplier": "Doka"},
+    ]
+    engine = create_engine(pg_throwaway)
+    try:
+        with engine.begin() as conn:
+            for row in seeded:
+                conn.execute(_INSERT_SYSTEM, row)
+    finally:
+        engine.dispose()
+
+    _run_revision_upgrade(pg_throwaway, "v3271_formwork_debrand")
+    after = _systems_by_id(pg_throwaway)
+
+    assert after[plain] == ("Steel framed wall panel", None)
+    assert after[non_ascii] == ("Crane-set steel wall panel", None), (
+        "the non-ASCII pair did not move - the literal no longer matches the column"
+    )
+    assert after[tenant_supplier] == (
+        "Steel wall panel, single-side tie",
+        "Central hire yard",
+    ), "a supplier the tenant set themselves was cleared"
+    assert after[would_duplicate] == ("Doka Dokadek 30", "Doka"), (
+        "renamed onto a name already present for this tenant, creating a duplicate"
+    )
+    assert after[already_present] == ("Aluminium slab deck panel", None)
+    assert after[tenant_renamed] == ("Site-built wall shutter", "Doka"), "a row the tenant renamed was rewritten"
+
+    # Idempotent: a second run must be a no-op, including for the row the
+    # duplicate guard declined to touch.
+    _run_revision_upgrade(pg_throwaway, "v3271_formwork_debrand")
+    assert _systems_by_id(pg_throwaway) == after
+
+
+def test_v3271_lands_an_upgraded_install_on_the_shipped_catalogue(pg_throwaway: str) -> None:
+    """An upgraded install ends up with the names a fresh install has.
+
+    This test cannot check the *old* names and does not try to. It seeds from
+    ``_RENAMES``, so a mistyped old-name literal would be inserted mistyped,
+    found renamed, and passed - measured, that exact mutation went green here
+    while ``test_v3271_renames_only_the_rows_it_should`` caught it, because
+    that one spells the trademarked names out independently of the migration.
+    Drift in the old names is its job, not this one's.
+
+    What this test owns is the other half: the migration and the shipped
+    catalogue must agree on where the rows land. ``default_seed_systems()`` is
+    the denominator, so re-wording a catalogue row without updating the
+    revision fails here rather than leaving upgraded and fresh installs with
+    two different names for the same system.
+    """
+    cfg = _make_alembic_config(pg_throwaway)
+    _create_all_then_stamp(pg_throwaway, cfg)
+
+    module = ScriptDirectory.from_config(cfg).get_revision("v3271_formwork_debrand").module
+    renames = module._RENAMES  # noqa: SLF001 - the mapping is the thing under test
+
+    from app.modules.formwork.schemas import default_seed_systems
+
+    catalogue = {row["name"] for row in default_seed_systems()}
+    written = {new_name for _old, _supplier, new_name in renames}
+    assert written <= catalogue, (
+        f"revision renames rows to names a fresh install does not have: {sorted(written - catalogue)}"
+    )
+    assert len(renames) == 8, f"expected eight renamed rows, mapping carries {len(renames)}"
+
+    engine = create_engine(pg_throwaway)
+    try:
+        with engine.begin() as conn:
+            for old_name, old_supplier, _new_name in renames:
+                conn.execute(
+                    _INSERT_SYSTEM,
+                    {"id": str(uuid.uuid4()), "name": old_name, "supplier": old_supplier},
+                )
+    finally:
+        engine.dispose()
+
+    _run_revision_upgrade(pg_throwaway, "v3271_formwork_debrand")
+
+    after = _systems_by_id(pg_throwaway)
+    surviving = {name for name, _supplier in after.values()}
+    assert surviving <= catalogue, f"rows left carrying a name no fresh install has: {sorted(surviving - catalogue)}"
+
+    suppliers = {supplier for _name, supplier in after.values()}
+    assert suppliers == {None}, f"brand suppliers still in the catalogue: {suppliers - {None}}"
+
+
+# ─────────────────────────────────────────────────────────────────────
+#  v3272 - the assignment -> schedule activity link
+# ─────────────────────────────────────────────────────────────────────
+
+_ASSIGNMENT_TABLE = "oe_resources_assignment"
+_ACTIVITY_FK = "fk_oe_resources_assignment_activity_id_oe_schedule_activity"
+
+
+def _activity_fk(sync_url: str) -> dict[str, object] | None:
+    """Reflect the assignment -> activity foreign key back, or None."""
+    engine = create_engine(sync_url)
+    try:
+        for fk in inspect(engine).get_foreign_keys(_ASSIGNMENT_TABLE):
+            if fk.get("name") == _ACTIVITY_FK:
+                return fk
+        return None
+    finally:
+        engine.dispose()
+
+
+def test_v3272_creates_the_activity_foreign_key(pg_throwaway: str) -> None:
+    """The FK is the migration's whole payload, and only this asserts it.
+
+    ``create_all`` already lays down ``activity_id`` and its index, because
+    the column is on the model. What it cannot lay down is the constraint:
+    the ORM deliberately carries no ``ForeignKey`` for it, so the resources
+    module still imports on an install where the schedule module is absent.
+    That leaves the migration as the only thing that ever creates it.
+
+    A migration that ran without raising is not a migration that created a
+    constraint. ``upgrade()`` returns early when the target table is missing
+    and swallows a refused ``create_foreign_key``, and both of those silent
+    paths look exactly like success from outside. Reflecting the constraint
+    back is what tells them apart.
+    """
+    cfg = _make_alembic_config(pg_throwaway)
+    _create_all_then_stamp(pg_throwaway, cfg)
+
+    # Negative control. Without it this test cannot tell the migration's work
+    # from what the model had already produced.
+    assert _activity_fk(pg_throwaway) is None, "create_all already made the FK - this test would prove nothing"
+
+    _run_revision_upgrade(pg_throwaway, "v3272_assignment_activity_link")
+
+    fk = _activity_fk(pg_throwaway)
+    assert fk is not None, f"{_ACTIVITY_FK} absent after the revision ran"
+    assert fk["referred_table"] == "oe_schedule_activity"
+    assert fk["constrained_columns"] == ["activity_id"]
+    assert fk["referred_columns"] == ["id"]
+
+    # Deleting a Gantt bar must not take the booking history with it.
+    options = fk.get("options") or {}
+    assert isinstance(options, dict)
+    assert options.get("ondelete") == "SET NULL", f"expected SET NULL, reflected {options!r}"
+
+
+def test_v3272_upgrade_is_idempotent(pg_throwaway: str) -> None:
+    """Running it twice must not raise, and must leave one constraint.
+
+    Every guard in the body is an ``if not present`` check, so a second run
+    is the cheapest test of all of them at once.
+    """
+    cfg = _make_alembic_config(pg_throwaway)
+    _create_all_then_stamp(pg_throwaway, cfg)
+
+    _run_revision_upgrade(pg_throwaway, "v3272_assignment_activity_link")
+    _run_revision_upgrade(pg_throwaway, "v3272_assignment_activity_link")
+
+    engine = create_engine(pg_throwaway)
+    try:
+        fks = inspect(engine).get_foreign_keys(_ASSIGNMENT_TABLE)
+    finally:
+        engine.dispose()
+
+    assert [fk["name"] for fk in fks].count(_ACTIVITY_FK) == 1
+
+
+def test_v3272_rebuilds_a_column_the_constraint_still_fits(pg_throwaway: str) -> None:
+    """After a downgrade, the re-upgrade must rebuild the column at its own type.
+
+    The parametrized round-trip above compares column *names*, so a column
+    that comes back at the wrong type reads as unchanged. This revision was
+    first written declaring ``activity_id`` as native ``uuid``, copying the
+    idiom of the neighbouring v3014 columns; PostgreSQL then refused the
+    constraint against ``oe_schedule_activity.id``, which ``GUID`` makes
+    ``varchar(36)`` on every dialect. What proves the type is right is the
+    constraint standing after the cycle, not the column existing.
+    """
+    cfg = _make_alembic_config(pg_throwaway)
+    _create_all_then_stamp(pg_throwaway, cfg)
+
+    command.stamp(cfg, "v3272_assignment_activity_link")
+    command.downgrade(cfg, "v3271_formwork_debrand")
+    command.upgrade(cfg, "v3272_assignment_activity_link")
+
+    engine = create_engine(pg_throwaway)
+    try:
+        insp = inspect(engine)
+        column = next(c for c in insp.get_columns(_ASSIGNMENT_TABLE) if c["name"] == "activity_id")
+    finally:
+        engine.dispose()
+
+    assert "CHAR" in str(column["type"]).upper(), f"activity_id came back as {column['type']!r}"
+    fk = _activity_fk(pg_throwaway)
+    assert fk is not None, "the constraint did not survive a downgrade and re-upgrade"
+    assert (fk.get("options") or {}).get("ondelete") == "SET NULL"

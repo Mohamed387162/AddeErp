@@ -27,7 +27,7 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, Query, UploadFile, status
+from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, Query, Response, UploadFile, status
 from fastapi.responses import FileResponse
 
 from app.core.bulk_ops import BulkDeleteRequest
@@ -61,6 +61,8 @@ from app.modules.documents.schemas import (
     ShareLinkListItem,
     ShareLinkPublicInfo,
     ShareLinkResponse,
+    SheetCompletenessRequest,
+    SheetCompletenessResponse,
     SheetResponse,
     SheetUpdate,
     SheetVersionHistory,
@@ -572,6 +574,7 @@ async def list_recent_photos(
     session: SessionDep,
     user_id: CurrentUserId = None,  # type: ignore[assignment]
     limit: int = Query(default=12, ge=1, le=48),
+    project_id: uuid.UUID | None = Query(default=None),
     service: PhotoService = Depends(_get_photo_service),
 ) -> list[RecentPhotoResponse]:
     """Most recent photos across every project the caller can access.
@@ -582,11 +585,16 @@ async def list_recent_photos(
     documentation from a project the caller cannot open. Ordered newest
     first by ``taken_at`` with ``created_at`` as the null fallback.
 
+    ``project_id`` narrows the feed to one project, which is what the
+    dashboard passes when a project is selected. It intersects with the
+    accessible set in the service rather than replacing it, so it can only
+    ever return fewer rows than the unfiltered call, never different ones.
+
     Each item carries the project name (joined server-side) and a
     relative thumbnail URL matching the existing ``/photos/{id}/thumb/``
     route the gallery already loads through ``AuthImage``.
     """
-    rows = await service.recent_across_projects(user_id, limit=limit)
+    rows = await service.recent_across_projects(user_id, limit=limit, project_id=project_id)
     return [
         RecentPhotoResponse(
             id=photo.id,
@@ -896,6 +904,7 @@ def _sheet_to_response(sheet: object) -> SheetResponse:
 @router.get("/sheets/", response_model=list[SheetResponse])
 async def list_sheets(
     session: SessionDep,
+    response: Response,
     project_id: uuid.UUID = Query(...),
     discipline: str | None = Query(default=None),
     revision: str | None = Query(default=None),
@@ -906,9 +915,15 @@ async def list_sheets(
     user_id: CurrentUserId = None,  # type: ignore[assignment]
     service: SheetService = Depends(_get_sheet_service),
 ) -> list[SheetResponse]:
-    """List sheets for a project with optional filters."""
+    """List sheets for a project with optional filters.
+
+    The body stays a bare array, matching every other list in this module, and
+    the number of sheets the filters matched is returned in ``X-Total-Count``.
+    ``limit`` caps at 500 and the register asks for exactly that, so without the
+    count a truncated page and a whole one are the same response.
+    """
     await verify_project_access(project_id, user_id, session)
-    sheets, _ = await service.list_sheets(
+    sheets, total = await service.list_sheets(
         project_id,
         offset=offset,
         limit=limit,
@@ -917,6 +932,7 @@ async def list_sheets(
         document_id=document_id,
         current_only=current_only,
     )
+    response.headers["X-Total-Count"] = str(total)
     return [_sheet_to_response(s) for s in sheets]
 
 
@@ -967,6 +983,46 @@ async def split_pdf(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to split PDF into sheets",
         )
+
+
+# ── Sheet completeness (drawing index reconciliation) ──────────────────
+
+
+@router.post("/sheets/check-completeness/", response_model=SheetCompletenessResponse)
+async def check_sheet_completeness(
+    data: SheetCompletenessRequest,
+    user_id: CurrentUserId,
+    session: SessionDep,
+    _perm: None = Depends(RequirePermission("documents.create")),
+    service: SheetService = Depends(_get_sheet_service),
+) -> SheetCompletenessResponse:
+    """Reconcile the project's uploaded sheets against a drawing index.
+
+    Parses the index (an uploaded index PDF, a pasted sheet list, or a
+    structured override), diffs it against the project's actual ``Sheet`` rows,
+    and persists a document-target ``ValidationReport`` under the
+    ``sheet_completeness`` rule set - flagging missing sheets (error), extra
+    sheets and revision mismatches (warning). Read the report back through the
+    standard ``/v1/validation/reports/`` endpoints.
+    """
+    await verify_project_access(data.project_id, user_id, session)
+    try:
+        result = await service.check_completeness(
+            data.project_id,
+            user_id=uuid.UUID(user_id) if user_id else None,
+            index_document_id=data.index_document_id,
+            index_page=data.index_page,
+            pasted_index=data.pasted_index,
+            expected_sheets=data.expected_sheets,
+            current_only=data.current_only,
+        )
+    except ValueError as exc:
+        msg = str(exc)
+        # "not found" is an IDOR-safe 404 (missing or foreign index document);
+        # every other ValueError is bad/unreadable input -> 422.
+        code = status.HTTP_404_NOT_FOUND if "not found" in msg.lower() else status.HTTP_422_UNPROCESSABLE_ENTITY
+        raise HTTPException(status_code=code, detail=msg) from exc
+    return SheetCompletenessResponse.model_validate(result)
 
 
 # ── Get single sheet ───────────────────────────────────────────────────

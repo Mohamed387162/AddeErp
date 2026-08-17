@@ -23,26 +23,31 @@ import {
   Briefcase,
   Boxes,
   ChevronDown,
+  ChevronUp,
   Info,
+  Play,
 } from 'lucide-react';
 import clsx from 'clsx';
 import { Button, Badge, Card, Input, Breadcrumb, ConfirmDialog, DismissibleInfo } from '@/shared/ui';
 import { useConfirm } from '@/shared/hooks/useConfirm';
 import { apiGet, triggerDownload } from '@/shared/lib/api';
-import { getIntlLocale } from '@/shared/lib/formatters';
+import { fmtPercent, getIntlLocale } from '@/shared/lib/formatters';
+import { currencyFractionDigits } from '@/shared/lib/money';
 import { useToastStore } from '@/stores/useToastStore';
 import { useProjectContextStore } from '@/stores/useProjectContextStore';
+import { usePreferencesStore } from '@/stores/usePreferencesStore';
+import { getUnitsForLocale } from '@/features/boq/boqHelpers';
+import { unitGlyph, unitLabel } from '@/shared/lib/unitLabels';
 import {
   assembliesApi,
   type AssemblyComponent,
+  type AssemblyParameter,
   type ComponentMetadata,
   type CreateComponentData,
   type ResourceType,
 } from './api';
-
-/* -- Constants ------------------------------------------------------------ */
-
-const UNITS = ['m', 'm2', 'm3', 'kg', 't', 'pcs', 'lsum', 'h', 'set', 'lm'];
+import { ParametersPanel } from './ParametersPanel';
+import { ExpandPreviewModal } from './ExpandPreviewModal';
 
 /* -- Component ------------------------------------------------------------ */
 
@@ -51,8 +56,14 @@ export function AssemblyEditorPage() {
   const navigate = useNavigate();
   const { assemblyId } = useParams<{ assemblyId: string }>();
   const queryClient = useQueryClient();
+  // Seed new component units from the user's measurement system (imperial ->
+  // sqft, metric -> m2) the same way the BOQ editor does, so an imperial user
+  // no longer lands on a hardcoded metric unit. Storage stays free-text.
+  const measurementSystem = usePreferencesStore((s) => s.measurementSystem);
+  const defaultUnit = measurementSystem === 'imperial' ? 'sqft' : 'm2';
 
   const [applyModalOpen, setApplyModalOpen] = useState(false);
+  const [previewOpen, setPreviewOpen] = useState(false);
   const [costDbModalOpen, setCostDbModalOpen] = useState(false);
   const [catalogPickerOpen, setCatalogPickerOpen] = useState(false);
   const [catalogPickerType, setCatalogPickerType] = useState<ResourceType | null>(null);
@@ -147,7 +158,7 @@ export function AssemblyEditorPage() {
       > = {
         material: {
           description: t('assemblies.seed_material', { defaultValue: 'New material' }),
-          unit: assembly?.unit || 'm2',
+          unit: assembly?.unit || defaultUnit,
           metadata: { waste_pct: 0 },
         },
         labor: {
@@ -187,7 +198,7 @@ export function AssemblyEditorPage() {
         metadata: d.metadata,
       });
     },
-    [addComponentMutation, assembly?.unit, t],
+    [addComponentMutation, assembly?.unit, defaultUnit, t],
   );
 
   const openCatalogPicker = useCallback((rt: ResourceType | null = null) => {
@@ -260,10 +271,15 @@ export function AssemblyEditorPage() {
     tagsMutation.mutate(currentTags.filter((t) => t !== tag));
   }, [assembly, tagsMutation]);
 
+  // Decimals come from the assembly's own currency, not from a literal 2. An
+  // assembly priced in CLP, JPY or KRW has no minor unit, so cents there are
+  // not decoration, they are digits the currency cannot express - and this is
+  // the number a unit price analysis carries into a tender.
+  const fmtDigits = currencyFractionDigits(assembly?.currency);
   const fmt = (n: number) =>
     new Intl.NumberFormat(getIntlLocale(), {
-      minimumFractionDigits: 2,
-      maximumFractionDigits: 2,
+      minimumFractionDigits: fmtDigits,
+      maximumFractionDigits: fmtDigits,
     }).format(n);
 
   if (isLoading) {
@@ -277,13 +293,29 @@ export function AssemblyEditorPage() {
 
   if (!assembly) {
     return (
-      <div className="w-full py-16 text-center">
-        <p className="text-content-secondary">{t('assemblies.not_found', { defaultValue: 'Assembly not found' })}</p>
+      <div className="w-full py-16 flex flex-col items-center gap-3 text-center animate-fade-in">
+        <div className="flex h-12 w-12 items-center justify-center rounded-xl bg-surface-tertiary text-content-tertiary">
+          <LayersIcon size={22} />
+        </div>
+        <p className="text-content-primary font-medium">{t('assemblies.not_found', { defaultValue: 'Assembly not found' })}</p>
+        <p className="text-sm text-content-tertiary max-w-sm">
+          {t('assemblies.not_found_hint', {
+            defaultValue: 'This assembly may have been deleted, or you may not have access to it.',
+          })}
+        </p>
+        <Button variant="secondary" size="sm" onClick={() => navigate('/assemblies')}>
+          {t('assemblies.back_to_list', { defaultValue: 'Back to assemblies' })}
+        </Button>
       </div>
     );
   }
 
   const components = assembly.components ?? [];
+  // Parametric assembly state (Issue #365) — the parameter graph plus whether
+  // any line drives its quantity from a formula. Gates the Preview button.
+  const parameters = assembly.parameters ?? [];
+  const hasParametrics =
+    parameters.length > 0 || components.some((c) => !!c.quantity_formula);
   const computedTotal = components.reduce((sum, c) => sum + (Number(c.total) || 0), 0);
   // Prefer the server-persisted total_rate for the headline figure: it already
   // reflects the bid factor AND any per-type typed-formula adjustments
@@ -333,9 +365,21 @@ export function AssemblyEditorPage() {
               <span className="capitalize">{assembly.category}</span>
             )}
             <span className="text-content-tertiary">/</span>
-            <span>{assembly.unit}</span>
+            <span title={unitLabel(assembly.unit, t)}>{unitGlyph(assembly.unit)}</span>
             <span className="text-content-tertiary">/</span>
-            <span>{assembly.currency || 'EUR'}</span>
+            {/* No silent EUR. An assembly stored without a currency has an
+                unknown one, and printing "EUR" states something we do not
+                know - the same guess MoneyDisplay was rewritten to stop
+                making. Show the gap and say what it is. */}
+            <span
+              title={
+                assembly.currency
+                  ? undefined
+                  : t('projects.currency_not_set', { defaultValue: 'Currency not set' })
+              }
+            >
+              {assembly.currency || '—'}
+            </span>
             {assembly.bid_factor !== 1.0 && (
               <>
                 <span className="text-content-tertiary">/</span>
@@ -365,6 +409,20 @@ export function AssemblyEditorPage() {
           >
             {t('assemblies.tags', { defaultValue: 'Tags' })}
           </Button>
+          {hasParametrics && (
+            <Button
+              variant="secondary"
+              size="sm"
+              icon={<Play size={15} />}
+              onClick={() => setPreviewOpen(true)}
+              className="border-oe-blue/30 text-oe-blue hover:bg-oe-blue-subtle"
+              title={t('assembly.preview.button_title', {
+                defaultValue: 'Preview how the parameters expand each line quantity and the rate',
+              })}
+            >
+              {t('assembly.preview.button', { defaultValue: 'Preview' })}
+            </Button>
+          )}
           <Button
             variant="secondary"
             size="sm"
@@ -524,6 +582,10 @@ export function AssemblyEditorPage() {
         </Card>
       )}
 
+      {/* Parameters editor (Issue #365) — name the values that drive the
+          recipe, then reference them from each line's quantity formula. */}
+      <ParametersPanel assemblyId={assemblyId!} parameters={parameters} />
+
       {/* Two-column workspace: components table on the left, M/L/E
           breakdown summary on the right. The summary is sticky so it
           stays visible as the user scrolls a long component list — this
@@ -594,6 +656,9 @@ export function AssemblyEditorPage() {
                     setDragOverIdx(null);
                   }}
                   onDragLeave={() => setDragOverIdx(null)}
+                  onMove={(delta) => handleDragEnd(idx, idx + delta)}
+                  canMoveUp={idx > 0}
+                  canMoveDown={idx < components.length - 1}
                   onUpdate={(data) =>
                     updateComponentMutation.mutate({
                       componentId: component.id,
@@ -648,7 +713,7 @@ export function AssemblyEditorPage() {
                   <td className="px-4 py-3 text-right text-content-primary text-base tabular-nums">
                     {fmt(adjustedTotal)}
                     <span className="ml-1 text-xs font-normal text-content-tertiary">
-                      / {assembly.unit}
+                      / {unitGlyph(assembly.unit)}
                     </span>
                   </td>
                   <td />
@@ -687,12 +752,24 @@ export function AssemblyEditorPage() {
         />
       )}
 
+      {/* Expansion Preview Modal (Issue #365) */}
+      {previewOpen && assemblyId && (
+        <ExpandPreviewModal
+          assemblyId={assemblyId}
+          parameters={parameters}
+          unit={assembly.unit}
+          currency={assembly.currency || 'EUR'}
+          onClose={() => setPreviewOpen(false)}
+        />
+      )}
+
       {/* Apply to BOQ Modal */}
       {applyModalOpen && (
         <ApplyToBOQModal
           assemblyId={assemblyId!}
           assemblyName={assembly.name}
           regionalFactors={assembly.regional_factors}
+          parameters={parameters}
           onClose={() => setApplyModalOpen(false)}
         />
       )}
@@ -721,6 +798,13 @@ interface CostSearchItem {
   description: string;
   unit: string;
   rate: number;
+  /**
+   * The item's own currency. `CostItemResponse` always sends it (it backfills
+   * from the region for legacy CWICR rows), but it stays optional here so a
+   * cached bundle that outlives a deploy degrades to the default digits
+   * instead of rendering nothing.
+   */
+  currency?: string;
 }
 
 function CostDbSearchForAssembly({
@@ -785,8 +869,15 @@ function CostDbSearchForAssembly({
     [assemblyId, addToast, t, queryClient],
   );
 
-  const fmt = (n: number) =>
-    new Intl.NumberFormat(getIntlLocale(), { minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(n);
+  // Each search hit prices in its own currency, so the digits are per row
+  // rather than per list: a catalogue can hold a CLP rate next to a USD one.
+  const fmt = (n: number, currency?: string) => {
+    const digits = currencyFractionDigits(currency);
+    return new Intl.NumberFormat(getIntlLocale(), {
+      minimumFractionDigits: digits,
+      maximumFractionDigits: digits,
+    }).format(n);
+  };
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 animate-fade-in" onClick={handleClose}>
@@ -857,7 +948,7 @@ function CostDbSearchForAssembly({
                   </div>
                   <span className="text-xs text-content-secondary font-mono uppercase shrink-0">{item.unit}</span>
                   <span className="text-sm font-semibold text-content-primary tabular-nums shrink-0 w-20 text-right">
-                    {fmt(item.rate)}
+                    {fmt(item.rate, item.currency)}
                   </span>
                   {added.has(item.id) ? (
                     <span className="flex items-center gap-1 text-xs font-medium text-green-600 px-2">
@@ -932,15 +1023,19 @@ const RESOURCE_TYPE_BAR: Record<string, string> = {
   overhead: 'bg-slate-500',
 };
 
-/* -- Component Row (inline editable) -------------------------------------- */
+/* -- Component Row (inline editable) --------------------------------------
+   Exported for the drag-affordance test; the page itself renders it directly. */
 
-function ComponentRow({
+export function ComponentRow({
   component,
   isDragOver,
   onDragStart,
   onDragOver,
   onDragEnd,
   onDragLeave,
+  onMove,
+  canMoveUp = false,
+  canMoveDown = false,
   onUpdate,
   onDelete,
   fmt,
@@ -951,17 +1046,31 @@ function ComponentRow({
   onDragOver: (e: React.DragEvent) => void;
   onDragEnd: () => void;
   onDragLeave: () => void;
+  /**
+   * Move this row one place up (-1) or down (+1).
+   *
+   * HTML5 drag and drop does not fire on touch, so on a tablet on site the
+   * rows above could not be reordered at all: the grip was visible, draggable
+   * was set, and nothing happened. This is the path that does not go through
+   * the drag API, which also makes the list reorderable from the keyboard.
+   */
+  onMove?: (delta: -1 | 1) => void;
+  canMoveUp?: boolean;
+  canMoveDown?: boolean;
   onUpdate: (data: Partial<CreateComponentData>) => void;
   onDelete: () => void;
   fmt: (n: number) => string;
 }) {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
   const { confirm, ...confirmProps } = useConfirm();
   const [editing, setEditing] = useState<string | null>(null);
   // Per-row "details" panel toggle. Closed by default to keep the
   // table compact; opens to reveal type-specific fields (waste_pct
   // for material, burden_pct for labor, fuel_cost for equipment …).
   const [detailsOpen, setDetailsOpen] = useState(false);
+  // Locale/imperial-aware unit list (same primitive as the BOQ editor) so the
+  // per-component unit dropdown offers imperial + locale tokens, not metric only.
+  const unitOptions = useMemo(() => getUnitsForLocale(i18n.language), [i18n.language]);
 
   const handleBlur = (field: string, value: string) => {
     setEditing(null);
@@ -1000,10 +1109,44 @@ function ComponentRow({
       onDragEnd={onDragEnd}
       onDragLeave={onDragLeave}
     >
-      {/* Drag handle */}
+      {/* Drag handle. `draggable` sits on the whole row, so this is the affordance
+          rather than the drag source. It rests at `secondary`, not `tertiary`:
+          quaternary and tertiary are three hex units apart per channel in both
+          themes (#696c78 vs #666b78 light, #8b8e9d vs #9499a8 dark), so the old
+          resting colour and its hover step were the same grey to the eye. */}
       <td className="px-1 py-2.5 cursor-grab active:cursor-grabbing">
-        <div className="flex items-center justify-center text-content-quaternary group-hover:text-content-tertiary transition-colors">
-          <GripVertical size={14} />
+        <div className="flex flex-col items-center gap-0.5">
+          {/* The two buttons are always rendered, never hover-revealed. A
+              touch device has no hover, and this is the only reorder path it
+              has, so hiding them until hover would hide the whole feature on
+              exactly the device that needs it. They are sized for a fingertip
+              and kept quiet at rest so they do not shout on the desktop. */}
+          <button
+            type="button"
+            onClick={() => onMove?.(-1)}
+            disabled={!onMove || !canMoveUp}
+            aria-label={t('common.move_up', { defaultValue: 'Move up' })}
+            data-testid="component-move-up"
+            className="flex h-5 w-6 items-center justify-center rounded text-content-tertiary hover:bg-surface-secondary hover:text-content-primary disabled:pointer-events-none disabled:opacity-30"
+          >
+            <ChevronUp size={13} aria-hidden="true" />
+          </button>
+          <div
+            className="flex items-center justify-center text-content-secondary group-hover:text-content-primary transition-colors"
+            title={t('assemblies.drag_to_reorder', { defaultValue: 'Drag to reorder' })}
+          >
+            <GripVertical size={16} />
+          </div>
+          <button
+            type="button"
+            onClick={() => onMove?.(1)}
+            disabled={!onMove || !canMoveDown}
+            aria-label={t('common.move_down', { defaultValue: 'Move down' })}
+            data-testid="component-move-down"
+            className="flex h-5 w-6 items-center justify-center rounded text-content-tertiary hover:bg-surface-secondary hover:text-content-primary disabled:pointer-events-none disabled:opacity-30"
+          >
+            <ChevronDown size={13} aria-hidden="true" />
+          </button>
         </div>
       </td>
 
@@ -1060,29 +1203,48 @@ function ComponentRow({
         />
       </td>
 
-      {/* Quantity */}
+      {/* Quantity — an "fx" badge flags a line whose quantity is computed
+          from a parameter formula (Issue #365). The static value below stays
+          editable and is the fallback when no parameters are supplied. */}
       <td className={`${cellClass} text-right`}>
-        <EditableCell
-          value={String(component.quantity)}
-          field="quantity"
-          editing={editing}
-          setEditing={setEditing}
-          onBlur={handleBlur}
-          className={`${inputClass} text-right`}
-          type="number"
-        />
+        <div className="flex items-center justify-end gap-1">
+          {component.quantity_formula ? (
+            <span
+              title={t('assemblies.qty_formula_badge_title', {
+                defaultValue: 'Quantity is computed from a formula: {{formula}}',
+                formula: component.quantity_formula,
+              })}
+              className="text-[9px] font-mono font-bold text-oe-blue bg-oe-blue/10 rounded px-1 py-0.5 leading-none cursor-help shrink-0"
+            >
+              fx
+            </span>
+          ) : null}
+          <EditableCell
+            value={String(component.quantity)}
+            field="quantity"
+            editing={editing}
+            setEditing={setEditing}
+            onBlur={handleBlur}
+            className={`${inputClass} text-right`}
+            type="number"
+          />
+        </div>
       </td>
 
-      {/* Unit */}
+      {/* Unit — dense cell keeps the compact glyph (m2 -> m²); the friendly
+          localized name is a hover/aria title so the column stays narrow.
+          Option value stays the canonical token, storage is unchanged. */}
       <td className="px-4 py-2.5 text-center">
         <select
           value={component.unit}
           onChange={(e) => onUpdate({ unit: e.target.value })}
+          title={unitLabel(component.unit, t)}
+          aria-label={t('boq.unit', { defaultValue: 'Unit' })}
           className="bg-transparent text-sm text-center cursor-pointer border-none outline-none text-content-secondary hover:text-content-primary"
         >
-          {UNITS.map((u) => (
-            <option key={u} value={u}>
-              {u}
+          {unitOptions.map((u) => (
+            <option key={u} value={u} title={unitLabel(u, t)}>
+              {unitGlyph(u)}
             </option>
           ))}
         </select>
@@ -1160,6 +1322,25 @@ function ComponentRow({
       <tr className="bg-surface-secondary/40 dark:bg-surface-secondary/30">
         <td colSpan={9} className="px-4 py-3">
           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
+            {/* Quantity formula (Issue #365) — available for every line type.
+                An arithmetic expression over the assembly's parameters drives
+                the computed quantity; empty keeps the static Qty above. */}
+            <DetailField
+              label={t('assemblies.field_quantity_formula', {
+                defaultValue: 'Quantity formula (fx)',
+              })}
+              hint={t('assemblies.field_quantity_formula_hint', {
+                defaultValue:
+                  'Compute this line from the assembly parameters, e.g. wall_area * 0.12. Leave empty to use the static quantity.',
+              })}
+              type="text"
+              value={component.quantity_formula ?? ''}
+              onCommit={(v) => {
+                const trimmed = v.trim();
+                onUpdate({ quantity_formula: trimmed === '' ? null : trimmed });
+              }}
+              span="sm:col-span-2 lg:col-span-4"
+            />
             {resType === 'material' && (
               <>
                 <DetailField
@@ -1374,11 +1555,13 @@ function ApplyToBOQModal({
   assemblyId,
   assemblyName,
   regionalFactors,
+  parameters,
   onClose,
 }: {
   assemblyId: string;
   assemblyName: string;
   regionalFactors?: Record<string, string>;
+  parameters?: AssemblyParameter[];
   onClose: () => void;
 }) {
   const { t } = useTranslation();
@@ -1391,6 +1574,13 @@ function ApplyToBOQModal({
   const [boqId, setBoqId] = useState('');
   const [quantity, setQuantity] = useState('1');
   const [region, setRegion] = useState('');
+  // Issue #365 — values for the assembly's `input` parameters. Seeded from
+  // each parameter's stored default; the component quantity formulas are then
+  // computed against the resolved values server-side at apply time.
+  const inputParams = (parameters ?? []).filter((p) => p.kind === 'input');
+  const [paramValues, setParamValues] = useState<Record<string, string>>(() =>
+    Object.fromEntries(inputParams.map((p) => [p.name, p.value ?? ''])),
+  );
 
   const { data: projects } = useQuery({
     queryKey: ['projects'],
@@ -1408,8 +1598,22 @@ function ApplyToBOQModal({
   });
 
   const applyMutation = useMutation({
-    mutationFn: () =>
-      assembliesApi.applyToBoq(assemblyId, boqId, parseFloat(quantity) || 1),
+    mutationFn: () => {
+      const parameterValues =
+        inputParams.length > 0
+          ? Object.fromEntries(
+              inputParams.map((p) => {
+                const raw = paramValues[p.name];
+                const n =
+                  raw === undefined || raw.trim() === ''
+                    ? Number(p.value ?? 0)
+                    : Number(raw);
+                return [p.name, Number.isFinite(n) ? n : 0];
+              }),
+            )
+          : undefined;
+      return assembliesApi.applyToBoq(assemblyId, boqId, parseFloat(quantity) || 1, parameterValues);
+    },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['boq'] });
       queryClient.invalidateQueries({ queryKey: ['boqs'] });
@@ -1545,6 +1749,37 @@ function ApplyToBOQModal({
               hint={t('assemblies.quantity_hint', { defaultValue: 'Number of times to apply this assembly' })}
             />
 
+            {/* Input parameters (Issue #365) — drive each line's quantity
+                formula. Empty falls back to the stored default. */}
+            {inputParams.length > 0 && (
+              <div className="space-y-2 rounded-lg border border-border-light bg-surface-secondary/40 px-3 py-2.5">
+                <div className="text-xs font-medium text-content-primary">
+                  {t('assembly.apply.params_title', { defaultValue: 'Parameter values' })}
+                </div>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                  {inputParams.map((p) => (
+                    <label key={p.name} className="block">
+                      <div className="text-[11px] text-content-secondary mb-1 flex items-center gap-1">
+                        <span className="font-mono">{p.name}</span>
+                        {p.unit && <span className="text-content-tertiary">({p.unit})</span>}
+                      </div>
+                      <input
+                        type="number"
+                        inputMode="decimal"
+                        step="any"
+                        value={paramValues[p.name] ?? ''}
+                        onChange={(e) =>
+                          setParamValues((prev) => ({ ...prev, [p.name]: e.target.value }))
+                        }
+                        placeholder={p.value ?? '0'}
+                        className="w-full h-9 px-2.5 rounded-lg border border-border-light bg-surface-primary text-sm text-content-primary text-right tabular-nums focus:outline-none focus:ring-1 focus:ring-oe-blue/40"
+                      />
+                    </label>
+                  ))}
+                </div>
+              </div>
+            )}
+
             {applyMutation.error && (
               <div className="rounded-lg bg-semantic-error-bg px-3 py-2 text-sm text-semantic-error">
                 {(applyMutation.error as Error).message || t('assemblies.apply_failed', { defaultValue: 'Failed to apply assembly to BOQ' })}
@@ -1598,10 +1833,14 @@ function BreakdownSidebar({
   bidFactor: number;
 }) {
   const { t } = useTranslation();
+  // Every figure in this sidebar is printed next to `currency`, so the digits
+  // have to come from it. The resource split is the part of a unit price
+  // analysis a reviewer reads line by line.
+  const breakdownDigits = currencyFractionDigits(currency);
   const fmt = (n: number) =>
     new Intl.NumberFormat(getIntlLocale(), {
-      minimumFractionDigits: 2,
-      maximumFractionDigits: 2,
+      minimumFractionDigits: breakdownDigits,
+      maximumFractionDigits: breakdownDigits,
     }).format(n);
   const order: ResourceType[] = [
     'material',
@@ -1653,7 +1892,7 @@ function BreakdownSidebar({
                   <div className="flex items-baseline justify-between gap-2 text-xs mb-1">
                     <span className="font-medium text-content-secondary">{labelFor(rt)}</span>
                     <span className="text-content-tertiary tabular-nums">
-                      {pct.toFixed(0)}%
+                      {fmtPercent(pct, 0)}
                     </span>
                   </div>
                   <div className="h-1.5 rounded-full bg-surface-tertiary overflow-hidden">
@@ -1695,7 +1934,7 @@ function BreakdownSidebar({
               {t('assemblies.breakdown_total', { defaultValue: 'Total / unit' })}
             </span>
             <span className="font-bold text-content-primary tabular-nums">
-              {fmt(breakdown.withBid)} {currency} / {unit}
+              {fmt(breakdown.withBid)} {currency} / {unitGlyph(unit)}
             </span>
           </div>
         </div>
@@ -1889,8 +2128,8 @@ function CatalogResourcePickerModal({
                     <td className="py-2 text-center text-content-secondary">{it.unit}</td>
                     <td className="py-2 text-right tabular-nums text-content-primary">
                       {new Intl.NumberFormat(getIntlLocale(), {
-                        minimumFractionDigits: 2,
-                        maximumFractionDigits: 2,
+                        minimumFractionDigits: currencyFractionDigits(it.currency),
+                        maximumFractionDigits: currencyFractionDigits(it.currency),
                       }).format(it.base_price || 0)}{' '}
                       <span className="text-[10px] text-content-tertiary">{it.currency}</span>
                     </td>

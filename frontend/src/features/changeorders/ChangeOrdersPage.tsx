@@ -37,12 +37,13 @@ import {
 } from '@/shared/ui/WideModal';
 import { useConfirm } from '@/shared/hooks/useConfirm';
 import { apiGet, apiPost, apiDelete } from '@/shared/lib/api';
-import { getIntlLocale } from '@/shared/lib/formatters';
+import { fmtDate, getIntlLocale } from '@/shared/lib/formatters';
 import { formatCurrency as fmtMoney } from '@/shared/lib/money';
 import { useToastStore } from '@/stores/useToastStore';
 import { useProjectContextStore } from '@/stores/useProjectContextStore';
 import { useAuthStore } from '@/stores/useAuthStore';
 import { listContracts } from '@/features/contracts/api';
+import { ProvabilityGauge, EvidenceThreadPanel } from '@/features/claims-evidence';
 import { ApprovalTimeline } from './ApprovalTimeline';
 import { ImpactSimulator, type SavedScenario } from './ImpactSimulator';
 import { AIDraftModal } from './AIDraftModal';
@@ -53,6 +54,8 @@ import {
   startApprovalChain,
   type ApprovalRow,
 } from './api';
+import { InsightsPanel, InsightsToggleButton, useModuleInsights } from '@/features/insights';
+import { buildChangeordersInsights } from './changeordersInsights';
 
 /* ── Types ─────────────────────────────────────────────────────────────── */
 
@@ -179,6 +182,8 @@ function getReasonLabels(t: (key: string, opts?: Record<string, unknown>) => str
     unforeseen: t('changeorders.reason_unforeseen', { defaultValue: 'Unforeseen Conditions' }),
     regulatory: t('changeorders.reason_regulatory', { defaultValue: 'Regulatory' }),
     error: t('changeorders.reason_error', { defaultValue: 'Error/Omission' }),
+    non_conformance: t('changeorders.reason_non_conformance', { defaultValue: 'Non-Conformance' }),
+    value_engineering: t('changeorders.reason_value_engineering', { defaultValue: 'Value Engineering' }),
   };
 }
 
@@ -219,11 +224,9 @@ function formatQuantity(value: string | number): string {
 function formatDate(iso: string | null): string {
   if (!iso) return '-';
   try {
-    return new Date(iso).toLocaleDateString(getIntlLocale(), {
-      year: 'numeric',
-      month: 'short',
-      day: 'numeric',
-    });
+    // The app-wide date formatter, so this register renders dates exactly like
+    // the variations and claims-evidence screens next to it.
+    return fmtDate(iso);
   } catch {
     return iso;
   }
@@ -1597,6 +1600,14 @@ function DetailView({
         </Card>
       </div>
 
+      {/* Claims evidence: how provable this change is from the contemporaneous
+          record, and the reconciled evidence thread assembled around it, ready
+          to export for a claim. Both self-fetch and degrade to empty states. */}
+      <div className="grid gap-4 lg:grid-cols-2 mb-6">
+        <ProvabilityGauge projectId={order.project_id} subjectKind="change_order" subjectId={orderId} />
+        <EvidenceThreadPanel projectId={order.project_id} subjectType="change_order" subjectId={orderId} />
+      </div>
+
       {/* What-If impact simulator (TOP-30 #11). Hidden once a CO is rejected:
           there is nothing left to forecast. Publishing a scenario is allowed
           while the CO can still change (draft / submitted); the backend also
@@ -1971,6 +1982,17 @@ export function ChangeOrdersPage() {
     enabled: !!projectId,
   });
 
+  // Module Insights - the toggleable KPI/chart panel for this module. Its
+  // charts are built client-side from the change orders already loaded; when
+  // the project has none the panel draws nothing rather than inventing rows to
+  // fill it. Declared here, above the detail-view early return further down, so
+  // the hook order stays stable.
+  const insights = useModuleInsights('changeorders', { defaultOpen: true });
+  const { datasets: insightDatasets, builtins: insightBuiltins } = useMemo(
+    () => buildChangeordersInsights(orders, project?.currency || summary?.currency || '', t),
+    [orders, project, summary, t],
+  );
+
   const deleteMut = useMutation({
     mutationFn: (id: string) => apiDelete(`/v1/changeorders/${id}`),
     onSuccess: () => {
@@ -2064,6 +2086,7 @@ export function ChangeOrdersPage() {
         subtitle={t('changeorders.subtitle', { defaultValue: 'Track scope changes with cost and schedule impact' })}
         actions={
           <>
+            <InsightsToggleButton open={insights.open} onClick={insights.toggle} />
             <ModuleGuideButton content={changeordersGuide} />
             <Button variant="secondary" icon={<Download size={14} />} onClick={handleExportCSV} disabled={!filteredOrders || filteredOrders.length === 0}>
               {t('changeorders.export_csv', { defaultValue: 'Export CSV' })}
@@ -2078,6 +2101,18 @@ export function ChangeOrdersPage() {
             </Button>
           </>
         }
+      />
+
+      <InsightsPanel
+        open={insights.open}
+        title={t('changeorders.insights.title', { defaultValue: 'Change order insights' })}
+        datasets={insightDatasets}
+        builtins={insightBuiltins}
+        custom={insights.custom}
+        onAdd={insights.addCustom}
+        onUpdate={insights.updateCustom}
+        onRemove={insights.removeCustom}
+        onCollapse={() => insights.setOpen(false)}
       />
 
       <DismissibleInfo
@@ -2286,7 +2321,13 @@ export function ChangeOrdersPage() {
                       onClick={() => setSelectedOrderId(order.id)}
                     >
                       <td className="px-4 py-3 font-mono text-xs text-content-secondary whitespace-nowrap">{order.code}</td>
-                      <td className="px-4 py-3 text-content-primary font-medium max-w-[200px] truncate">
+                      {/* The title is the one free-text column here. It was
+                          capped at a flat 200px, so it cut at the same ~40
+                          characters whether the window was 1120px or 1720px
+                          wide. w-full + max-w-0 hands it whatever the seven
+                          fixed columns do not use, and truncates only past
+                          that. */}
+                      <td className="px-4 py-3 text-content-primary font-medium w-full max-w-0 truncate" title={order.title}>
                         {order.title}
                       </td>
                       <td className="px-4 py-3">

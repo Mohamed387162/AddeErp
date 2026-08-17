@@ -30,7 +30,7 @@ import {
   Loader2,
   Network,
 } from 'lucide-react';
-import { Card, CardHeader, CardContent, Button, Badge, EmptyState, Skeleton, Breadcrumb, DismissibleInfo, IntroRichText, ModuleGuideButton } from '@/shared/ui';
+import { Card, CardHeader, CardContent, Button, Badge, EmptyState, Skeleton, Breadcrumb, DismissibleInfo, IntroRichText, ModuleGuideButton, CollapsibleSection } from '@/shared/ui';
 import { PageHeader } from '@/shared/ui/PageHeader';
 import { PlanningCrossLinks } from '@/features/schedule/PlanningCrossLinks';
 import { apiGet, apiPost, apiPatch } from '@/shared/lib/api';
@@ -45,10 +45,11 @@ import {
 } from './api';
 import { CostBenchmark } from './CostBenchmark';
 import { CostSpinePanel } from './CostSpinePanel';
+import { ContractExposurePanel } from './ContractExposurePanel';
 import { costmodelGuide } from './costmodelGuide';
 import { BudgetLineThresholdEditor, parseThreshold } from './BudgetLineThresholdEditor';
-import { getIntlLocale } from '@/shared/lib/formatters';
-import { formatCurrency as fmtMoney } from '@/shared/lib/money';
+import { fmtPercent, getIntlLocale } from '@/shared/lib/formatters';
+import { formatCompactCurrency, formatCurrency as fmtMoney } from '@/shared/lib/money';
 
 /* ── Types ─────────────────────────────────────────────────────────────── */
 
@@ -82,14 +83,7 @@ function formatCurrency(amount: string | number, currency?: string): string {
 }
 
 function formatCompact(amount: number, currency: string): string {
-  const abs = Math.abs(amount);
-  if (abs >= 1_000_000) {
-    return `${(amount / 1_000_000).toFixed(1)}M ${currency}`;
-  }
-  if (abs >= 1_000) {
-    return `${(amount / 1_000).toFixed(0)}K ${currency}`;
-  }
-  return formatCurrency(amount, currency);
+  return formatCompactCurrency(amount, currency);
 }
 
 /**
@@ -150,12 +144,21 @@ const KPICard = memo(function KPICard({
         </div>
         {variance !== undefined && variance !== 0 && (
           <div className="mt-2.5 flex items-center gap-1.5">
+            {/* The badge says "vs budget", so the number has to be the deviation
+                from it - spending above budget is a plus. What the callers pass
+                is the opposite quantity, budget minus spend, which is the
+                headroom left: it is the right input for the colour (headroom is
+                green) and the arrow (headroom points down), and the wrong one to
+                print. Printed raw it labelled a project 11.1M under budget as
+                "+11.1M vs. Budget", and the reader who looks at the number
+                rather than the arrow got the opposite truth. All three now come
+                off one quantity. */}
             <span
               className={`inline-flex items-center gap-1 rounded-full px-2.5 py-0.5 text-2xs font-semibold ${varianceBg(variance)} ${varianceColor(variance)}`}
             >
               {variance < 0 ? <TrendingUp size={10} /> : <TrendingDown size={10} />}
-              {variance > 0 ? '+' : ''}
-              {formatCompact(variance, currency)}
+              {-variance > 0 ? '+' : ''}
+              {formatCompact(-variance, currency)}
             </span>
             <span className="text-2xs text-content-tertiary">{t('costmodel.vs_budget', { defaultValue: 'vs budget' })}</span>
           </div>
@@ -536,7 +539,7 @@ const BudgetTable = memo(function BudgetTable({
                 <td className="py-3.5 px-2">
                   <div className="flex flex-col items-center gap-0.5">
                     <span className={`text-2xs font-semibold tabular-nums ${spentOver ? 'text-semantic-error' : 'text-content-secondary'}`}>
-                      {spentPct.toFixed(0)}%
+                      {fmtPercent(spentPct, 0)}
                     </span>
                     <div className="h-1.5 w-full max-w-[60px] rounded-full bg-surface-secondary overflow-hidden">
                       <div
@@ -577,7 +580,7 @@ const BudgetTable = memo(function BudgetTable({
               {totals.planned > 0 && (
                 <div className="flex flex-col items-center gap-0.5">
                   <span className="text-2xs font-bold tabular-nums text-content-primary">
-                    {Math.min(100, (totals.actual / totals.planned) * 100).toFixed(0)}%
+                    {fmtPercent(Math.min(100, (totals.actual / totals.planned) * 100), 0)}
                   </span>
                   <div className="h-1.5 w-full max-w-[60px] rounded-full bg-surface-secondary overflow-hidden">
                     <div
@@ -904,7 +907,7 @@ const EVMDashboard = memo(function EVMDashboard({
                 {t('costmodel.evm_time_elapsed', { defaultValue: 'Time Elapsed' })}
               </span>
               <span className="font-medium tabular-nums text-content-primary">
-                {evm.time_elapsed_pct.toFixed(1)}%
+                {fmtPercent(evm.time_elapsed_pct)}
               </span>
             </div>
             <div className="flex justify-between">
@@ -912,7 +915,7 @@ const EVMDashboard = memo(function EVMDashboard({
                 {t('costmodel.evm_schedule_progress', { defaultValue: 'Schedule Progress' })}
               </span>
               <span className="font-medium tabular-nums text-content-primary">
-                {evm.schedule_progress_pct.toFixed(1)}%
+                {fmtPercent(evm.schedule_progress_pct)}
               </span>
             </div>
             <div className="flex justify-between">
@@ -1895,7 +1898,7 @@ function WhatIfPanel({
                       {formatCompact(result.delta, currency)}
                       <span className="text-xs font-medium ml-1">
                         ({result.delta_pct > 0 ? '+' : ''}
-                        {result.delta_pct.toFixed(1)}%)
+                        {fmtPercent(result.delta_pct)})
                       </span>
                     </div>
                   </div>
@@ -2097,6 +2100,13 @@ function FiveDDashboard({ project }: { project: Project }) {
     queryFn: () => costModelApi.getEVM(project.id),
     retry: false,
   });
+
+  // The Performance card names the same two indices the Earned Value panel
+  // does, so it has to read the same computation. Falls back to the latest
+  // stored snapshot, which is all the dashboard aggregate carries, when the
+  // live figures are absent.
+  const perfSpi = evmData?.spi ?? dashboard?.spi ?? 0;
+  const perfCpi = evmData?.cpi ?? dashboard?.cpi ?? 0;
 
   // Live KPI freshness: poll a cheap watermark; when an upstream change (cost,
   // schedule progress, finance, contracts) advances it, refetch the live EVM /
@@ -2372,7 +2382,7 @@ function FiveDDashboard({ project }: { project: Project }) {
             accentColor="amber"
           />
           <KPICard
-            label={t('costmodel.forecast_eac', 'Forecast (EAC)')}
+            label={t('costmodel.forecast_lines', { defaultValue: 'Forecast (budget lines)' })}
             amount={dashboard.total_forecast}
             currency={currency}
             variance={dashboard.total_budget - dashboard.total_forecast}
@@ -2431,6 +2441,14 @@ function FiveDDashboard({ project }: { project: Project }) {
       <MonteCarloPanel projectId={project.id} currency={currency} />
 
       {/* Performance Indicators + S-Curve row */}
+      {/* One page, one pair of indices. This card read the latest stored EVM
+          snapshot while the Earned Value panel above it recomputed live, so
+          the same two names carried two different numbers in the same scroll:
+          SPI 0.90 / CPI 0.96 here against SPI 0.75 / CPI 0.19 there, one
+          saying the job is nearly on plan and the other that it pays five
+          euro for one of work. The live figures win where they exist; the
+          snapshot stays as the fallback for a project whose EVM cannot be
+          recomputed. */}
       <div className="grid grid-cols-1 gap-6 lg:grid-cols-3">
         {/* SPI / CPI */}
         <div>
@@ -2442,11 +2460,11 @@ function FiveDDashboard({ project }: { project: Project }) {
                   <Skeleton height={56} className="w-full" rounded="lg" />
                   <Skeleton height={56} className="w-full" rounded="lg" />
                 </div>
-              ) : dashboard && dashboard.spi > 0 && dashboard.cpi > 0 ? (
+              ) : dashboard && perfSpi > 0 && perfCpi > 0 ? (
                 <div className="space-y-5">
                   <PerformanceIndicator
                     label="SPI"
-                    value={dashboard.spi}
+                    value={perfSpi}
                     description={t(
                       'costmodel.spi_desc',
                       'Schedule Performance Index',
@@ -2455,7 +2473,7 @@ function FiveDDashboard({ project }: { project: Project }) {
                   <div className="border-t border-border-light" />
                   <PerformanceIndicator
                     label="CPI"
-                    value={dashboard.cpi}
+                    value={perfCpi}
                     description={t('costmodel.cpi_desc', 'Cost Performance Index')}
                   />
                   {dashboard.variance !== 0 && (
@@ -2469,7 +2487,7 @@ function FiveDDashboard({ project }: { project: Project }) {
                           className={`text-sm font-semibold tabular-nums ${varianceColor(dashboard.variance)}`}
                         >
                           {dashboard.variance > 0 ? '+' : ''}
-                          {dashboard.variance_pct.toFixed(1)}%
+                          {fmtPercent(dashboard.variance_pct)}
                         </span>
                       </div>
                     </>
@@ -2564,6 +2582,9 @@ function FiveDDashboard({ project }: { project: Project }) {
           )}
         </CardContent>
       </Card>
+
+      {/* Contract Exposure (committed vs budget by cost group) */}
+      <ContractExposurePanel projectId={project.id} currency={currency} />
 
       {/* Editable Budget Lines */}
       {hasBudget && (
@@ -2692,12 +2713,12 @@ function HowCostModelConnects() {
   ];
 
   return (
-    <div className="rounded-xl border border-border-light bg-surface-secondary/40 p-4">
-      <h2 className="flex items-center gap-1.5 text-sm font-semibold text-content-primary">
-        <Network size={15} className="text-oe-blue" />
-        {t('costmodel.flow_title', { defaultValue: 'How the 5D cost model connects' })}
-      </h2>
-      <p className="mt-1 text-xs text-content-tertiary">
+    <CollapsibleSection
+      storageKey="costmodel.how"
+      icon={<Network size={15} className="text-oe-blue" />}
+      title={t('costmodel.flow_title', { defaultValue: 'How the 5D cost model connects' })}
+    >
+      <p className="text-xs text-content-tertiary">
         {t('costmodel.flow_intro', {
           defaultValue:
             'Turn your priced BOQ into a live budget and track it against actual cost and progress with earned value. Record the current period costs and progress to keep it current.',
@@ -2740,7 +2761,7 @@ function HowCostModelConnects() {
         {' · '}
         <ModLink to="/reports">{t('costmodel.mod_reports', { defaultValue: 'Reports' })}</ModLink>
       </div>
-    </div>
+    </CollapsibleSection>
   );
 }
 

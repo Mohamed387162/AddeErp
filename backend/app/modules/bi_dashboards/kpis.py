@@ -9,6 +9,21 @@ Each KPI:
       / ``OperationalError``). The module is read-only across the platform
       and must never crash because an upstream module was uninstalled.
 
+Degrading gracefully is not the same as degrading quietly. Two different
+things reach the user as a zero, and the logs are the only place they can be
+told apart:
+
+    * ``ImportError`` means the source module is simply not installed. That
+      is the designed, expected condition, and it stays unlogged.
+    * Anything else means a probe that should have worked did not. The
+      dashboard still renders (one broken probe must not take the page
+      down) but the failure is logged through :func:`logging.Logger.exception`,
+      so it lands at ERROR with a traceback naming the probe.
+
+Production log level sits above DEBUG. A probe failure logged at DEBUG is
+invisible, and its zero is indistinguishable from a real zero, which is how a
+broken cost feed reads as "nothing spent yet".
+
 The registry is process-local. Custom KPIs registered by community
 modules survive a hot reload of this file but not a worker restart -
 modules should register inside their own ``on_startup`` hook.
@@ -132,7 +147,7 @@ async def _safe_count(session: AsyncSession, query: Any) -> int:
         rows = list(result.scalars().all())
         return len(rows)
     except Exception:
-        logger.debug("KPI safe_count: query failed", exc_info=True)
+        logger.exception("KPI safe_count: query failed")
         return 0
 
 
@@ -234,7 +249,7 @@ async def _project_currency_and_fx(
     except ImportError:
         return "", {}
     except Exception:
-        logger.debug("project currency/fx probe failed", exc_info=True)
+        logger.exception("project currency/fx probe failed")
         return "", {}
 
 
@@ -411,7 +426,7 @@ async def _evm_snapshot_for_project(
     except ImportError:
         pass
     except Exception:
-        logger.debug("evm: tasks probe failed", exc_info=True)
+        logger.exception("evm: tasks probe failed")
 
     # Project budget → BAC
     try:
@@ -426,7 +441,7 @@ async def _evm_snapshot_for_project(
     except ImportError:
         pass
     except Exception:
-        logger.debug("evm: project probe failed", exc_info=True)
+        logger.exception("evm: project probe failed")
     # CONN-78: when neither budget nor contract value is set, the cost
     # baseline (BAC) is the priced estimate - the sum of the project's BOQ
     # position totals. This ties the executive cost spine back to the
@@ -470,7 +485,7 @@ async def _evm_snapshot_for_project(
     except ImportError:
         pass
     except Exception:
-        logger.debug("evm: finance payment probe failed", exc_info=True)
+        logger.exception("evm: finance payment probe failed")
 
     # procurement.PurchaseOrder → AC (committed cost)
     try:
@@ -488,7 +503,7 @@ async def _evm_snapshot_for_project(
     except ImportError:
         pass
     except Exception:
-        logger.debug("evm: procurement probe failed", exc_info=True)
+        logger.exception("evm: procurement probe failed")
 
     snap.breakdown = {
         "bac": str(snap.bac),
@@ -545,7 +560,7 @@ async def _boq_baseline_for_project(
     except ImportError:
         return Decimal("0")
     except Exception:
-        logger.debug("evm: boq baseline probe failed", exc_info=True)
+        logger.exception("evm: boq baseline probe failed")
         return Decimal("0")
     return total
 
@@ -591,7 +606,7 @@ async def _evm_snapshot_portfolio(
     except ImportError:
         return snap
     except Exception:
-        logger.debug("evm portfolio: project list failed", exc_info=True)
+        logger.exception("evm portfolio: project list failed")
         return snap
 
     missing_codes: set[str] = set()
@@ -1015,7 +1030,7 @@ async def procurement_savings_kpi(
     except ImportError:
         pass
     except Exception:
-        logger.debug("procurement_savings: requisition probe failed", exc_info=True)
+        logger.exception("procurement_savings: requisition probe failed")
 
     try:
         from app.modules.procurement.models import PurchaseOrder  # type: ignore
@@ -1040,7 +1055,7 @@ async def procurement_savings_kpi(
     except ImportError:
         pass
     except Exception:
-        logger.debug("procurement_savings: probe failed", exc_info=True)
+        logger.exception("procurement_savings: probe failed")
 
     if budgeted <= 0:
         return KPIComputation(
@@ -1107,7 +1122,7 @@ async def change_order_ratio_kpi(
     except ImportError:
         pass
     except Exception:
-        logger.debug("change_order_ratio: probe failed", exc_info=True)
+        logger.exception("change_order_ratio: probe failed")
 
     contract_value = Decimal("0")
     try:
@@ -1122,7 +1137,7 @@ async def change_order_ratio_kpi(
     except ImportError:
         pass
     except Exception:
-        logger.debug("change_order_ratio: project probe failed", exc_info=True)
+        logger.exception("change_order_ratio: project probe failed")
 
     if contract_value <= 0:
         return KPIComputation(
@@ -1216,7 +1231,7 @@ async def cash_in_30d_kpi(
     except ImportError:
         pass
     except Exception:
-        logger.debug("cash_in_30d: probe failed", exc_info=True)
+        logger.exception("cash_in_30d: probe failed")
     if is_portfolio:
         value, breakdown = _portfolio_money_breakdown(by_currency)
     else:
@@ -1304,7 +1319,7 @@ async def cash_out_30d_kpi(
     except ImportError:
         pass
     except Exception:
-        logger.debug("cash_out_30d: invoice probe failed", exc_info=True)
+        logger.exception("cash_out_30d: invoice probe failed")
 
     # Committed purchase orders due within the horizon (not yet completed).
     try:
@@ -1338,7 +1353,7 @@ async def cash_out_30d_kpi(
     except ImportError:
         pass
     except Exception:
-        logger.debug("cash_out_30d: procurement probe failed", exc_info=True)
+        logger.exception("cash_out_30d: procurement probe failed")
 
     if is_portfolio:
         value, breakdown = _portfolio_money_breakdown(by_currency)
@@ -1405,7 +1420,7 @@ async def dso_kpi(
     except ImportError:
         pass
     except Exception:
-        logger.debug("dso: probe failed", exc_info=True)
+        logger.exception("dso: probe failed")
 
     avg = _safe_div(total_days, Decimal(count)) if count > 0 else Decimal("0")
     return KPIComputation(
@@ -1454,7 +1469,7 @@ async def first_pass_yield_kpi(
     except ImportError:
         pass
     except Exception:
-        logger.debug("first_pass_yield: probe failed", exc_info=True)
+        logger.exception("first_pass_yield: probe failed")
 
     if total == 0:
         return KPIComputation(
@@ -1535,7 +1550,7 @@ async def copq_kpi(
     except ImportError:
         pass
     except Exception:
-        logger.debug("copq: probe failed", exc_info=True)
+        logger.exception("copq: probe failed")
 
     if is_portfolio:
         value, breakdown = _portfolio_money_breakdown(by_currency)
@@ -1582,7 +1597,7 @@ async def punch_close_rate_kpi(
     except ImportError:
         pass
     except Exception:
-        logger.debug("punch_close_rate: probe failed", exc_info=True)
+        logger.exception("punch_close_rate: probe failed")
 
     if total == 0:
         return KPIComputation(
@@ -1653,7 +1668,7 @@ async def rfi_close_avg_days_kpi(
     except ImportError:
         pass
     except Exception:
-        logger.debug("rfi_close_avg_days: probe failed", exc_info=True)
+        logger.exception("rfi_close_avg_days: probe failed")
 
     avg = _safe_div(total_days, Decimal(count)) if count > 0 else Decimal("0")
     return KPIComputation(value=avg, unit="days", source_record_count=count)
@@ -1730,7 +1745,7 @@ async def safety_trir_kpi(
     except ImportError:
         pass
     except Exception:
-        logger.debug("safety_trir: probe failed", exc_info=True)
+        logger.exception("safety_trir: probe failed")
 
     trir = Decimal(incidents) * Decimal("200000") / hours_worked if hours_worked > 0 else Decimal("0")
     return KPIComputation(
@@ -1782,7 +1797,7 @@ async def embodied_carbon_per_m2_kpi(
     except ImportError:
         pass
     except Exception:
-        logger.debug("embodied_carbon_per_m2: carbon probe failed", exc_info=True)
+        logger.exception("embodied_carbon_per_m2: carbon probe failed")
 
     try:
         from app.modules.projects.models import Project  # type: ignore
@@ -1796,7 +1811,7 @@ async def embodied_carbon_per_m2_kpi(
     except ImportError:
         pass
     except Exception:
-        logger.debug("embodied_carbon_per_m2: project probe failed", exc_info=True)
+        logger.exception("embodied_carbon_per_m2: project probe failed")
 
     value = _safe_div(total_emissions, project_area)
     return KPIComputation(
@@ -1847,7 +1862,7 @@ async def equipment_utilization_kpi(
     except ImportError:
         pass
     except Exception:
-        logger.debug("equipment_utilization: probe failed", exc_info=True)
+        logger.exception("equipment_utilization: probe failed")
 
     if available <= 0:
         return KPIComputation(
@@ -1896,7 +1911,7 @@ async def subcontractor_avg_rating_kpi(
     except ImportError:
         pass
     except Exception:
-        logger.debug("subcontractor_avg_rating: probe failed", exc_info=True)
+        logger.exception("subcontractor_avg_rating: probe failed")
 
     avg = _safe_div(total, Decimal(count)) if count > 0 else Decimal("0")
     return KPIComputation(value=avg, unit="ratio", source_record_count=count)
@@ -1964,7 +1979,7 @@ async def bid_win_rate_kpi(
     except ImportError:
         pass
     except Exception:
-        logger.debug("bid_win_rate: tendering probe failed", exc_info=True)
+        logger.exception("bid_win_rate: tendering probe failed")
 
     # Fallback: bid_management (awards vs submissions) when no tender bids.
     if total == 0:
@@ -2008,7 +2023,7 @@ async def bid_win_rate_kpi(
         except ImportError:
             pass
         except Exception:
-            logger.debug("bid_win_rate: bid_management probe failed", exc_info=True)
+            logger.exception("bid_win_rate: bid_management probe failed")
 
     if total == 0:
         return KPIComputation(
@@ -2059,7 +2074,7 @@ async def project_count_active_kpi(
     except ImportError:
         pass
     except Exception:
-        logger.debug("project_count_active: probe failed", exc_info=True)
+        logger.exception("project_count_active: probe failed")
 
     return KPIComputation(
         value=Decimal(count),
@@ -2151,7 +2166,7 @@ async def risk_open_exposure_kpi(
     except ImportError:
         return KPIComputation(value=Decimal("0"), unit="currency", source_record_count=0)
     except Exception:
-        logger.debug("risk_open_exposure: probe failed", exc_info=True)
+        logger.exception("risk_open_exposure: probe failed")
 
     if project_id is None:
         value, breakdown = _portfolio_money_breakdown(by_currency)
@@ -2226,7 +2241,7 @@ async def risk_high_unmitigated_count_kpi(
     except ImportError:
         return KPIComputation(value=Decimal("0"), unit="count", source_record_count=0)
     except Exception:
-        logger.debug("risk_high_unmitigated_count: probe failed", exc_info=True)
+        logger.exception("risk_high_unmitigated_count: probe failed")
 
     return KPIComputation(
         value=Decimal(count),
@@ -2269,7 +2284,7 @@ async def ncr_open_count_kpi(
     except ImportError:
         return KPIComputation(value=Decimal("0"), unit="count", source_record_count=0)
     except Exception:
-        logger.debug("ncr_open_count: probe failed", exc_info=True)
+        logger.exception("ncr_open_count: probe failed")
 
     return KPIComputation(
         value=Decimal(count),
@@ -2320,7 +2335,7 @@ async def incident_count_kpi(
     except ImportError:
         return KPIComputation(value=Decimal("0"), unit="count", source_record_count=0)
     except Exception:
-        logger.debug("incident_count: probe failed", exc_info=True)
+        logger.exception("incident_count: probe failed")
 
     return KPIComputation(
         value=Decimal(count),
@@ -2388,7 +2403,7 @@ async def pending_variation_value_kpi(
     except ImportError:
         return KPIComputation(value=Decimal("0"), unit="currency", source_record_count=0)
     except Exception:
-        logger.debug("pending_variation_value: probe failed", exc_info=True)
+        logger.exception("pending_variation_value: probe failed")
 
     if project_id is None:
         value, breakdown = _portfolio_money_breakdown(by_currency)
@@ -2461,7 +2476,7 @@ async def _active_baseline_finishes(
     except ImportError:
         return {}
     except Exception:
-        logger.debug("milestone_slippage: baseline probe failed", exc_info=True)
+        logger.exception("milestone_slippage: baseline probe failed")
     return finishes
 
 
@@ -2538,13 +2553,558 @@ async def milestone_slippage_days_kpi(
     except ImportError:
         return KPIComputation(value=Decimal("0"), unit="days", source_record_count=0)
     except Exception:
-        logger.debug("milestone_slippage_days: probe failed", exc_info=True)
+        logger.exception("milestone_slippage_days: probe failed")
 
     return KPIComputation(
         value=Decimal(max_slip),
         unit="days",
         source_record_count=total,
         breakdown={"activities_compared": total, "activities_slipped": slipped},
+    )
+
+
+# ── Cost-composition KPIs (feature: cost dashboard) ─────────────────────
+# Six cost-composition tiles that reuse the EVM/cost primitives the snapshot
+# already computes (BAC, PV, EV, AC) plus a few project facts (elapsed days,
+# gross floor area, the categorized Cost Breakdown Structure). The arithmetic
+# lives in small pure helpers so it is unit-testable with fixture inputs and
+# never divides by zero: each helper returns ``None`` (the "not computable"
+# sentinel) when its denominator is absent, and the async KPI wrapper renders
+# that as a zero value with ``source_record_count == 0`` (the dashboard's
+# "no data" state) rather than a misleading 0. Money stays Decimal throughout.
+
+
+def _pct_over_budget(bac: Decimal, forecast: Decimal) -> Decimal | None:
+    """Percent a forecast final cost runs over (+) or under (-) budget.
+
+    ``(forecast - BAC) / BAC * 100``. A positive result means the project is
+    tracking over its budget baseline, negative means under. Returns ``None``
+    when ``BAC <= 0`` (no baseline to measure against - the guarded case).
+    """
+    if bac <= 0:
+        return None
+    return (forecast - bac) / bac * Decimal("100")
+
+
+def _budget_consumed_pct(bac: Decimal, ac: Decimal) -> Decimal | None:
+    """Percent of the budget baseline already spent: ``AC / BAC * 100``.
+
+    Can exceed 100 once actual cost overruns the baseline. Returns ``None``
+    when ``BAC <= 0`` (nothing to consume against - the guarded case).
+    """
+    if bac <= 0:
+        return None
+    return ac / bac * Decimal("100")
+
+
+def _cost_per_period(actual_cost: Decimal, elapsed: Decimal) -> Decimal | None:
+    """Cost velocity: actual cost spread over elapsed periods (``AC / elapsed``).
+
+    ``elapsed`` is elapsed calendar days for the cost-per-day / burn-rate
+    reading. Returns ``None`` when ``elapsed <= 0`` (the project has not
+    started, or its start date is unknown / in the future - guarded).
+    """
+    if elapsed <= 0:
+        return None
+    return actual_cost / elapsed
+
+
+def _cost_per_unit(actual_cost: Decimal, quantity: Decimal) -> Decimal | None:
+    """Unit cost: actual cost per unit of installed quantity (``AC / quantity``).
+
+    ``quantity`` is a single well-defined denominator (gross floor area in
+    m2). Returns ``None`` when ``quantity <= 0`` (area not recorded - guarded).
+    """
+    if quantity <= 0:
+        return None
+    return actual_cost / quantity
+
+
+def _composition_percentages(by_category: dict[str, Decimal]) -> dict[str, Decimal]:
+    """Turn a ``{category: amount}`` map into ``{category: percent}``.
+
+    Each percent is ``amount / total * 100`` where ``total`` is the sum of
+    all amounts. Negative category amounts are kept (a credit note can push a
+    category negative) but a non-positive ``total`` is treated as no data and
+    yields an empty dict (the guarded divide-by-zero case), so the caller can
+    grey the composition tile instead of dividing by zero.
+    """
+    total = sum(by_category.values(), Decimal("0"))
+    if total <= 0:
+        return {}
+    return {category: amount / total * Decimal("100") for category, amount in by_category.items()}
+
+
+@dataclass
+class _ProjectCostFacts:
+    """Per-project facts the cost-velocity / unit-cost KPIs divide by."""
+
+    currency: str = ""
+    actual_cost: Decimal = Decimal("0")
+    elapsed_days: int | None = None
+    gross_floor_area: Decimal = Decimal("0")
+    record_count: int = 0
+
+
+async def _project_cost_facts(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+) -> _ProjectCostFacts:
+    """Actual cost (base currency) plus the elapsed-days and GFA denominators.
+
+    ``actual_cost`` is the AC from the shared EVM snapshot (settled payments
+    plus committed purchase orders, FX-converted into the project base
+    currency), so the velocity / unit-cost KPIs never re-sum actuals. Elapsed
+    days run from the actual start date (falling back to the planned start) to
+    today; ``None`` when no start date is recorded. ``gross_floor_area`` is the
+    project GFA in m2 (Decimal), 0 when unrecorded. Degrades gracefully - a
+    missing projects module leaves the denominators at their empty defaults.
+    """
+    snap = await _evm_snapshot_for_project(session, project_id)
+    facts = _ProjectCostFacts(
+        currency=(snap.currency or "").strip().upper(),
+        actual_cost=snap.ac,
+        record_count=snap.record_count,
+    )
+    try:
+        from app.modules.projects.models import Project  # type: ignore
+
+        proj = await session.get(Project, project_id)
+    except ImportError:
+        return facts
+    except Exception:
+        logger.exception("cost facts: project probe failed")
+        return facts
+    if proj is None:
+        return facts
+    start = _parse_date(getattr(proj, "actual_start_date", None)) or _parse_date(
+        getattr(proj, "planned_start_date", None),
+    )
+    if start is not None:
+        facts.elapsed_days = (datetime.now(UTC).date() - start).days
+    facts.gross_floor_area = _to_decimal(getattr(proj, "gross_floor_area", None))
+    return facts
+
+
+async def _cost_portfolio_project_ids(
+    session: AsyncSession,
+    allowed_project_ids: set[uuid.UUID] | None,
+) -> list[uuid.UUID]:
+    """Project ids a portfolio cost-velocity / unit-cost KPI fans out over.
+
+    Mirrors the EVM portfolio fan-out scoping (IDOR defence): an empty
+    ``allowed_project_ids`` yields nothing (the caller can reach no project),
+    a non-empty set restricts to it, and ``None`` returns every project
+    (admin / unrestricted).
+    """
+    if allowed_project_ids is not None and not allowed_project_ids:
+        return []
+    try:
+        from app.modules.projects.models import Project  # type: ignore
+
+        stmt = select(Project.id)
+        if allowed_project_ids is not None:
+            stmt = stmt.where(Project.id.in_(allowed_project_ids))
+        return list((await session.execute(stmt)).scalars().all())
+    except ImportError:
+        return []
+    except Exception:
+        logger.exception("cost portfolio: project list failed")
+        return []
+
+
+async def _cost_breakdown_by_category(
+    session: AsyncSession,
+    project_id: uuid.UUID | None,
+    allowed_project_ids: set[uuid.UUID] | None,
+) -> tuple[dict[str, Decimal], str, int, bool]:
+    """Sum the categorized Cost Breakdown Structure by cost category.
+
+    Reads ``costmodel.BudgetLine`` and returns
+    ``(by_category, basis, record_count, multi_currency)`` where:
+
+        * ``by_category`` maps a cost category (labor, material, equipment,
+          subcontractor, overhead, contingency, ...) to its amount converted
+          into the owning project's base currency;
+        * ``basis`` records which amount column fed the map ("actual",
+          "committed" or "planned" - the first with a positive grand total,
+          so the tile is alive as soon as any of the three is populated);
+        * ``record_count`` is the number of budget lines read;
+        * ``multi_currency`` is True when the scope mixed more than one base
+          currency, in which case the portfolio composition is a blended
+          ratio (percentages are dimensionless, so this matches how the
+          portfolio CPI/SPI blend same-shaped sums across currencies).
+
+    Each amount is converted via ``Project.fx_rates`` before summing. Degrades
+    to ``({}, "", 0, False)`` when the cost-model module is absent or a query
+    fails - this is purely a read-side aggregation.
+    """
+    actual: dict[str, Decimal] = {}
+    committed: dict[str, Decimal] = {}
+    planned: dict[str, Decimal] = {}
+    total_actual = Decimal("0")
+    total_committed = Decimal("0")
+    total_planned = Decimal("0")
+    count = 0
+    bases_seen: set[str] = set()
+    base_currency, fx_map = await _project_currency_and_fx(session, project_id)
+    fx_cache: dict[uuid.UUID, tuple[str, dict[str, str]]] = {}
+    try:
+        from app.modules.costmodel.models import BudgetLine  # type: ignore
+
+        stmt = select(BudgetLine)
+        if project_id is not None:
+            stmt = stmt.where(BudgetLine.project_id == project_id)
+        stmt = _scope_portfolio(stmt, BudgetLine.project_id, project_id, allowed_project_ids)
+        rows = (await session.execute(stmt)).scalars().all()
+        for row in rows:
+            category = (getattr(row, "category", "") or "uncategorized").strip().lower() or "uncategorized"
+            code = str(getattr(row, "currency", "") or "").strip().upper()
+            row_base, row_fx = base_currency, fx_map
+            if project_id is None:
+                pid = getattr(row, "project_id", None)
+                if pid is not None:
+                    if pid not in fx_cache:
+                        fx_cache[pid] = await _project_currency_and_fx(session, pid)
+                    row_base, row_fx = fx_cache[pid]
+            bases_seen.add(row_base or code or "UNKNOWN")
+            amt_a = _amount_in_base(_to_decimal(getattr(row, "actual_amount", 0)), code, row_fx, row_base)
+            amt_c = _amount_in_base(_to_decimal(getattr(row, "committed_amount", 0)), code, row_fx, row_base)
+            amt_p = _amount_in_base(_to_decimal(getattr(row, "planned_amount", 0)), code, row_fx, row_base)
+            actual[category] = actual.get(category, Decimal("0")) + amt_a
+            committed[category] = committed.get(category, Decimal("0")) + amt_c
+            planned[category] = planned.get(category, Decimal("0")) + amt_p
+            total_actual += amt_a
+            total_committed += amt_c
+            total_planned += amt_p
+            count += 1
+    except ImportError:
+        return {}, "", 0, False
+    except Exception:
+        logger.exception("cost_split_by_category: probe failed")
+        return {}, "", 0, False
+
+    multi_currency = len(bases_seen) > 1
+    if total_actual > 0:
+        return actual, "actual", count, multi_currency
+    if total_committed > 0:
+        return committed, "committed", count, multi_currency
+    if total_planned > 0:
+        return planned, "planned", count, multi_currency
+    return {}, "", count, multi_currency
+
+
+@register_kpi(
+    "forecast_final_cost",
+    name="Forecast Final Cost",
+    unit="currency",
+    category="cost",
+    source_modules=["finance", "tasks", "projects", "procurement"],
+    description="Projected total cost at completion (EAC), stated plainly for the cost dashboard.",
+)
+async def forecast_final_cost_kpi(
+    session: AsyncSession,
+    project_id: uuid.UUID | None = None,
+    allowed_project_ids: set[uuid.UUID] | None = None,
+    **_: Any,
+) -> KPIComputation:
+    """Forecast final cost = EAC = AC + (BAC - EV) / (CPI * SPI).
+
+    A plain-language restatement of the EVM ``eac`` KPI for the cost
+    dashboard - what the project is now expected to cost in total. Reuses the
+    same EVM primitives and per-currency handling as ``eac`` so the two tiles
+    always agree; portfolio mode forecasts each currency bucket from its own
+    primitives rather than the blended scalars (EAC is non-linear).
+    """
+    snap = await _evm_snapshot(session, project_id, allowed_project_ids)
+    scalar_eac = _eac_from_primitives(snap.bac, snap.pv, snap.ev, snap.ac)
+    per_currency = {
+        code: _eac_from_primitives(
+            snap.bac_by_currency.get(code, Decimal("0")),
+            snap.pv_by_currency.get(code, Decimal("0")),
+            snap.ev_by_currency.get(code, Decimal("0")),
+            snap.ac_by_currency.get(code, Decimal("0")),
+        )
+        for code in (
+            set(snap.bac_by_currency) | set(snap.pv_by_currency) | set(snap.ev_by_currency) | set(snap.ac_by_currency)
+        )
+    }
+    return _evm_currency_result(
+        snap,
+        scalar_value=scalar_eac,
+        per_currency=per_currency,
+    )
+
+
+@register_kpi(
+    "pct_over_budget",
+    name="Percent Over Budget",
+    unit="percent",
+    category="cost",
+    source_modules=["finance", "tasks", "projects", "procurement"],
+    target_default=Decimal("0"),
+    description="Forecast vs budget: (EAC - BAC) / BAC. Positive = heading over budget.",
+)
+async def pct_over_budget_kpi(
+    session: AsyncSession,
+    project_id: uuid.UUID | None = None,
+    allowed_project_ids: set[uuid.UUID] | None = None,
+    **_: Any,
+) -> KPIComputation:
+    """Percent the forecast final cost runs over (+) or under (-) budget.
+
+    ``(EAC - BAC) / BAC * 100``, a currency-neutral ratio, so portfolio mode
+    reads the blended scalar sums like the other index KPIs. The actual-cost
+    variant ``(AC - BAC) / BAC`` rides in the breakdown. Greys out (no data)
+    when no budget baseline exists, so the tile never shows a misleading 0%.
+    """
+    snap = await _evm_snapshot(session, project_id, allowed_project_ids)
+    forecast = _eac_from_primitives(snap.bac, snap.pv, snap.ev, snap.ac)
+    value = _pct_over_budget(snap.bac, forecast)
+    if value is None:
+        return KPIComputation(
+            value=Decimal("0"),
+            unit="percent",
+            source_record_count=0,
+            breakdown={**snap.breakdown, "reason": "no_budget_baseline"},
+        )
+    breakdown = {**snap.breakdown, "forecast_final_cost": str(forecast)}
+    actual_pct = _pct_over_budget(snap.bac, snap.ac)
+    if actual_pct is not None:
+        breakdown["actual_vs_budget_pct"] = str(actual_pct)
+    return KPIComputation(
+        value=value,
+        unit="percent",
+        source_record_count=snap.record_count,
+        breakdown=breakdown,
+    )
+
+
+@register_kpi(
+    "budget_consumed_pct",
+    name="Budget Consumed",
+    unit="percent",
+    category="cost",
+    source_modules=["finance", "projects", "procurement"],
+    target_default=Decimal("100"),
+    description="Actual cost as a percent of the budget baseline: AC / BAC.",
+)
+async def budget_consumed_pct_kpi(
+    session: AsyncSession,
+    project_id: uuid.UUID | None = None,
+    allowed_project_ids: set[uuid.UUID] | None = None,
+    **_: Any,
+) -> KPIComputation:
+    """Percent of the budget baseline already spent: ``AC / BAC * 100``.
+
+    Pairs with percent-complete to expose a project burning budget faster
+    than it earns value. Currency-neutral ratio, so portfolio mode uses the
+    blended scalar sums. Greys out (no data) when no budget baseline exists.
+    """
+    snap = await _evm_snapshot(session, project_id, allowed_project_ids)
+    value = _budget_consumed_pct(snap.bac, snap.ac)
+    if value is None:
+        return KPIComputation(
+            value=Decimal("0"),
+            unit="percent",
+            source_record_count=0,
+            breakdown={**snap.breakdown, "reason": "no_budget_baseline"},
+        )
+    return KPIComputation(
+        value=value,
+        unit="percent",
+        source_record_count=snap.record_count,
+        breakdown=snap.breakdown,
+    )
+
+
+@register_kpi(
+    "cost_per_day",
+    name="Cost per Day",
+    unit="currency",
+    category="cost",
+    source_modules=["finance", "procurement", "projects"],
+    description="Cost velocity: actual cost to date over elapsed calendar days (burn rate).",
+)
+async def cost_per_day_kpi(
+    session: AsyncSession,
+    project_id: uuid.UUID | None = None,
+    allowed_project_ids: set[uuid.UUID] | None = None,
+    **_: Any,
+) -> KPIComputation:
+    """Average daily burn: cumulative actual cost / elapsed calendar days.
+
+    Single project: AC (base currency) over the days since the project
+    started. Portfolio: each project's daily burn is bucketed by its base
+    currency and the dominant currency's total daily burn is the headline
+    (never a blended cross-currency scalar), so the tile reads as total
+    money-per-day across the accessible portfolio. Greys out (no data) when
+    no start date is recorded or the project has not started yet.
+
+    This single velocity tile is both the "cost per day" and the "burn rate"
+    reading; a distinct windowed burn rate would need dated payment / PO rows
+    the shared EVM snapshot deliberately does not expose.
+    """
+    if project_id is not None:
+        facts = await _project_cost_facts(session, project_id)
+        days = facts.elapsed_days
+        value = _cost_per_period(facts.actual_cost, Decimal(days)) if days is not None else None
+        if value is None:
+            return KPIComputation(
+                value=Decimal("0"),
+                unit="currency",
+                source_record_count=0,
+                breakdown={"currency": facts.currency, "reason": "no_elapsed_time"},
+            )
+        return KPIComputation(
+            value=value,
+            unit="currency",
+            source_record_count=facts.record_count,
+            breakdown={
+                "currency": facts.currency,
+                "actual_cost": str(facts.actual_cost),
+                "elapsed_days": days,
+            },
+        )
+    # Portfolio: sum each project's daily burn, grouped by base currency.
+    by_currency: dict[str, Decimal] = {}
+    count = 0
+    for pid in await _cost_portfolio_project_ids(session, allowed_project_ids):
+        facts = await _project_cost_facts(session, pid)
+        if facts.elapsed_days is None:
+            continue
+        velocity = _cost_per_period(facts.actual_cost, Decimal(facts.elapsed_days))
+        if velocity is None:
+            continue
+        _add_currency_bucket(by_currency, velocity, facts.currency, "")
+        count += facts.record_count
+    value, breakdown = _portfolio_money_breakdown(by_currency)
+    return KPIComputation(
+        value=value,
+        unit="currency",
+        source_record_count=count,
+        breakdown=breakdown,
+    )
+
+
+@register_kpi(
+    "cost_per_m2",
+    name="Cost per m2 (GFA)",
+    unit="currency",
+    category="cost",
+    source_modules=["finance", "procurement", "projects"],
+    description="Actual cost per m2 of gross floor area - the canonical construction unit cost.",
+)
+async def cost_per_m2_kpi(
+    session: AsyncSession,
+    project_id: uuid.UUID | None = None,
+    allowed_project_ids: set[uuid.UUID] | None = None,
+    **_: Any,
+) -> KPIComputation:
+    """Unit cost: actual cost divided by gross floor area (m2 GFA).
+
+    GFA is the one well-defined quantity every project shares, so unlike a
+    mixed-unit sum of BOQ quantities (m + m2 + kg + pcs, which cannot be
+    added) it yields a meaningful, guarded unit cost. Single project: AC
+    (base currency) / GFA. Portfolio: projects are grouped by base currency
+    and each group's Sigma AC / Sigma GFA is a real blended unit cost, the
+    dominant currency's figure being the headline. Greys out (no data) when
+    no floor area is recorded.
+    """
+    if project_id is not None:
+        facts = await _project_cost_facts(session, project_id)
+        value = _cost_per_unit(facts.actual_cost, facts.gross_floor_area)
+        if value is None:
+            return KPIComputation(
+                value=Decimal("0"),
+                unit="currency",
+                source_record_count=0,
+                breakdown={"currency": facts.currency, "reason": "no_floor_area"},
+            )
+        return KPIComputation(
+            value=value,
+            unit="currency",
+            source_record_count=facts.record_count,
+            breakdown={
+                "currency": facts.currency,
+                "actual_cost": str(facts.actual_cost),
+                "gross_floor_area_m2": str(facts.gross_floor_area),
+            },
+        )
+    # Portfolio: per base currency, Sigma AC / Sigma GFA is a real unit cost.
+    ac_by_currency: dict[str, Decimal] = {}
+    area_by_currency: dict[str, Decimal] = {}
+    count = 0
+    for pid in await _cost_portfolio_project_ids(session, allowed_project_ids):
+        facts = await _project_cost_facts(session, pid)
+        if facts.gross_floor_area <= 0:
+            continue
+        ac_by_currency[facts.currency] = ac_by_currency.get(facts.currency, Decimal("0")) + facts.actual_cost
+        area_by_currency[facts.currency] = area_by_currency.get(facts.currency, Decimal("0")) + facts.gross_floor_area
+        count += facts.record_count
+    unit_by_currency = {
+        code: _cost_per_unit(ac_by_currency[code], area_by_currency[code]) or Decimal("0") for code in ac_by_currency
+    }
+    value, breakdown = _portfolio_money_breakdown(unit_by_currency)
+    return KPIComputation(
+        value=value,
+        unit="currency",
+        source_record_count=count,
+        breakdown=breakdown,
+    )
+
+
+@register_kpi(
+    "cost_split_by_category",
+    name="Cost Split by Category",
+    unit="percent",
+    category="cost",
+    source_modules=["costmodel"],
+    description="Labor / material / equipment / subcontractor cost composition as percentages.",
+)
+async def cost_split_by_category_kpi(
+    session: AsyncSession,
+    project_id: uuid.UUID | None = None,
+    allowed_project_ids: set[uuid.UUID] | None = None,
+    **_: Any,
+) -> KPIComputation:
+    """Cost composition: each cost category's share of the categorized total.
+
+    Reads the project Cost Breakdown Structure (``costmodel.BudgetLine``),
+    summing the actual amount per category (falling back to committed, then
+    planned, so the tile is alive before invoices land) and expressing each
+    category as a percentage of the total. The headline value is the labor
+    share when the project tracks it (the most scrutinized cost driver),
+    else the largest category's share; the full per-category percentage map
+    and the underlying amounts ride in the breakdown for the composition
+    chart, keyed so the UI can drill into labor / material / equipment.
+    """
+    by_category, basis, count, multi_currency = await _cost_breakdown_by_category(
+        session,
+        project_id,
+        allowed_project_ids,
+    )
+    percentages = _composition_percentages(by_category)
+    if not percentages:
+        return KPIComputation(
+            value=Decimal("0"),
+            unit="percent",
+            source_record_count=0,
+            breakdown={"basis": basis, "reason": "no_categorized_cost"},
+        )
+    headline_category = "labor" if "labor" in percentages else max(sorted(percentages), key=percentages.__getitem__)
+    breakdown = {
+        "basis": basis,
+        "headline_category": headline_category,
+        "multi_currency": multi_currency,
+        "percentages": {c: str(v) for c, v in sorted(percentages.items())},
+        "amounts": {c: str(v) for c, v in sorted(by_category.items())},
+    }
+    return KPIComputation(
+        value=percentages[headline_category],
+        unit="percent",
+        source_record_count=count,
+        breakdown=breakdown,
     )
 
 
@@ -2615,7 +3175,7 @@ async def _evm_drilldown_records(
     except ImportError:
         pass
     except Exception:
-        logger.debug("evm drilldown: tasks probe failed", exc_info=True)
+        logger.exception("evm drilldown: tasks probe failed")
     # Actual cost rows: settled payments (joined to the invoice for project
     # scope) - there is no finance.Expense model on this platform.
     try:
@@ -2639,7 +3199,7 @@ async def _evm_drilldown_records(
     except ImportError:
         pass
     except Exception:
-        logger.debug("evm drilldown: finance probe failed", exc_info=True)
+        logger.exception("evm drilldown: finance probe failed")
     # Committed cost rows: purchase orders.
     try:
         from app.modules.procurement.models import PurchaseOrder  # type: ignore
@@ -2663,12 +3223,56 @@ async def _evm_drilldown_records(
     except ImportError:
         pass
     except Exception:
-        logger.debug("evm drilldown: procurement probe failed", exc_info=True)
+        logger.exception("evm drilldown: procurement probe failed")
     return records
 
 
 for _evm_code in ("cpi", "spi", "cv", "sv", "eac", "etc", "vac", "tcpi"):
     KPI_RECORD_PROVIDERS[_evm_code] = _evm_drilldown_records
+
+# The cost-composition tiles that derive from actual cost (AC) share the EVM
+# drill-down: their aggregate is built from the same tasks / payments /
+# purchase orders, so the drawer lists exactly those rows.
+for _cost_code in ("forecast_final_cost", "pct_over_budget", "budget_consumed_pct", "cost_per_day", "cost_per_m2"):
+    KPI_RECORD_PROVIDERS[_cost_code] = _evm_drilldown_records
+
+
+@register_kpi_records("cost_split_by_category")
+async def _cost_split_records(
+    session: AsyncSession,
+    project_id: uuid.UUID | None,
+    limit: int,
+    allowed_project_ids: set[uuid.UUID] | None = None,
+) -> list[dict[str, Any]]:
+    """Budget lines behind ``cost_split_by_category`` (the categorized cost rows)."""
+    records: list[dict[str, Any]] = []
+    try:
+        from app.modules.costmodel.models import BudgetLine  # type: ignore
+
+        stmt = select(BudgetLine)
+        if project_id is not None:
+            stmt = stmt.where(BudgetLine.project_id == project_id)
+        stmt = _scope_portfolio(stmt, BudgetLine.project_id, project_id, allowed_project_ids).limit(limit)
+        rows = (await session.execute(stmt)).scalars().all()
+        for row in rows:
+            records.append(
+                {
+                    "kind": "budget_line",
+                    "id": str(row.id),
+                    "category": getattr(row, "category", "") or "",
+                    "description": (getattr(row, "description", "") or "")[:200],
+                    "planned_amount": str(_to_decimal(getattr(row, "planned_amount", 0))),
+                    "committed_amount": str(_to_decimal(getattr(row, "committed_amount", 0))),
+                    "actual_amount": str(_to_decimal(getattr(row, "actual_amount", 0))),
+                    "currency": getattr(row, "currency", "") or "",
+                    "project_id": str(getattr(row, "project_id", "") or ""),
+                },
+            )
+    except ImportError:
+        pass
+    except Exception:
+        logger.exception("cost_split_by_category drilldown: probe failed")
+    return records
 
 
 @register_kpi_records("safety_trir")
@@ -2705,7 +3309,7 @@ async def _safety_trir_records(
     except ImportError:
         pass
     except Exception:
-        logger.debug("safety_trir drilldown: probe failed", exc_info=True)
+        logger.exception("safety_trir drilldown: probe failed")
     return records
 
 
@@ -2740,7 +3344,7 @@ async def _projects_active_records(
     except ImportError:
         pass
     except Exception:
-        logger.debug("project_count_active drilldown: probe failed", exc_info=True)
+        logger.exception("project_count_active drilldown: probe failed")
     return records
 
 
@@ -2784,7 +3388,7 @@ async def _risk_drilldown_records(
     except ImportError:
         pass
     except Exception:
-        logger.debug("risk drilldown: probe failed", exc_info=True)
+        logger.exception("risk drilldown: probe failed")
     return records
 
 
@@ -2827,7 +3431,7 @@ async def _ncr_open_records(
     except ImportError:
         pass
     except Exception:
-        logger.debug("ncr_open_count drilldown: probe failed", exc_info=True)
+        logger.exception("ncr_open_count drilldown: probe failed")
     return records
 
 
@@ -2862,7 +3466,7 @@ async def _incident_records(
     except ImportError:
         pass
     except Exception:
-        logger.debug("incident_count drilldown: probe failed", exc_info=True)
+        logger.exception("incident_count drilldown: probe failed")
     return records
 
 
@@ -2900,7 +3504,7 @@ async def _pending_variation_records(
     except ImportError:
         pass
     except Exception:
-        logger.debug("pending_variation_value drilldown: probe failed", exc_info=True)
+        logger.exception("pending_variation_value drilldown: probe failed")
     return records
 
 
@@ -2964,7 +3568,7 @@ async def _milestone_slippage_records(
     except ImportError:
         pass
     except Exception:
-        logger.debug("milestone_slippage_days drilldown: probe failed", exc_info=True)
+        logger.exception("milestone_slippage_days drilldown: probe failed")
     return records
 
 
@@ -3009,7 +3613,7 @@ async def _first_pass_yield_records(
     except ImportError:
         pass
     except Exception:
-        logger.debug("first_pass_yield drilldown: probe failed", exc_info=True)
+        logger.exception("first_pass_yield drilldown: probe failed")
     return records
 
 
@@ -3046,7 +3650,7 @@ async def _copq_records(
     except ImportError:
         pass
     except Exception:
-        logger.debug("copq drilldown: probe failed", exc_info=True)
+        logger.exception("copq drilldown: probe failed")
     return records
 
 
@@ -3083,7 +3687,7 @@ async def _rfi_close_records(
     except ImportError:
         pass
     except Exception:
-        logger.debug("rfi_close_avg_days drilldown: probe failed", exc_info=True)
+        logger.exception("rfi_close_avg_days drilldown: probe failed")
     return records
 
 
@@ -3123,7 +3727,7 @@ async def _change_order_records(
     except ImportError:
         pass
     except Exception:
-        logger.debug("change_order_ratio drilldown: probe failed", exc_info=True)
+        logger.exception("change_order_ratio drilldown: probe failed")
     return records
 
 
@@ -3180,21 +3784,35 @@ async def benchmark(
     except ImportError:
         return {}
     except Exception:
-        logger.debug("benchmark: project list failed", exc_info=True)
+        logger.exception("benchmark: project list failed")
         return {}
 
     project_values: list[Decimal] = []
     target_value: Decimal | None = None
+    failed_projects = 0
     for proj in rows:
         try:
             result = await compute(code, session, project_id=proj.id)
         except Exception:
+            # One project must not sink the whole benchmark, but a silently
+            # skipped project shifts the median and the percentile the user
+            # reads. Count them and report once after the loop rather than
+            # logging per project.
+            failed_projects += 1
             continue
         if result.source_record_count == 0:
             continue
         project_values.append(result.value)
         if proj.id == project_id:
             target_value = result.value
+    if failed_projects:
+        logger.warning(
+            "benchmark: KPI %s could not be computed for %s of %s projects - "
+            "the median and percentile are based on the remaining ones",
+            code,
+            failed_projects,
+            len(rows),
+        )
     if not project_values or target_value is None:
         return {}
     project_values.sort()
@@ -3236,7 +3854,13 @@ async def compute(
     """
     fn = KPI_FORMULAS.get(code)
     if fn is None:
-        logger.debug("compute: unknown KPI code=%s", code)
+        # A widget pointing at a KPI code nothing registers renders a
+        # permanent zero. That is a misconfiguration, not a data reading,
+        # so it must be visible above DEBUG.
+        logger.warning(
+            "compute: unknown KPI code=%s - the widget will render 0 until the code is registered",
+            code,
+        )
         return KPIComputation()
     try:
         return await fn(

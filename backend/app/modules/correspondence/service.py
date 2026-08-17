@@ -76,6 +76,9 @@ class CorrespondenceService:
                 linked_document_ids=data.linked_document_ids,
                 linked_transmittal_id=data.linked_transmittal_id,
                 linked_rfi_id=data.linked_rfi_id,
+                status=data.status,
+                response_required_by=data.response_required_by,
+                contract_clause_ref=data.contract_clause_ref,
                 notes=data.notes,
                 created_by=user_id,
                 metadata_=data.metadata,
@@ -146,6 +149,7 @@ class CorrespondenceService:
         limit: int = 50,
         direction: str | None = None,
         correspondence_type: str | None = None,
+        status: str | None = None,
     ) -> tuple[list[Correspondence], int]:
         return await self.repo.list_for_project(
             project_id,
@@ -153,6 +157,7 @@ class CorrespondenceService:
             limit=limit,
             direction=direction,
             correspondence_type=correspondence_type,
+            status=status,
         )
 
     async def update_correspondence(

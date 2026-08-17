@@ -27,11 +27,14 @@ import {
   BookOpen,
   Network,
   ArrowRight,
+  Trash2,
 } from 'lucide-react';
 import {
   Button,
   Card,
   Badge,
+  CollapsibleSection,
+  ConfirmDialog,
   EmptyState,
   Breadcrumb,
   RecoveryCard,
@@ -50,17 +53,25 @@ import { MoneyDisplay } from '@/shared/ui/MoneyDisplay';
 import { MultiCurrencyTotal } from '@/shared/ui/MultiCurrencyTotal';
 import { DateDisplay } from '@/shared/ui/DateDisplay';
 import { PageHeader } from '@/shared/ui/PageHeader';
+import {
+  ContractTemplatesPanel,
+  TEMPLATE_CATALOGUE_KEY,
+} from './ContractTemplatesPanel';
 import { ContractStatusPipeline } from './ContractStatusPipeline';
 import { ContractExpiryBadge } from './ContractExpiryBadge';
 import { ComplianceGate } from './ComplianceGate';
+import { ContractPartiesPanel } from './ContractPartiesPanel';
+import { ContractSecuritiesPanel } from './ContractSecuritiesPanel';
+import { ContractAnalyticsPanels } from './ContractAnalyticsPanels';
 import { contractsGuide } from './contractsGuide';
 import { useToastStore } from '@/stores/useToastStore';
-import { useProjectContextStore } from '@/stores/useProjectContextStore';
+import { useActiveProjectId } from '@/shared/hooks/useActiveProjectId';
 import { useAuthStore } from '@/stores/useAuthStore';
 import { getErrorMessage } from '@/shared/lib/api';
 import { projectsApi } from '@/features/projects/api';
 import { listSubcontractors } from '@/features/subcontractors/api';
 import { fetchContacts } from '@/features/contacts/api';
+import { getRetentionLedger } from '@/features/finance/api';
 import {
   listContracts,
   listProgressClaims,
@@ -72,6 +83,7 @@ import {
   terminateContract,
   closeContract,
   cloneContract,
+  deleteContract,
   listClauseTemplates,
   submitClaim,
   approveClaim,
@@ -88,8 +100,10 @@ import {
   type CounterpartyType,
   type ContractDashboard,
 } from './api';
+import { InsightsPanel, InsightsToggleButton, useModuleInsights } from '@/features/insights';
+import { buildContractsInsights } from './contractsInsights';
 
-type Tab = 'contracts' | 'claims' | 'final_accounts';
+type Tab = 'contracts' | 'claims' | 'final_accounts' | 'templates';
 
 const CONTRACT_TYPE_COLORS: Record<
   ContractType,
@@ -202,6 +216,17 @@ function claimStatusLabel(t: TFunction, status: ClaimStatus): string {
   });
 }
 
+/** Human label for a retention ledger direction (payable / receivable). */
+function retentionDirectionLabel(t: TFunction, direction: string): string {
+  if (direction === 'payable') {
+    return t('contracts.retention_payable', { defaultValue: 'Payable' });
+  }
+  if (direction === 'receivable') {
+    return t('contracts.retention_receivable', { defaultValue: 'Receivable' });
+  }
+  return direction;
+}
+
 const inputCls =
   'h-9 w-full rounded-lg border border-border bg-surface-primary px-3 text-sm focus:outline-none focus:ring-2 focus:ring-oe-blue/30 focus:border-oe-blue';
 
@@ -290,7 +315,14 @@ function CounterpartyLink({
     );
   }
 
-  const contact = (contactsQ.data ?? []).find((c) => c.id === id);
+  // Known limit, deliberately left as it stands: this component renders once
+  // per contract row, so one shared 500-row page is one request where a
+  // per-id lookup would be one per distinct counterparty on screen. Past 500
+  // contacts a client counterparty falls out of the page and the cell quietly
+  // degrades to the type word instead of the firm name. The honest fix is a
+  // by-ids batch route, which is backend scope, not a notice here - a link
+  // cell has nowhere to say "showing 500 of 3500" that would mean anything.
+  const contact = (contactsQ.data?.items ?? []).find((c) => c.id === id);
   const contactName =
     contact?.company_name ||
     contact?.legal_name ||
@@ -365,12 +397,12 @@ function HowContractsWork() {
   ];
 
   return (
-    <Card padding="md">
-      <h2 className="flex items-center gap-1.5 text-sm font-semibold text-content-primary">
-        <Network size={15} className="text-oe-blue" />
-        {t('contracts.flow_title', { defaultValue: 'How contracts fit together' })}
-      </h2>
-      <p className="mt-1 text-xs text-content-tertiary">
+    <CollapsibleSection
+      storageKey="contracts.how"
+      icon={<Network size={15} className="text-oe-blue" />}
+      title={t('contracts.flow_title', { defaultValue: 'How contracts fit together' })}
+    >
+      <p className="text-xs text-content-tertiary">
         {t('contracts.flow_intro', {
           defaultValue:
             'A won deal or an awarded bid becomes a contract with a counterparty, billed through progress claims and settled in a final account. Variations keep the sum honest, and certified amounts reconcile against committed cost.',
@@ -427,7 +459,7 @@ function HowContractsWork() {
           </ModLink>
         </span>
       </div>
-    </Card>
+    </CollapsibleSection>
   );
 }
 
@@ -438,7 +470,7 @@ export function ContractsPage() {
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
   const [tab, setTab] = useState<Tab>('contracts');
-  const activeProjectId = useProjectContextStore((s) => s.activeProjectId);
+  const activeProjectId = useActiveProjectId();
 
   // CONN-43 consumer: a subcontractor's "Subcontract agreement" pill deep-links
   // here with ?counterparty=<id> so the register opens scoped to that firm's
@@ -487,6 +519,21 @@ export function ContractsPage() {
     () => (projectsQ.data ?? []).find((p) => p.id === projectId),
     [projectsQ.data, projectId],
   );
+
+  // Module Insights - reads the loaded contract register (charts, KPIs). Kept
+  // among the top hooks, above every conditional render, so hook order is
+  // stable no matter which tab or drawer is open.
+  const insights = useModuleInsights('contracts', { defaultOpen: true });
+  const { datasets: insightDatasets, builtins: insightBuiltins } = useMemo(
+    () =>
+      buildContractsInsights(
+        contracts,
+        selectedProject?.currency || contracts[0]?.currency || '',
+        t,
+      ),
+    [contracts, selectedProject, t],
+  );
+
   const [claimsContractId, setClaimsContractId] = useState<string>('');
   const effectiveClaimsContract = claimsContractId || contracts[0]?.id || '';
 
@@ -576,6 +623,7 @@ export function ContractsPage() {
         })}
         actions={
           <>
+            <InsightsToggleButton open={insights.open} onClick={insights.toggle} />
             <ModuleGuideButton content={contractsGuide} />
             <Button
               variant="primary"
@@ -592,6 +640,18 @@ export function ContractsPage() {
             </Button>
           </>
         }
+      />
+
+      <InsightsPanel
+        open={insights.open}
+        title={t('contracts.insights.title', { defaultValue: 'Contract insights' })}
+        datasets={insightDatasets}
+        builtins={insightBuiltins}
+        custom={insights.custom}
+        onAdd={insights.addCustom}
+        onUpdate={insights.updateCustom}
+        onRemove={insights.removeCustom}
+        onCollapse={() => insights.setOpen(false)}
       />
 
       <DismissibleInfo
@@ -646,6 +706,11 @@ export function ContractsPage() {
                 id: 'final_accounts',
                 label: t('contracts.tab_final_accounts', { defaultValue: 'Final Accounts' }),
                 icon: Archive,
+              },
+              {
+                id: 'templates',
+                label: t('contracts.tab_templates', { defaultValue: 'Clause Templates' }),
+                icon: BookOpen,
               },
             ] as { id: Tab; label: string; icon: React.ElementType }[]
           ).map((it) => {
@@ -714,7 +779,7 @@ export function ContractsPage() {
           </select>
         )}
 
-        {tab !== 'contracts' && contracts.length > 0 && (
+        {tab !== 'contracts' && tab !== 'templates' && contracts.length > 0 && (
           <select
             value={effectiveClaimsContract}
             onChange={(e) => setClaimsContractId(e.target.value)}
@@ -731,36 +796,41 @@ export function ContractsPage() {
           </select>
         )}
 
-        <select
-          value={statusFilter}
-          onChange={(e) => setStatusFilter(e.target.value)}
-          aria-label={t('a11y.contracts.status_filter', {
-            defaultValue: 'Filter contracts by status',
-          })}
-          className={clsx(inputCls, 'max-w-[180px]')}
-        >
-          <option value="">
-            {t('common.all_statuses', { defaultValue: 'All statuses' })}
-          </option>
-          {tab === 'contracts' &&
-            CONTRACT_STATUSES.map((s) => (
-              <option key={s} value={s}>
-                {contractStatusLabel(t, s)}
-              </option>
-            ))}
-          {tab === 'claims' &&
-            CLAIM_STATUSES.map((s) => (
-              <option key={s} value={s}>
-                {claimStatusLabel(t, s)}
-              </option>
-            ))}
-          {tab === 'final_accounts' &&
-            FINAL_ACCOUNT_CONTRACT_STATUSES.map((s) => (
-              <option key={s} value={s}>
-                {contractStatusLabel(t, s)}
-              </option>
-            ))}
-        </select>
+        {/* The template library filters itself by the search box alone: its
+            rows are catalogue entries, not contracts, so a contract-status
+            select over them would offer statuses none of them can hold. */}
+        {tab !== 'templates' && (
+          <select
+            value={statusFilter}
+            onChange={(e) => setStatusFilter(e.target.value)}
+            aria-label={t('a11y.contracts.status_filter', {
+              defaultValue: 'Filter contracts by status',
+            })}
+            className={clsx(inputCls, 'max-w-[180px]')}
+          >
+            <option value="">
+              {t('common.all_statuses', { defaultValue: 'All statuses' })}
+            </option>
+            {tab === 'contracts' &&
+              CONTRACT_STATUSES.map((s) => (
+                <option key={s} value={s}>
+                  {contractStatusLabel(t, s)}
+                </option>
+              ))}
+            {tab === 'claims' &&
+              CLAIM_STATUSES.map((s) => (
+                <option key={s} value={s}>
+                  {claimStatusLabel(t, s)}
+                </option>
+              ))}
+            {tab === 'final_accounts' &&
+              FINAL_ACCOUNT_CONTRACT_STATUSES.map((s) => (
+                <option key={s} value={s}>
+                  {contractStatusLabel(t, s)}
+                </option>
+              ))}
+          </select>
+        )}
       </div>
 
       {/* CONN-43: active counterparty deep-link filter, dismissible. */}
@@ -785,7 +855,12 @@ export function ContractsPage() {
 
       {/* Body */}
       <Card padding="none">
-        {!projectId ? (
+        {/* Templates are tenant-wide paper, not project data, so the library
+            sits above the project gate. Requiring a project to look at a
+            standard form would be a gate on nothing. */}
+        {tab === 'templates' ? (
+          <ContractTemplatesPanel search={search} />
+        ) : !projectId ? (
           <RequiresProject
             emptyHint={t('contracts.no_project_desc', {
               defaultValue: 'Pick a project above to view its contracts.',
@@ -863,14 +938,24 @@ function ContractTable({
   // query is cheap (in-memory dict on the backend) and is shared with
   // the CreateContractModal via React Query's cache.
   const templatesQ = useQuery({
-    queryKey: ['contracts', 'clause-templates'],
+    queryKey: TEMPLATE_CATALOGUE_KEY,
     queryFn: listClauseTemplates,
     staleTime: 60 * 60 * 1000,
   });
 
   if (rows.length === 0) {
+    // Only paper a contract can actually be drawn from. The catalogue now
+    // carries the tenant's own templates too, and an unpublished draft is
+    // refused at contract creation, so advertising its family here would
+    // promise something the next screen takes away. A built-in reports
+    // "published", so both halves pass through this one predicate.
     const families = Array.from(
-      new Set((templatesQ.data ?? []).map((tpl) => tpl.family.toUpperCase())),
+      new Set(
+        (templatesQ.data ?? [])
+          .filter((tpl) => tpl.status === 'published')
+          .map((tpl) => tpl.family.toUpperCase())
+          .filter(Boolean),
+      ),
     ).slice(0, 5);
     return (
       <div className="relative">
@@ -1299,9 +1384,11 @@ function FinalAccountsView({
   );
 }
 
-/* ─── Detail drawer ─── */
+/* ─── Detail drawer ───
+   Exported for the delete-affordance test; the page itself renders it
+   directly. */
 
-function ContractDetailDrawer({
+export function ContractDetailDrawer({
   contractId,
   contracts,
   onClose,
@@ -1318,6 +1405,7 @@ function ContractDetailDrawer({
   // the project's compliance rule packs against the SoV and only lets the
   // user sign once there are no blocking errors.
   const [gateOpen, setGateOpen] = useState(false);
+  const [deleteOpen, setDeleteOpen] = useState(false);
 
   const linesQ = useQuery({
     queryKey: ['contracts', 'lines', contractId],
@@ -1332,6 +1420,16 @@ function ContractDetailDrawer({
   const dashQ = useQuery<ContractDashboard>({
     queryKey: ['contracts', 'dashboard', contractId],
     queryFn: () => getContractDashboard(contractId),
+    retry: false,
+  });
+
+  // Real retention ledger for the whole project (per currency and direction),
+  // replacing the former single-scalar placeholder. Scoped to the contract's
+  // project since the finance ledger endpoint is project-wide.
+  const retentionQ = useQuery({
+    queryKey: ['finance', 'retention-ledger', contract?.project_id],
+    queryFn: () => getRetentionLedger(contract!.project_id),
+    enabled: !!contract?.project_id,
     retry: false,
   });
 
@@ -1419,6 +1517,29 @@ function ContractDetailDrawer({
     onError: (err) => addToast({ type: 'error', title: getErrorMessage(err) }),
   });
 
+  // Delete is offered on a draft and on nothing else, which is the same rule
+  // the endpoint enforces. A contract that has been signed is the commercial
+  // record of the job and leaves through its status, not through deletion.
+  // The drawer has to close on success: its subject is looked up out of the
+  // list by id, so once the row is gone the drawer would render nothing while
+  // still counting as open.
+  const deleteMut = useMutation({
+    mutationFn: () => deleteContract(contractId),
+    onSuccess: () => {
+      setDeleteOpen(false);
+      qc.invalidateQueries({ queryKey: ['contracts', 'list'] });
+      addToast({
+        type: 'success',
+        title: t('contracts.deleted_ok', { defaultValue: 'Draft contract deleted' }),
+      });
+      onClose();
+    },
+    onError: (err) => {
+      setDeleteOpen(false);
+      addToast({ type: 'error', title: getErrorMessage(err) });
+    },
+  });
+
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key === 'Escape') onClose();
@@ -1435,14 +1556,20 @@ function ContractDetailDrawer({
   );
 
   return (
-    <div className="fixed inset-0 z-50 flex justify-end" onClick={onClose}>
-      <div className="absolute inset-0 bg-black/30" />
+    <div className="fixed inset-0 z-50 flex justify-end">
+      {/* Close-on-backdrop lives on the backdrop itself, not on the wrapper.
+          The wrapper is also the React parent of the modals this drawer opens,
+          and a portal delivers its events to the React parent rather than to
+          whatever DOM node it was mounted under. A handler up here therefore
+          sees every click inside those modals and closes the drawer, taking
+          the modal down with it. The panel below needs no stopPropagation for
+          the same reason: nothing above it is listening any more. */}
+      <div className="absolute inset-0 bg-black/30" onClick={onClose} />
       <div
         role="dialog"
         aria-modal="true"
         aria-labelledby="contract-drawer-title"
         className="relative h-full w-full max-w-2xl overflow-y-auto bg-surface-elevated shadow-xl"
-        onClick={(e) => e.stopPropagation()}
       >
         <div className="sticky top-0 z-10 flex items-center justify-between border-b border-border-light bg-surface-elevated px-5 py-3">
           <div>
@@ -1512,13 +1639,23 @@ function ContractDetailDrawer({
           {/* Workflow buttons */}
           <div className="flex flex-wrap gap-2 pt-1">
             {contract.status === 'draft' && (
-              <Button
-                variant="primary"
-                icon={<PenLine size={14} />}
-                onClick={() => setGateOpen(true)}
-              >
-                {t('contracts.sign', { defaultValue: 'Sign' })}
-              </Button>
+              <>
+                <Button
+                  variant="primary"
+                  icon={<PenLine size={14} />}
+                  onClick={() => setGateOpen(true)}
+                >
+                  {t('contracts.sign', { defaultValue: 'Sign' })}
+                </Button>
+                <Button
+                  variant="ghost"
+                  icon={<Trash2 size={14} />}
+                  onClick={() => setDeleteOpen(true)}
+                  loading={deleteMut.isPending}
+                >
+                  {t('contracts.delete', { defaultValue: 'Delete' })}
+                </Button>
+              </>
             )}
             {contract.status === 'active' && (
               <Button
@@ -1657,8 +1794,29 @@ function ContractDetailDrawer({
                 })}
                 value={contract.retention_release_event}
               />
+              {/* The pin, shown only when there is one. Version 0 is a built-in
+                  standard form, which has no versions of its own, so printing
+                  "v0" would invite the reader to look for a v1 that cannot
+                  exist. */}
+              {contract.template_code && (
+                <Field
+                  label={t('contracts.tpl_drawn_from', {
+                    defaultValue: 'Drawn from clause template',
+                  })}
+                  value={
+                    contract.template_version && contract.template_version > 0
+                      ? `${contract.template_code} · v${contract.template_version}`
+                      : contract.template_code
+                  }
+                />
+              )}
             </div>
           </Card>
+
+          {/* Who the contract is between. Directly under the header because the
+              header's counterparty field is one side and a category, and this
+              is the list the signature block is actually built from. */}
+          <ContractPartiesPanel contractId={contractId} />
 
           {/* SoV */}
           <Card padding="sm">
@@ -1736,25 +1894,77 @@ function ContractDetailDrawer({
             )}
           </Card>
 
-          {/* Retention ledger placeholder */}
+          {/* Retention ledger - real per-currency/direction rollup pulled from
+              the finance ledger (project-wide), replacing the former single
+              retention_held scalar. */}
           <Card padding="sm">
-            <p className="text-xs font-semibold uppercase tracking-wide text-content-secondary mb-2">
-              {t('contracts.retention_ledger', { defaultValue: 'Retention ledger' })}
-            </p>
-            <div className="grid grid-cols-2 gap-3 text-sm">
-              <Field
-                label={t('contracts.held', { defaultValue: 'Held' })}
-                value={
-                  <MoneyDisplay
-                    amount={toNum(dashQ.data?.retention_held)}
-                    currency={contract.currency || undefined}
-                  />
-                }
-              />
-              <Field
-                label={t('contracts.release_event_short', {
-                  defaultValue: 'Release on',
+            <div className="mb-2 flex items-center justify-between gap-2">
+              <p className="text-xs font-semibold uppercase tracking-wide text-content-secondary">
+                {t('contracts.retention_ledger', { defaultValue: 'Retention ledger' })}
+              </p>
+              <span className="text-2xs text-content-tertiary">
+                {t('contracts.retention_ledger_project_scope', {
+                  defaultValue: 'Across this project',
                 })}
+              </span>
+            </div>
+            {retentionQ.isError ? (
+              <p className="py-2 text-sm text-content-tertiary">
+                {t('contracts.retention_ledger_unavailable', {
+                  defaultValue: 'Retention ledger is unavailable right now.',
+                })}
+              </p>
+            ) : !retentionQ.data ? (
+              <p className="py-2 text-sm text-content-tertiary">
+                {t('common.loading', { defaultValue: 'Loading...' })}
+              </p>
+            ) : retentionQ.data.totals.length === 0 ? (
+              <p className="py-2 text-sm text-content-tertiary">
+                {t('contracts.retention_ledger_empty', {
+                  defaultValue: 'No retention held or scheduled yet.',
+                })}
+              </p>
+            ) : (
+              <div className="space-y-1">
+                <div className="grid grid-cols-[1fr_auto_auto] gap-x-4 text-2xs uppercase tracking-wide text-content-tertiary">
+                  <span>{t('contracts.retention_scope_col', { defaultValue: 'Scope' })}</span>
+                  <span className="text-right">
+                    {t('contracts.held', { defaultValue: 'Held' })}
+                  </span>
+                  <span className="text-right">
+                    {t('contracts.outstanding', { defaultValue: 'Outstanding' })}
+                  </span>
+                </div>
+                {retentionQ.data.totals.map((row) => (
+                  <div
+                    key={`${row.currency_code}-${row.direction}`}
+                    className="grid grid-cols-[1fr_auto_auto] items-center gap-x-4 text-sm"
+                  >
+                    <span className="truncate text-content-secondary">
+                      {retentionDirectionLabel(t, row.direction)}
+                      <span className="ml-1.5 font-mono text-2xs text-content-tertiary">
+                        {row.currency_code}
+                      </span>
+                    </span>
+                    <span className="text-right tabular-nums text-content-primary">
+                      <MoneyDisplay
+                        amount={row.held_to_date}
+                        currency={row.currency_code || undefined}
+                      />
+                    </span>
+                    <span className="text-right font-medium tabular-nums text-content-primary">
+                      <MoneyDisplay
+                        amount={row.outstanding}
+                        currency={row.currency_code || undefined}
+                      />
+                    </span>
+                  </div>
+                ))}
+              </div>
+            )}
+            <div className="mt-3 border-t border-border-light pt-2">
+              <Field
+                label={t('contracts.release_event_short', { defaultValue: 'Release on' })}
                 value={contract.retention_release_event}
               />
             </div>
@@ -1828,6 +2038,24 @@ function ContractDetailDrawer({
                 )}
             </Card>
           )}
+
+          {/* The bonds, guarantees and insurance themselves, immediately above
+              the coverage tile that counts them. The summary was the only thing
+              on this screen for a while, which meant an expiring bond could be
+              read as a number and never opened. */}
+          <ContractSecuritiesPanel
+            contractId={contractId}
+            currency={contract.currency}
+          />
+
+          {/* Analytics & close-out — four read-only endpoints surfaced as
+              stacked panels (SoV status, completeness, EOT exposure, final-
+              account checklist). Each owns its query so one slow/forbidden
+              endpoint never blocks the others. */}
+          <ContractAnalyticsPanels
+            contractId={contractId}
+            currency={contract.currency}
+          />
         </div>
       </div>
 
@@ -1845,6 +2073,24 @@ function ContractDetailDrawer({
           onClose={() => setGateOpen(false)}
         />
       )}
+
+      {/* The message names the children because the delete cascades to every
+          one of them. On a draft that is what the user wants, and saying so is
+          what makes the confirmation worth reading. */}
+      <ConfirmDialog
+        open={deleteOpen}
+        onConfirm={() => deleteMut.mutate()}
+        onCancel={() => setDeleteOpen(false)}
+        title={t('contracts.delete_title', { defaultValue: 'Delete draft contract' })}
+        message={t('contracts.delete_message', {
+          defaultValue:
+            'This removes the draft and everything held under it, including its lines, variations, progress claims and retention. Only a draft can be deleted. A contract that has been signed is closed or terminated instead. This action cannot be undone.',
+        })}
+        confirmLabel={t('contracts.delete', { defaultValue: 'Delete' })}
+        cancelLabel={t('common.cancel', { defaultValue: 'Cancel' })}
+        variant="danger"
+        loading={deleteMut.isPending}
+      />
     </div>
   );
 }
@@ -1897,7 +2143,19 @@ function CreateContractModal({
     retention_percent: '5',
     start_date: todayIso(),
     end_date: '',
+    template_code: '',
   });
+
+  // Only paper that can be drawn from is offered. An unpublished draft is
+  // refused by the server, so listing it here would be an option that fails.
+  const templatesQ = useQuery({
+    queryKey: TEMPLATE_CATALOGUE_KEY,
+    queryFn: listClauseTemplates,
+    staleTime: 60 * 60 * 1000,
+  });
+  const pickableTemplates = (templatesQ.data ?? []).filter(
+    (tpl) => tpl.status === 'published',
+  );
 
   const submit = async () => {
     if (!form.code.trim()) {
@@ -1920,6 +2178,7 @@ function CreateContractModal({
         retention_percent: Number(form.retention_percent) || 0,
         start_date: form.start_date || null,
         end_date: form.end_date || null,
+        template_code: form.template_code || null,
       });
       addToast({
         type: 'success',
@@ -2019,6 +2278,32 @@ function CreateContractModal({
                 defaultValue: 'Subcontractor',
               })}
             </option>
+          </select>
+        </WideModalField>
+        <WideModalField
+          label={t('contracts.tpl_drawn_from', {
+            defaultValue: 'Drawn from clause template',
+          })}
+          span={2}
+          hint={t('contracts.tpl_drawn_from_hint', {
+            defaultValue:
+              'Optional. The contract records the exact version, so it keeps naming this paper after a later version is published.',
+          })}
+        >
+          <select
+            value={form.template_code}
+            onChange={(e) => setForm({ ...form, template_code: e.target.value })}
+            className={inputCls}
+          >
+            <option value="">
+              {t('contracts.tpl_none', { defaultValue: 'No template' })}
+            </option>
+            {pickableTemplates.map((tpl) => (
+              <option key={tpl.code} value={tpl.code}>
+                {tpl.name}
+                {tpl.version > 0 ? ` (v${tpl.version})` : ''}
+              </option>
+            ))}
           </select>
         </WideModalField>
       </WideModalSection>

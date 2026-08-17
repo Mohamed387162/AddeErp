@@ -17,6 +17,8 @@ import type { ICellEditorParams } from 'ag-grid-community';
 import { AutocompleteInput } from '../AutocompleteInput';
 import type { CostAutocompleteItem, Position } from '../api';
 import { getUnitsForLocale, saveCustomUnit } from '../boqHelpers';
+import { parseDecimalInput } from './parseDecimal';
+import { useToastStore } from '@/stores/useToastStore';
 import type { DisplayQuantityApi } from '@/shared/hooks/useDisplayQuantity';
 import {
   evaluateFormula as evalFormulaImpl,
@@ -237,10 +239,28 @@ export function parseFeetInches(raw: string): number | null {
  * garbage (Issue #290).
  */
 function parsePlainNumber(raw: string): number | null {
-  const t = raw.trim();
-  if (t === '') return null;
-  const n = Number(t.replace(',', '.'));
-  return Number.isFinite(n) ? n : null;
+  // Locale-aware and strict: `48,60` -> 48.6, `1.234,56` -> 1234.56,
+  // `48.60` stays 48.6; anything not wholly a number is null (never a
+  // truncated parseFloat prefix). See parseDecimal.ts for the rules.
+  return parseDecimalInput(raw);
+}
+
+type TranslateFn = (key: string, opts?: Record<string, unknown>) => string;
+
+/**
+ * Invalid-number revert toast - the numeric editors' sibling of the
+ * Ordnungszahl guard's toast in BOQGrid.onCellValueChanged. Fired when a
+ * commit path refuses unparseable input and keeps the stored value.
+ */
+function toastInvalidNumber(t: TranslateFn): void {
+  useToastStore.getState().addToast({
+    type: 'warning',
+    title: t('boq.number_invalid_title', { defaultValue: 'Value not changed' }),
+    message: t('boq.number_invalid', {
+      defaultValue:
+        'This is not a number the field can read - use formats like 48,60 or 48.60 or 1.234,56. The previous value was kept.',
+    }),
+  });
 }
 
 /**
@@ -298,6 +318,7 @@ function previewFor(input: string, ctx?: FormulaContext, ftInActive = false): Fo
 
 export const FormulaCellEditor = forwardRef(
   (props: FormulaCellEditorParams, ref) => {
+    const { t } = useTranslation();
     const inputRef = useRef<HTMLInputElement>(null);
     const formula = props.data?.metadata?.formula;
     // Pre-fill with the previously-saved formula if there is one — this
@@ -461,7 +482,11 @@ export const FormulaCellEditor = forwardRef(
       // (Enter/Tab) or revert to the stored value (blur = Escape-cancel).
       if (!res.ok) {
         if (fromBlur) {
-          // Cancel: preserve the previously stored value.
+          // Cancel: preserve the previously stored value. Mark committed
+          // FIRST - stopEditing tears the input down, which can fire a tail
+          // blur that would re-enter here and double-toast.
+          committedRef.current = true;
+          if (live.trim() !== '') toastInvalidNumber(t);
           props.api.stopEditing(true);
           return true;
         }
@@ -561,7 +586,11 @@ export const FormulaCellEditor = forwardRef(
           // Only advance the focus when the value actually committed; on an
           // invalid entry commitFromInput keeps the editor open (Issue #290).
           if (commitFromInput(false)) {
-            props.api.tabToNextCell();
+            // Direction follows the modifier: preventDefault above removed the
+            // grid's own move, so always calling tabToNextCell would send
+            // Shift+Tab forward.
+            if (ev.shiftKey) props.api.tabToPreviousCell();
+            else props.api.tabToNextCell();
           }
         }
       };
@@ -755,6 +784,7 @@ FormulaCellEditor.displayName = 'FormulaCellEditor';
  * editor, so a plain controlled input is safe here.
  */
 export const RateCellEditor = forwardRef((props: ICellEditorParams, ref) => {
+  const { t } = useTranslation();
   const dq = (props.context as { displayQuantity?: DisplayQuantityApi } | undefined)?.displayQuantity;
   const unit = (props.data?.unit as string | undefined) ?? '';
   const inputRef = useRef<HTMLInputElement>(null);
@@ -788,12 +818,18 @@ export const RateCellEditor = forwardRef((props: ICellEditorParams, ref) => {
 
   const commit = (cancelNavigation: boolean): boolean => {
     if (committedRef.current) return true;
-    const live = (inputRef.current?.value ?? valueRef.current).replace(',', '.');
-    const n = parseFloat(live);
-    if (!isFinite(n)) {
-      // Nothing usable typed: keep the previously stored rate (Escape-style
-      // cancel). Guard set so a tail blur after Enter doesn't re-enter.
+    const live = inputRef.current?.value ?? valueRef.current;
+    // Locale-aware and strict: `48,60` -> 48.6, `1.234,56` -> 1234.56, and
+    // garbage is refused instead of parseFloat-truncated. The input is
+    // type=text precisely so the comma REACHES this parser - a number input
+    // silently drops it and a German keystroke became a 100x rate.
+    const n = parseDecimalInput(live);
+    if (n === null) {
+      // Keep the previously stored rate (Escape-style cancel). Guard set so
+      // a tail blur after Enter doesn't re-enter. An empty field is a plain
+      // "changed my mind"; anything else earns the why-was-it-kept toast.
       committedRef.current = true;
+      if (live.trim() !== '') toastInvalidNumber(t);
       props.api.stopEditing(true);
       return true;
     }
@@ -831,7 +867,12 @@ export const RateCellEditor = forwardRef((props: ICellEditorParams, ref) => {
       if (ev.key === 'Tab') {
         ev.preventDefault();
         ev.stopPropagation();
-        if (commit(false)) props.api.tabToNextCell();
+        // Direction follows the modifier, for the same reason as in the other
+        // two editors: the default move is already cancelled above.
+        if (commit(false)) {
+          if (ev.shiftKey) props.api.tabToPreviousCell();
+          else props.api.tabToNextCell();
+        }
       }
     };
     const onBlur = () => commit(false);
@@ -849,8 +890,8 @@ export const RateCellEditor = forwardRef((props: ICellEditorParams, ref) => {
     getValue() {
       // Cold path only (programmatic stopEditing without our commit): return the
       // typed DISPLAY value so the column valueParser converts it once to metric.
-      const n = parseFloat(valueRef.current.replace(',', '.'));
-      if (isFinite(n)) return n;
+      const n = parseDecimalInput(valueRef.current);
+      if (n !== null) return n;
       if (displaySeed != null) return displaySeed;
       return props.value;
     },
@@ -862,10 +903,14 @@ export const RateCellEditor = forwardRef((props: ICellEditorParams, ref) => {
   return (
     <input
       ref={inputRef}
-      type="number"
-      min={0}
-      step="any"
+      // type=text, NOT number: a number input drops the decimal comma at the
+      // keystroke level, so a German typing 48,60 silently got 4860 - the
+      // comma must survive the DOM to reach parseDecimalInput above.
+      // inputMode keeps the numeric keyboard on touch devices.
+      type="text"
       inputMode="decimal"
+      autoComplete="off"
+      spellCheck={false}
       className="w-full h-full bg-surface-elevated border border-oe-blue/40 rounded ring-2 ring-oe-blue/20 outline-none text-sm text-content-primary tabular-nums text-right px-1"
       defaultValue={seedStr}
     />
@@ -1242,9 +1287,27 @@ export const UnitCellEditor = forwardRef((props: ICellEditorParams, ref) => {
             e.preventDefault();
             setActiveIdx((i) => Math.max(0, i - 1));
           } else if (e.key === 'Tab') {
-            // Plain Tab commits the current text — same behaviour as Enter on
+            // Plain Tab commits the current text - same behaviour as Enter on
             // a free-typed value, lets the user blow past the dropdown.
+            //
+            // Cancelling the keystroke matters as much as committing it. Left
+            // uncancelled, this same Tab also runs ag-grid's own
+            // Tab-during-edit path, so the grid advances a second time and,
+            // with stopEditingWhenCellsLoseFocus on, tears down the popup
+            // editor the first advance had just opened. That is the blink a
+            // user sees on the quantity cell after leaving unit: the editor
+            // opens and is closed by the duplicate of the keystroke that
+            // opened it, and only a mouse click gets it back. Every other
+            // branch in this handler already cancels; this one did not, which
+            // is why this was the only hop that broke.
+            e.preventDefault();
+            e.stopPropagation();
             commit();
+            // preventDefault also removes the grid's own move, so the move has
+            // to be made here, and in the direction the user actually asked
+            // for. Without the shiftKey arm Shift+Tab would walk forward.
+            if (e.shiftKey) props.api.tabToPreviousCell();
+            else props.api.tabToNextCell();
           }
         }}
         onBlur={(e) => {

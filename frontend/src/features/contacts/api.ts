@@ -6,16 +6,19 @@
  * All endpoints are prefixed with /v1/contacts/.
  */
 
-import { apiGet, apiPost, apiPatch, apiDelete, triggerDownload, extractErrorMessageFromBody } from '@/shared/lib/api';
+import { apiGet, apiPost, apiPatch, apiDelete, triggerDownload, extractErrorMessageFromBody, type Page } from '@/shared/lib/api';
 import { useAuthStore } from '@/stores/useAuthStore';
 
 /* ── Types ─────────────────────────────────────────────────────────────── */
 
+/** Mirrors CONTACT_TYPES in the backend contacts schemas. */
 export type ContactType =
   | 'client'
   | 'subcontractor'
+  | 'contractor'
   | 'supplier'
   | 'consultant'
+  | 'authority'
   | 'internal'
   | 'lead'
   | 'customer';
@@ -139,9 +142,51 @@ export interface CreateContactPayload {
   notes?: string;
 }
 
+/**
+ * Patch payload for an existing contact.
+ *
+ * Separate from `CreateContactPayload` because clearing a field has to be
+ * expressible on the wire. `undefined` cannot express it: `JSON.stringify`
+ * drops the key entirely, so the old value survives and emptying a phone
+ * number has no effect at all. Every one of these columns is `str | None` on
+ * the backend, so `null` is what clears them. An empty string is not a
+ * substitute: `primary_email` runs through a format validator that rejects it.
+ *
+ * A key left out is left alone, because the update route dumps with
+ * `exclude_unset=True`. That is what lets the form send only the fields the
+ * user actually edited instead of writing its whole copy of the record back.
+ */
+export interface UpdateContactPayload {
+  contact_type?: ContactType;
+  first_name?: string | null;
+  last_name?: string | null;
+  company_name?: string | null;
+  legal_name?: string | null;
+  vat_number?: string | null;
+  primary_email?: string | null;
+  primary_phone?: string | null;
+  website?: string | null;
+  country_code?: string | null;
+  address?: Record<string, unknown> | null;
+  payment_terms_days?: string | null;
+  prequalification_status?: PrequalificationStatus;
+  notes?: string | null;
+}
+
 /* ── API Functions ─────────────────────────────────────────────────────── */
 
-export async function fetchContacts(filters?: ContactFilters): Promise<Contact[]> {
+/**
+ * One page of the directory, envelope intact.
+ *
+ * The previous signature returned `Contact[]` and unwrapped a
+ * `Contact[] | { items }` union, so every caller saw the rows the server
+ * happened to send and nothing at all about the rows it did not. The
+ * directory caps at 500 per request, which a CRM tenant with a few thousand
+ * inbound leads passes without a word on screen. Callers that only need the
+ * rows read `.items`; callers that put the rows in front of a person also
+ * mount `TruncationNotice` with this page.
+ */
+export async function fetchContacts(filters?: ContactFilters): Promise<Page<Contact>> {
   const params = new URLSearchParams();
   if (filters?.contact_type) params.set('contact_type', filters.contact_type);
   if (filters?.country) params.set('country', filters.country);
@@ -153,8 +198,19 @@ export async function fetchContacts(filters?: ContactFilters): Promise<Contact[]
     }
   }
   const qs = params.toString();
-  const res = await apiGet<Contact[] | { items: Contact[] }>(`/v1/contacts/${qs ? `?${qs}` : ''}`);
-  return Array.isArray(res) ? res : res.items ?? [];
+  return apiGet<Page<Contact>>(`/v1/contacts/${qs ? `?${qs}` : ''}`);
+}
+
+/**
+ * One contact by id.
+ *
+ * Two callers used to answer "what is this contact called" by pulling 500
+ * rows and searching them, which is a lookup that silently fails for contact
+ * 501: no error, no empty state, the name just renders as a type word. The
+ * per-id route has always existed.
+ */
+export function fetchContact(contactId: string): Promise<Contact> {
+  return apiGet<Contact>(`/v1/contacts/${contactId}`);
 }
 
 export async function fetchContactTags(): Promise<TagFacet[]> {
@@ -173,7 +229,7 @@ export async function createContact(data: CreateContactPayload): Promise<Contact
 
 export async function updateContact(
   id: string,
-  data: Partial<CreateContactPayload>,
+  data: UpdateContactPayload,
 ): Promise<Contact> {
   return apiPatch<Contact>(`/v1/contacts/${id}`, data);
 }

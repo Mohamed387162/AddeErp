@@ -202,6 +202,14 @@ export interface FolderPermissionCreatePayload {
 
 export interface FileFilters {
   category?: FileKind;
+  /**
+   * Several kinds at once, where ``category`` selects exactly one. A caller
+   * that wants two sources - the file picker asking for the documents area
+   * plus the calling module's own store - sends this and gets one
+   * project-scoped, permission-checked, paged answer rather than merging two
+   * listings itself. An unknown kind is a 400 from the server.
+   */
+  kinds?: readonly FileKind[];
   extension?: string;
   q?: string;
   sort?: 'modified' | 'name' | 'size' | 'kind';
@@ -229,4 +237,35 @@ export interface FileFavorite {
  * ``(file_kind, file_id)`` uniqueness scope. */
 export function favoriteKey(kind: FileKind, fileId: string): string {
   return `${kind}:${fileId}`;
+}
+
+/* ── Drawing sheets ──────────────────────────────────────────────────── */
+
+/** One indexed drawing sheet — a single page lifted out of a multi-page PDF
+ * drawing set. Mirrors ``SheetResponse`` in
+ * backend/app/modules/documents/schemas.py.
+ *
+ * ``document_id`` points at the parent document in the documents module (the
+ * same table ``/v1/documents/`` lists), so it can be handed straight to the
+ * plan room and takeoff deep-links without translation. ``thumbnail_path`` is a
+ * server-side filesystem path, NOT a URL: no route currently serves it to an
+ * authenticated client, so nothing renders it yet. */
+export interface SheetRow {
+  id: string;
+  project_id: string;
+  document_id: string;
+  page_number: number;
+  sheet_number: string | null;
+  sheet_title: string | null;
+  discipline: string | null;
+  revision: string | null;
+  revision_date: string | null;
+  scale: string | null;
+  is_current: boolean;
+  previous_version_id: string | null;
+  thumbnail_path: string | null;
+  metadata: Record<string, unknown>;
+  created_by: string;
+  created_at: string;
+  updated_at: string;
 }

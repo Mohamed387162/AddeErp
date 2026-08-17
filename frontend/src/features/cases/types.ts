@@ -45,6 +45,25 @@ export interface StepFlowItem {
  * sidebar/nav key (e.g. `boq.title`) so the chip is localized for free;
  * when omitted the plain `moduleLabel` renders.
  *
+ * The two are a pair and must name the same module. Only the key is
+ * translated, so `moduleLabel` decides what an English reader sees and
+ * `moduleLabelKey` decides what everyone else sees. A step carrying
+ * `moduleLabel: "Files"` next to `moduleLabelKey: "nav.documents"` reads as
+ * Files in English and as the word for Documents in the other 27 languages,
+ * and no locale gate can see it, because nothing is untranslated.
+ *
+ * Correcting one side alone is worse than leaving both wrong. The marketing
+ * case pages copy this chip into the module honeycomb by matching the label
+ * text, so a fixed label next to a stale key starts matching and carries the
+ * wrong translation to more cells than before, while reading in review as the
+ * fix working.
+ *
+ * A short label is not a local choice either. `moduleLabel: "BOQ"` with
+ * `moduleLabelKey: "boq.title"` renders BOQ in English and "Bill of
+ * Quantities" in every other language, because the key decides and the label
+ * is only the English fallback. Choose the key whose value you want read
+ * aloud, not the one whose name looks closest to the label.
+ *
  * `spotlightSelector` is an optional CSS selector reserved for a future
  * in-module highlight (it mirrors ModuleGuide's spotlight contract). It is
  * carried on the model now so data files can declare it without a later
@@ -86,6 +105,15 @@ export interface PlaybookStep {
   /** What this step produces: the data / artifacts it leaves behind. Shown as the
    *  "Out" side of the flow, so the user sees what comes out of the step. */
   outputs?: StepFlowItem[];
+  /** Optional one-line sentence shown above the "In" list, explaining in plain
+   *  words what the user brings into the step. `inputsHintDefault` is the English
+   *  fallback; `inputsHintKey` localizes it (same key + fallback pattern). */
+  inputsHintKey?: string;
+  inputsHintDefault?: string;
+  /** Optional one-line sentence shown above the "Out" list, explaining what the
+   *  user walks away with. `outputsHintDefault` is the English fallback. */
+  outputsHintKey?: string;
+  outputsHintDefault?: string;
   /** Optional CSS selector for a future in-module spotlight highlight. */
   spotlightSelector?: string;
 }
@@ -185,6 +213,11 @@ export interface Playbook {
   /** Company types this case is built for (one or more). Drives the primary
    *  "I work as..." selector on the Cases hub; see `companyTypes.ts`. */
   companyTypes: CompanyType[];
+  /** Optional ISO 3166-1 alpha-2 country code when the case is authored for one
+   *  market's standards and law (e.g. "DE" for a VOB/B, GAEB or XRechnung
+   *  workflow). Renders a flag chip on the case card and feeds the region
+   *  filter on the Cases hub. Omit for the universal cases. */
+  region?: string;
   /** Optional explicit professional roles this case is built for. When omitted
    *  the roles are derived from `category` + `companyTypes` (see
    *  `rolesForPlaybook` in `roles.ts`), so most cases never set this. Set it

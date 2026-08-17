@@ -30,6 +30,20 @@ def _sanitize_email_header_value(value: str) -> str:
     return " ".join(cleaned.split())
 
 
+def _sanitize_readable_text(value: str) -> str:
+    """Scrub control chars from a human-readable free-text value, replacing
+    each with a space so that words separated only by a line break stay
+    separated (``NEC\\r\\ncl. 61.3`` becomes ``NEC cl. 61.3``, not the fused
+    ``NECcl. 61.3``). Use this for values shown verbatim to people, such as a
+    clause reference on an exported cover sheet, where an email subject's
+    outright removal of the break would corrupt the text instead.
+    """
+    if not value:
+        return value
+    cleaned = "".join(ch if (ch == "\t" or ord(ch) >= 0x20) else " " for ch in value)
+    return " ".join(cleaned.split())
+
+
 class CorrespondenceCreate(BaseModel):
     """Create a new correspondence record."""
 
@@ -49,6 +63,12 @@ class CorrespondenceCreate(BaseModel):
     linked_document_ids: list[str] = Field(default_factory=list)
     linked_transmittal_id: str | None = None
     linked_rfi_id: str | None = None
+    status: str = Field(
+        default="open",
+        pattern=r"^(open|awaiting_response|responded|closed)$",
+    )
+    response_required_by: str | None = Field(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$")
+    contract_clause_ref: str | None = Field(default=None, max_length=120)
     notes: str | None = Field(default=None, max_length=5000)
     metadata: dict[str, Any] = Field(default_factory=dict)
 
@@ -59,6 +79,18 @@ class CorrespondenceCreate(BaseModel):
         if not cleaned:
             raise ValueError("subject is empty after sanitisation")
         return cleaned
+
+    @field_validator("contract_clause_ref")
+    @classmethod
+    def _clause_no_control_chars(cls, value: str | None) -> str | None:
+        # The clause pointer is rendered as raw text on the frontend and can
+        # end up in an exported cover sheet, so scrub control characters while
+        # keeping words that only a line break separated readable. An
+        # all-whitespace value collapses to None rather than a stored blank.
+        if value is None:
+            return None
+        cleaned = _sanitize_readable_text(value)
+        return cleaned or None
 
 
 class CorrespondenceUpdate(BaseModel):
@@ -79,6 +111,12 @@ class CorrespondenceUpdate(BaseModel):
     linked_document_ids: list[str] | None = None
     linked_transmittal_id: str | None = None
     linked_rfi_id: str | None = None
+    status: str | None = Field(
+        default=None,
+        pattern=r"^(open|awaiting_response|responded|closed)$",
+    )
+    response_required_by: str | None = Field(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$")
+    contract_clause_ref: str | None = Field(default=None, max_length=120)
     notes: str | None = Field(default=None, max_length=5000)
     metadata: dict[str, Any] | None = None
 
@@ -91,6 +129,14 @@ class CorrespondenceUpdate(BaseModel):
         if not cleaned:
             raise ValueError("subject is empty after sanitisation")
         return cleaned
+
+    @field_validator("contract_clause_ref")
+    @classmethod
+    def _clause_no_control_chars(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        cleaned = _sanitize_readable_text(value)
+        return cleaned or None
 
 
 class CorrespondenceResponse(BaseModel):
@@ -111,9 +157,32 @@ class CorrespondenceResponse(BaseModel):
     linked_document_ids: list[str] = Field(default_factory=list)
     linked_transmittal_id: str | None = None
     linked_rfi_id: str | None = None
+    status: str = "open"
+    response_required_by: str | None = None
+    contract_clause_ref: str | None = None
+    # Computed at serialisation time from ``response_required_by`` + ``status``;
+    # never stored. ``is_overdue`` is True when a still-open record has passed
+    # its deadline; ``days_until_due`` is signed (negative once overdue).
+    is_overdue: bool = False
+    days_until_due: int | None = None
     notes: str | None = None
     created_by: str | None = None
     attachments: list[str] = Field(default_factory=list)
     metadata: dict[str, Any] = Field(default_factory=dict, validation_alias="metadata_")
     created_at: datetime
     updated_at: datetime
+
+
+class CorrespondenceListResponse(BaseModel):
+    """One page of correspondence plus the size of the whole set.
+
+    ``total`` is the row count matching the filters, not the length of
+    ``items``. The register is the contractual record of who was told what
+    and when, so a client that renders ``items`` without reading ``total``
+    shows a truncated log and cannot tell that it did.
+    """
+
+    items: list[CorrespondenceResponse] = Field(default_factory=list)
+    total: int = 0
+    offset: int = 0
+    limit: int = 50

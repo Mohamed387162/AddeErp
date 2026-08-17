@@ -31,6 +31,8 @@ import { apiGet, apiPost } from '@/shared/lib/api';
 import { getIntlLocale } from '@/shared/lib/formatters';
 import { useToastStore } from '@/stores/useToastStore';
 import { REGION_MAP } from '@/stores/useCostDatabaseStore';
+import { localizedUnitCode } from '@/shared/lib/unitLabels';
+import { highlightMatch } from './highlightMatch';
 import { VariantPicker } from '@/features/costs/VariantPicker';
 import {
   MultiVariantPicker,
@@ -138,8 +140,19 @@ export function AssemblyPickerModal({
   const [quantity, setQuantity] = useState<Record<string, number>>({});
   const addToast = useToastStore((s) => s.addToast);
 
+  // The sibling picker in this issue (AutocompleteInput) waits 300ms before it
+  // asks the server; this one asked on every keystroke. The estimator who
+  // reported #406 types the discriminating words rather than the head of the
+  // position, so "installation de chantier grue" was close to thirty searches
+  // for one lookup. Same delay as the sibling, so the two pickers feel alike.
+  const [debouncedSearch, setDebouncedSearch] = useState('');
+  useEffect(() => {
+    const handle = setTimeout(() => setDebouncedSearch(search), 300);
+    return () => clearTimeout(handle);
+  }, [search]);
+
   const { data: assemblies, isLoading } = useQuery({
-    queryKey: ['assemblies', search],
+    queryKey: ['assemblies', debouncedSearch],
     queryFn: () => apiGet<{ items: Array<{
       id: string;
       code: string;
@@ -149,7 +162,7 @@ export function AssemblyPickerModal({
       total_rate: number;
       currency: string;
       components: Array<{ description: string; unit: string; unit_cost: number; quantity: number }>;
-    }>; total: number }>(`/v1/assemblies/?q=${encodeURIComponent(search)}&limit=20`).then((r) => r.items),
+    }>; total: number }>(`/v1/assemblies/?q=${encodeURIComponent(debouncedSearch)}&limit=20`).then((r) => r.items),
     retry: false,
   });
 
@@ -216,6 +229,9 @@ export function AssemblyPickerModal({
             <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-content-quaternary" />
             <input
               type="text"
+              id="boq-assembly-search"
+              name="boq-assembly-search"
+              autoComplete="off"
               value={search}
               onChange={(e) => setSearch(e.target.value)}
               placeholder={t('assemblies.search_placeholder', { defaultValue: 'Search assemblies...' })}
@@ -236,12 +252,12 @@ export function AssemblyPickerModal({
             <div className="flex flex-col items-center justify-center py-12 text-center">
               <Layers size={32} className="text-content-quaternary mb-3" />
               <p className="text-sm font-medium text-content-secondary mb-1">
-                {search ? t('assemblies.no_search_match', { defaultValue: 'No assemblies match your search' }) : t('assemblies.no_assemblies', { defaultValue: 'No assemblies yet' })}
+                {debouncedSearch ? t('assemblies.no_search_match', { defaultValue: 'No assemblies match your search' }) : t('assemblies.no_assemblies', { defaultValue: 'No assemblies yet' })}
               </p>
               <p className="text-xs text-content-tertiary mb-3">
-                {search ? t('assemblies.try_different_term', { defaultValue: 'Try a different search term' }) : t('assemblies.create_from_catalog', { defaultValue: 'Create assemblies from the Resource Catalog' })}
+                {debouncedSearch ? t('assemblies.try_different_term', { defaultValue: 'Try a different search term' }) : t('assemblies.create_from_catalog', { defaultValue: 'Create assemblies from the Resource Catalog' })}
               </p>
-              {!search && (
+              {!debouncedSearch && (
                 <Button variant="secondary" size="sm" onClick={() => { onClose(); navigate('/catalog'); }}>
                   {t('catalog.go_to_catalog', { defaultValue: 'Go to Catalog' })}
                 </Button>
@@ -258,9 +274,15 @@ export function AssemblyPickerModal({
                   >
                     <div className="flex items-start justify-between gap-3">
                       <div className="min-w-0 flex-1">
-                        <div className="flex items-center gap-2 mb-0.5">
-                          <span className="text-sm font-semibold text-content-primary truncate">{asm.name}</span>
-                          <span className="text-2xs font-mono text-content-quaternary">{asm.code}</span>
+                        {/* Assembly names built from a catalogue share a long prefix and
+                            differ at the end, so one truncated line made near-identical
+                            recipes unpickable. Clamp to two lines, keep the code
+                            baseline-aligned with the first of them, and mark the typed
+                            words so the reader sees which part of the name put this
+                            recipe in the list. */}
+                        <div className="flex items-baseline gap-2 mb-0.5">
+                          <span className="text-sm font-semibold text-content-primary line-clamp-2" title={asm.name}>{highlightMatch(asm.name, search)}</span>
+                          <span className="text-2xs font-mono text-content-quaternary shrink-0">{asm.code}</span>
                         </div>
                         <div className="flex items-center gap-2 text-xs text-content-tertiary">
                           <span className="inline-flex items-center gap-1 rounded bg-purple-100 dark:bg-purple-900/30 text-purple-700 dark:text-purple-400 px-1.5 py-0.5 text-2xs font-medium">
@@ -337,7 +359,7 @@ export function CostDatabaseSearchModal({
    *  rate / variant marker are persisted by the caller on the resource entry. */
   onSelectForResources?: (item: CostSearchItem, picked?: VariantResolution) => void;
 }) {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const [query, setQuery] = useState('');
@@ -1132,8 +1154,8 @@ export function CostDatabaseSearchModal({
           // the expanded resource panel.
           // Append the variant as an additional resource line so the
           // position's total = sum of all resource totals (the contract
-          // the user expects: "если есть ресурсы — стоимость собирается
-          // из общей стоимости ресурсов"). Without this, position.unit_rate
+          // the user expects: when a position has resources, its cost is
+          // assembled from the resource total). Without this, position.unit_rate
           // would lose the variant's contribution and the resource panel
           // total would diverge from the cell display.
           //
@@ -1604,6 +1626,22 @@ export function CostDatabaseSearchModal({
                 : t('boq.search_and_add', { defaultValue: 'Search items and add them to your estimate' })}
             </p>
           </div>
+          {/* Always-visible way out to the import screen, so more regional
+              cost bases can be loaded without first emptying the search. */}
+          <button
+            type="button"
+            onClick={() => {
+              onClose();
+              navigate('/costs/import');
+            }}
+            className="mr-1 inline-flex shrink-0 items-center gap-1.5 rounded-lg border border-border-light bg-surface-secondary px-2.5 py-1.5 text-xs font-medium text-content-secondary transition-colors hover:border-oe-blue/40 hover:text-oe-blue-text focus:outline-none focus-visible:ring-2 focus-visible:ring-oe-blue/40"
+            title={t('boq.import_database_cta', { defaultValue: 'Import a database' })}
+          >
+            <Plus size={14} aria-hidden="true" />
+            <span className="hidden sm:inline">
+              {t('boq.import_database_cta', { defaultValue: 'Import a database' })}
+            </span>
+          </button>
           <button onClick={onClose} aria-label={t('common.close', { defaultValue: 'Close' })} className="flex h-8 w-8 items-center justify-center rounded-lg text-content-tertiary hover:bg-surface-secondary">
             <X size={16} />
           </button>
@@ -1617,7 +1655,12 @@ export function CostDatabaseSearchModal({
         <div className="px-6 py-2 border-b border-border-light flex items-center gap-1.5 overflow-x-auto scrollbar-none shrink-0">
           {regions.map((r) => {
             const info = REGION_MAP[r];
-            const label = info?.name || r;
+            // DE_BERLIN has a localized display name (a German reader expects
+            // "Deutschland / DACH", not the English country name).
+            const label =
+              r === 'DE_BERLIN'
+                ? t('costdb.region_de_berlin', { defaultValue: info?.name || r })
+                : info?.name || r;
             const flag = info?.flag;
             const isActive = region === r;
             return (
@@ -1715,6 +1758,9 @@ export function CostDatabaseSearchModal({
                 <input
                   autoFocus
                   type="text"
+                  id="boq-cost-item-search"
+                  name="boq-cost-item-search"
+                  autoComplete="off"
                   value={query}
                   onChange={(e) => setQuery(e.target.value)}
                   placeholder={t('boq.search_cost_items', { defaultValue: 'Search cost items by description...' })}
@@ -1767,7 +1813,7 @@ export function CostDatabaseSearchModal({
                       .split('/')
                       .map((seg) =>
                         seg === '__unspecified__'
-                          ? t('boq.uncategorized', { defaultValue: '(Uncategorized)' })
+                          ? t('boq.uncategorized', { defaultValue: '(Not specified)' })
                           : seg,
                       )
                       .join(' / ')}
@@ -1954,7 +2000,9 @@ export function CostDatabaseSearchModal({
                             })()}
                           </td>
                           <td className="px-3 py-2.5 text-center">
-                            <Badge variant="neutral" size="sm">{item.unit}</Badge>
+                            {/* Superscript glyphs (m² / m³) to match the LV
+                                grid, plus locale trade codes (de: psch). */}
+                            <Badge variant="neutral" size="sm">{localizedUnitCode(item.unit, i18n.language)}</Badge>
                           </td>
                           <td
                             className="px-3 py-2.5 text-end"

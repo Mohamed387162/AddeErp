@@ -1,0 +1,506 @@
+# DDC-CWICR-OE: DataDrivenConstruction · OpenConstructionERP
+# Copyright (c) 2026 Artem Boiko / DataDrivenConstruction
+"""The shipped statutory payment regimes, and an idempotent seeder for them.
+
+This is where the law is written down. Every number here is a statutory default
+and every entry names the sections it came from, because the one question a
+quantity surveyor will ask about a computed date is which provision produced
+it. Nothing here is a house rule.
+
+Two modelling decisions run through the whole table and are worth stating once
+rather than once per regime.
+
+**The due date and the final date for payment are different dates, and only the
+UK Act genuinely splits them.** The UK Act makes a sum fall due, then gives a
+further period before it must be paid, and the notice deadlines hang off both.
+The security-of-payment statutes have one date: the progress payment "becomes
+due and payable" a set number of days after the claim. Those regimes are
+therefore written with the due date on the application date and the statutory
+period as the final date for payment, which is what the statute actually
+imposes - a last day to pay - and which keeps the final date after the due date
+in every regime shipped.
+
+**A null deadline means the statute is silent, which is not the same as zero.**
+Malaysia leaves the payment period to the contract, and the EU Late Payment
+Directive and the German regimes have no notice sequence at all. The rules skip
+what the regime does not set rather than treating it as an instant deadline.
+
+Seed data lives here and not in a migration on purpose: a migration is a
+schema change that runs once per deployment, and this table is content that
+will be corrected as statutes are amended.
+"""
+
+from __future__ import annotations
+
+import logging
+from decimal import Decimal
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+logger = logging.getLogger(__name__)
+
+
+PAYMENT_REGIMES: tuple[dict[str, Any], ...] = (
+    {
+        "code": "uk_hgcra",
+        "jurisdiction": "United Kingdom",
+        "country_code": "GB",
+        "statute": "Housing Grants, Construction and Regeneration Act 1996",
+        "statute_reference": (
+            "sections 110, 110A, 110B and 111, as amended by the Local Democracy, Economic Development "
+            "and Construction Act 2009; default periods from the Scheme for Construction Contracts"
+        ),
+        "due_date_basis": "period_end",
+        "due_date_days": 7,
+        "due_date_day_basis": "calendar",
+        "payment_notice_basis": "due_date",
+        "payment_notice_days": 5,
+        "payment_notice_day_basis": "calendar",
+        "final_date_basis": "due_date",
+        "final_date_days": 17,
+        "final_date_day_basis": "calendar",
+        "pay_less_days": 7,
+        "pay_less_day_basis": "calendar",
+        "no_notice_effect": "applied_sum_becomes_notified_sum",
+        "interest_basis": "reference_rate_plus_margin",
+        "interest_reference_rate": "Bank of England base rate",
+        "interest_margin_percent": Decimal("8.000"),
+        "interest_fixed_percent": None,
+        "interest_statute": "Late Payment of Commercial Debts (Interest) Act 1998",
+        "notes": (
+            "The periods are the Scheme's defaults and apply where the contract does not provide "
+            "compliant ones; a contract may set shorter periods but may not remove the sequence. Under "
+            "section 111 the notified sum must be paid in full by the final date unless a valid pay-less "
+            "notice was served in time, and where the payer served no payment notice the sum the payee "
+            "applied for is the notified sum. Section 110B lets the payee serve its own default payment "
+            "notice when the payer missed the deadline, which postpones the final date for payment by the "
+            "days between the missed deadline and that notice."
+        ),
+    },
+    {
+        "code": "ie_cca_2013",
+        "jurisdiction": "Ireland",
+        "country_code": "IE",
+        "statute": "Construction Contracts Act 2013",
+        "statute_reference": "section 4 and the Schedule",
+        "due_date_basis": "application_date",
+        "due_date_days": 0,
+        "due_date_day_basis": "calendar",
+        "payment_notice_basis": "application_date",
+        "payment_notice_days": 21,
+        "payment_notice_day_basis": "calendar",
+        "final_date_basis": "application_date",
+        "final_date_days": 30,
+        "final_date_day_basis": "calendar",
+        "pay_less_days": None,
+        "pay_less_day_basis": "calendar",
+        "no_notice_effect": "applied_sum_becomes_notified_sum",
+        "interest_basis": "reference_rate_plus_margin",
+        "interest_reference_rate": "European Central Bank main refinancing rate",
+        "interest_margin_percent": Decimal("8.000"),
+        "interest_fixed_percent": None,
+        "interest_statute": "European Communities (Late Payment in Commercial Transactions) Regulations 2012",
+        "notes": (
+            "The Act does not split a due date from a final date the way the UK Act does, so the payment "
+            "claim date is taken as the due date and the Act's thirty-day limit as the final date for "
+            "payment. The response to a payment claim notice must state the amount proposed to be paid "
+            "and the reason for any difference from the amount claimed; there is no separate pay-less "
+            "notice. Unpaid amounts carry a right to suspend."
+        ),
+    },
+    {
+        "code": "au_nsw_sopa",
+        "jurisdiction": "New South Wales, Australia",
+        "country_code": "AU",
+        "statute": "Building and Construction Industry Security of Payment Act 1999 (NSW)",
+        "statute_reference": "sections 11, 13, 14 and 17",
+        "due_date_basis": "application_date",
+        "due_date_days": 0,
+        "due_date_day_basis": "calendar",
+        "payment_notice_basis": "application_date",
+        "payment_notice_days": 10,
+        "payment_notice_day_basis": "business",
+        "final_date_basis": "application_date",
+        "final_date_days": 15,
+        "final_date_day_basis": "business",
+        "pay_less_days": None,
+        "pay_less_day_basis": "calendar",
+        "no_notice_effect": "applied_sum_becomes_notified_sum",
+        "interest_basis": "prescribed_rate",
+        "interest_reference_rate": "section 101 of the Civil Procedure Act 2005 (NSW)",
+        "interest_margin_percent": None,
+        "interest_fixed_percent": None,
+        "interest_statute": "Building and Construction Industry Security of Payment Act 1999 (NSW), section 11(2)",
+        "notes": (
+            "The response to a payment claim is a payment schedule. Fifteen business days is the limit "
+            "for a head contract and twenty for a subcontract; a contract may set a shorter period but "
+            "not a longer one. Business days under this Act exclude 27 to 31 December as well as weekends "
+            "and public holidays, so supply that calendar to reproduce the statutory dates exactly. Where "
+            "no payment schedule is served in time the respondent becomes liable to pay the claimed "
+            "amount on the due date. Interest runs at the greater of the prescribed rate and the rate the "
+            "contract specifies."
+        ),
+    },
+    {
+        "code": "au_qld_bif",
+        "jurisdiction": "Queensland, Australia",
+        "country_code": "AU",
+        "statute": "Building Industry Fairness (Security of Payment) Act 2017 (Qld)",
+        "statute_reference": "sections 68, 75, 76 and 90",
+        "due_date_basis": "application_date",
+        "due_date_days": 0,
+        "due_date_day_basis": "calendar",
+        "payment_notice_basis": "application_date",
+        "payment_notice_days": 15,
+        "payment_notice_day_basis": "business",
+        "final_date_basis": "application_date",
+        "final_date_days": 25,
+        "final_date_day_basis": "business",
+        "pay_less_days": None,
+        "pay_less_day_basis": "calendar",
+        "no_notice_effect": "applied_sum_becomes_notified_sum",
+        "interest_basis": "prescribed_rate",
+        "interest_reference_rate": "section 67P of the Queensland Building and Construction Commission Act 1991",
+        "interest_margin_percent": None,
+        "interest_fixed_percent": Decimal("10.000"),
+        "interest_statute": "Queensland Building and Construction Commission Act 1991, section 67P",
+        "notes": (
+            "The response to a payment claim is a payment schedule. Twenty-five business days is the "
+            "limit for a head contract and fifteen for a subcontract. Where no payment schedule is served "
+            "in time the respondent becomes liable to pay the claimed amount on the due date. Interest "
+            "runs at the greater of ten per cent a year and the prescribed rate."
+        ),
+    },
+    {
+        "code": "nz_cca_2002",
+        "jurisdiction": "New Zealand",
+        "country_code": "NZ",
+        "statute": "Construction Contracts Act 2002",
+        "statute_reference": "sections 18, 20, 21, 22 and 23",
+        "due_date_basis": "application_date",
+        "due_date_days": 0,
+        "due_date_day_basis": "calendar",
+        "payment_notice_basis": "application_date",
+        "payment_notice_days": 20,
+        "payment_notice_day_basis": "business",
+        "final_date_basis": "application_date",
+        "final_date_days": 20,
+        "final_date_day_basis": "business",
+        "pay_less_days": None,
+        "pay_less_day_basis": "calendar",
+        "no_notice_effect": "applied_sum_becomes_notified_sum",
+        "interest_basis": "contract",
+        "interest_reference_rate": "",
+        "interest_margin_percent": None,
+        "interest_fixed_percent": None,
+        "interest_statute": "",
+        "notes": (
+            "The response to a payment claim is a payment schedule. Both default periods run twenty "
+            "working days from the payment claim, so on the default terms the payer must serve its "
+            "schedule on the day payment falls due at the latest; a contract may set shorter periods. "
+            "Working days under this Act exclude 24 December to 5 January as well as weekends and public "
+            "holidays, so supply that calendar to reproduce the statutory dates exactly. Where no payment "
+            "schedule is served the payer becomes liable for the claimed amount and it is recoverable as "
+            "a debt. The Act sets no interest rate, so the contract rate applies."
+        ),
+    },
+    {
+        "code": "sg_sopa",
+        "jurisdiction": "Singapore",
+        "country_code": "SG",
+        "statute": "Building and Construction Industry Security of Payment Act 2004",
+        "statute_reference": "sections 8, 11 and 15",
+        "due_date_basis": "application_date",
+        "due_date_days": 0,
+        "due_date_day_basis": "calendar",
+        "payment_notice_basis": "application_date",
+        "payment_notice_days": 21,
+        "payment_notice_day_basis": "calendar",
+        "final_date_basis": "application_date",
+        "final_date_days": 35,
+        "final_date_day_basis": "calendar",
+        "pay_less_days": None,
+        "pay_less_day_basis": "calendar",
+        "no_notice_effect": "evidential_bar",
+        "interest_basis": "contract",
+        "interest_reference_rate": "",
+        "interest_margin_percent": None,
+        "interest_fixed_percent": None,
+        "interest_statute": "",
+        "notes": (
+            "The response to a payment claim is a payment response, due twenty-one days after the claim "
+            "for a construction contract and seven days for a supply contract. Payment falls due fourteen "
+            "days after the payment response was required, which is where the thirty-five days comes "
+            "from, unless the contract sets an earlier date. Failing to serve a payment response does not "
+            "concede the claim: it bars the respondent from raising at adjudication any reason it did not "
+            "put in the response."
+        ),
+    },
+    {
+        "code": "my_cipaa",
+        "jurisdiction": "Malaysia",
+        "country_code": "MY",
+        "statute": "Construction Industry Payment and Adjudication Act 2012",
+        "statute_reference": "sections 5, 6 and 36",
+        "due_date_basis": "application_date",
+        "due_date_days": 0,
+        "due_date_day_basis": "calendar",
+        "payment_notice_basis": "application_date",
+        "payment_notice_days": 10,
+        "payment_notice_day_basis": "business",
+        "final_date_basis": "application_date",
+        "final_date_days": None,
+        "final_date_day_basis": "calendar",
+        "pay_less_days": None,
+        "pay_less_day_basis": "calendar",
+        "no_notice_effect": "deemed_dispute",
+        "interest_basis": "contract",
+        "interest_reference_rate": "",
+        "interest_margin_percent": None,
+        "interest_fixed_percent": None,
+        "interest_statute": "",
+        "notes": (
+            "The response to a payment claim is a payment response, due ten working days after the claim. "
+            "The Act sets no payment period, so the final date for payment comes from the contract and "
+            "has to be entered on the application; section 36 voids a clause making payment conditional "
+            "on the payer itself being paid. Failing to respond within the ten working days is a deemed "
+            "dispute of the whole claim rather than an admission of it, so the claimant's next step is "
+            "adjudication and not a debt claim."
+        ),
+    },
+    {
+        "code": "eu_late_payment",
+        "jurisdiction": "European Union",
+        "country_code": "EU",
+        "statute": "Directive 2011/7/EU on combating late payment in commercial transactions",
+        "statute_reference": "articles 2, 3 and 4",
+        "due_date_basis": "application_date",
+        "due_date_days": 0,
+        "due_date_day_basis": "calendar",
+        "payment_notice_basis": "application_date",
+        "payment_notice_days": None,
+        "payment_notice_day_basis": "calendar",
+        "final_date_basis": "application_date",
+        "final_date_days": 30,
+        "final_date_day_basis": "calendar",
+        "pay_less_days": None,
+        "pay_less_day_basis": "calendar",
+        "no_notice_effect": "none",
+        "interest_basis": "reference_rate_plus_margin",
+        "interest_reference_rate": "European Central Bank reference rate",
+        "interest_margin_percent": Decimal("8.000"),
+        "interest_fixed_percent": None,
+        "interest_statute": "Directive 2011/7/EU, article 2(6)",
+        "notes": (
+            "An interest basis rather than a notice regime: the Directive sets a payment period and the "
+            "interest that runs when it is missed, and leaves notices to national law, so this regime has "
+            "no payment notice and missing one has no consequence under it. Thirty days is the default "
+            "period between undertakings; it may be extended to sixty by express agreement and beyond "
+            "that only where the term is not grossly unfair to the creditor. Use this regime where a "
+            "member state has no construction-specific payment statute, and the national regime where it "
+            "has one."
+        ),
+    },
+    # The three German regimes below carry the statutory deadlines of § 16
+    # VOB/B (2016) and §§ 632a, 641, 650g BGB. The German contract-type and
+    # invoice-template vocabulary (VOB_B_EINHEITSPREIS, ABSCHLAGSRECHNUNG,
+    # SCHLUSSRECHNUNG, "per § 632a BGB / § 16 VOB/B") lives in
+    # ``app.modules.dach_pack.config``; that module carries no deadline
+    # arithmetic, so the numbers are written down here, sourced from the
+    # provisions each entry names, and the wording follows dach_pack's. VOB/B
+    # gives an Abschlagsrechnung and a Schlussrechnung two different clocks (21
+    # and 30 days), and a regime in this table is one clock, so they are two
+    # entries rather than one entry with a footnote a calculation cannot read.
+    {
+        "code": "de_vob_b_abschlag",
+        "jurisdiction": "Germany",
+        "country_code": "DE",
+        "statute": "VOB/B § 16 Abs. 1 (Abschlagszahlungen)",
+        "statute_reference": (
+            "§ 16 Abs. 1 Nr. 3 VOB/B (2016); Nachfrist and default interest under § 16 Abs. 5 Nr. 3 "
+            "VOB/B with § 288 Abs. 2 BGB"
+        ),
+        "due_date_basis": "application_date",
+        "due_date_days": 0,
+        "due_date_day_basis": "calendar",
+        "payment_notice_basis": "due_date",
+        "payment_notice_days": None,
+        "payment_notice_day_basis": "calendar",
+        "final_date_basis": "application_date",
+        "final_date_days": 21,
+        "final_date_day_basis": "calendar",
+        "pay_less_days": None,
+        "pay_less_day_basis": "calendar",
+        "no_notice_effect": "none",
+        "interest_basis": "reference_rate_plus_margin",
+        "interest_reference_rate": "Deutsche Bundesbank base rate (Basiszinssatz, § 247 BGB)",
+        "interest_margin_percent": Decimal("9.000"),
+        "interest_fixed_percent": None,
+        "interest_statute": "§ 288 Abs. 2 BGB, applied by § 16 Abs. 5 Nr. 3 VOB/B",
+        "notes": (
+            "The clock for an interim payment invoice (Abschlagsrechnung) under a VOB/B contract. The claim "
+            "falls due within 21 calendar days of the client receiving the verifiable statement of work "
+            "(Zugang der Aufstellung), so enter that date of receipt as the application date; following the "
+            "convention used for the other single-date regimes, the application date is taken as the due "
+            "date and the 21-day limit as the final date for payment. VOB/B has no statutory payment or "
+            "pay-less notice: an objection to the statement is informal and silence has no preclusive "
+            "effect. If the client has not paid when the claim is due, § 16 Abs. 5 Nr. 3 VOB/B lets the "
+            "contractor set a reasonable grace period (angemessene Nachfrist - two weeks is the customary "
+            "yardstick), from whose expiry default interest under § 288 Abs. 2 BGB runs and the "
+            "contractor may suspend the works until payment; at the latest, the client is in default 30 "
+            "days after receipt of the invoice or statement. This module has no grace-period step, so the "
+            "interest warning runs from the final date for payment and the Nachfrist has to be minded by "
+            "hand."
+        ),
+    },
+    {
+        "code": "de_vob_b_schluss",
+        "jurisdiction": "Germany",
+        "country_code": "DE",
+        "statute": "VOB/B § 16 Abs. 3 (Schlusszahlung)",
+        "statute_reference": (
+            "§ 16 Abs. 3 Nr. 1 VOB/B (2016); reservation of claims under § 16 Abs. 3 Nr. 2 and Nr. 5 "
+            "VOB/B; Nachfrist and default interest under § 16 Abs. 5 Nr. 3 VOB/B with § 288 Abs. 2 BGB"
+        ),
+        "due_date_basis": "application_date",
+        "due_date_days": 0,
+        "due_date_day_basis": "calendar",
+        "payment_notice_basis": "due_date",
+        "payment_notice_days": None,
+        "payment_notice_day_basis": "calendar",
+        "final_date_basis": "application_date",
+        "final_date_days": 30,
+        "final_date_day_basis": "calendar",
+        "pay_less_days": None,
+        "pay_less_day_basis": "calendar",
+        "no_notice_effect": "none",
+        "interest_basis": "reference_rate_plus_margin",
+        "interest_reference_rate": "Deutsche Bundesbank base rate (Basiszinssatz, § 247 BGB)",
+        "interest_margin_percent": Decimal("9.000"),
+        "interest_fixed_percent": None,
+        "interest_statute": "§ 288 Abs. 2 BGB, applied by § 16 Abs. 5 Nr. 3 VOB/B",
+        "notes": (
+            "The clock for the final invoice (Schlussrechnung) under a VOB/B contract. The final payment "
+            "falls due promptly after examination and determination of the invoice, and at the latest "
+            "within 30 calendar days of the client receiving it, so enter the date of receipt (Zugang der "
+            "Schlussrechnung) as the application date. The period extends to at most 60 days only where "
+            "that is objectively justified by the particular nature or features of the agreement and was "
+            "expressly agreed (§ 16 Abs. 3 Nr. 1 sentence 2 VOB/B); record such a contract by stating "
+            "the agreed final date on the application, which marks the dates as overridden. Accepting the "
+            "final payment without reservation excludes further claims where the client gave written "
+            "notice of the payment and of that preclusive effect; the contractor's reservation (Vorbehalt) "
+            "must be declared within 28 calendar days of that notice and substantiated within a further 28 "
+            "(§ 16 Abs. 3 Nr. 2 and Nr. 5 VOB/B) - a payee-side sequence this clock does not compute. "
+            "Late payment carries the same Nachfrist and interest mechanics as the interim regime."
+        ),
+    },
+    {
+        "code": "de_bgb_632a",
+        "jurisdiction": "Germany",
+        "country_code": "DE",
+        "statute": "BGB § 632a (Abschlagszahlungen)",
+        "statute_reference": (
+            "§ 632a Abs. 1 BGB; default without a reminder under § 286 Abs. 3 BGB; interest under "
+            "§ 288 Abs. 2 BGB; final payment due on acceptance with a verifiable final invoice under "
+            "§ 641 Abs. 1 and § 650g Abs. 4 BGB"
+        ),
+        "due_date_basis": "application_date",
+        "due_date_days": 0,
+        "due_date_day_basis": "calendar",
+        "payment_notice_basis": "due_date",
+        "payment_notice_days": None,
+        "payment_notice_day_basis": "calendar",
+        "final_date_basis": "application_date",
+        "final_date_days": 30,
+        "final_date_day_basis": "calendar",
+        "pay_less_days": None,
+        "pay_less_day_basis": "calendar",
+        "no_notice_effect": "none",
+        "interest_basis": "reference_rate_plus_margin",
+        "interest_reference_rate": "Deutsche Bundesbank base rate (Basiszinssatz, § 247 BGB)",
+        "interest_margin_percent": Decimal("9.000"),
+        "interest_fixed_percent": None,
+        "interest_statute": "§ 288 Abs. 2 BGB",
+        "notes": (
+            "The clock for interim payments under a plain BGB construction contract, where the parties did "
+            "not agree the VOB/B. § 632a Abs. 1 BGB entitles the contractor to interim payments in the "
+            "amount of the value of the work performed and owed. The BGB sets no payment period - the "
+            "claim is due on demand with a verifiable statement (§ 271 BGB) - so the 30 days written "
+            "here are § 286 Abs. 3 BGB: the client is in default at the latest 30 days after receiving "
+            "the invoice, without any reminder, and that outer limit is taken as the final date for "
+            "payment. Between businesses it applies of itself; against a consumer only where the invoice "
+            "said so. Interest runs at nine percentage points over the base rate for commercial debts "
+            "(§ 288 Abs. 2 BGB). The final payment is a different clock: it falls due on acceptance of "
+            "the works plus a verifiable final invoice (§ 641 Abs. 1, § 650g Abs. 4 BGB), which is a "
+            "condition this module cannot compute from a date alone."
+        ),
+    },
+)
+
+REGIME_CODES: tuple[str, ...] = tuple(regime["code"] for regime in PAYMENT_REGIMES)
+
+
+def regime_by_code(code: str) -> dict[str, Any] | None:
+    """The shipped catalogue entry for ``code``, or ``None`` when unknown."""
+    for regime in PAYMENT_REGIMES:
+        if regime["code"] == code:
+            return dict(regime)
+    return None
+
+
+async def seed_payment_regimes(session: AsyncSession, *, refresh: bool = False) -> dict[str, int]:
+    """Insert the shipped regimes that are not in the table yet.
+
+    Idempotent, so it is safe on every startup and safe to call from a read
+    path: a regime already present is left alone unless ``refresh`` is set, in
+    which case its statutory fields are rewritten from the catalogue. Refresh is
+    off by default because an operator may have corrected a period to match a
+    contract's own compliant terms, and a silent overwrite on next boot would
+    change every date computed afterwards.
+
+    Args:
+        session: Active async session. The caller owns the transaction.
+        refresh: Rewrite regimes that already exist from the shipped catalogue.
+
+    Returns:
+        Counts under ``created``, ``updated`` and ``unchanged``.
+    """
+    from sqlalchemy import select
+
+    from app.modules.payment_clock.models import PaymentRegime
+
+    existing_rows = (await session.execute(select(PaymentRegime))).scalars().all()
+    existing = {row.code: row for row in existing_rows}
+
+    created = updated = unchanged = 0
+    for entry in PAYMENT_REGIMES:
+        row = existing.get(entry["code"])
+        if row is None:
+            session.add(PaymentRegime(**entry))
+            created += 1
+            continue
+        if not refresh:
+            unchanged += 1
+            continue
+        for key, value in entry.items():
+            setattr(row, key, value)
+        updated += 1
+
+    await session.flush()
+    logger.info(
+        "Payment regimes seeded: %d created, %d updated, %d unchanged",
+        created,
+        updated,
+        unchanged,
+    )
+    return {"created": created, "updated": updated, "unchanged": unchanged}
+
+
+__all__ = [
+    "PAYMENT_REGIMES",
+    "REGIME_CODES",
+    "regime_by_code",
+    "seed_payment_regimes",
+]

@@ -62,6 +62,7 @@ import BOQGrid from './BOQGrid';
 import { exportBOQToExcel } from './exportExcel';
 import { generateBOQPdf } from './pdfReport';
 import type { BOQGridHandle } from './BOQGrid';
+import { allResourcesExpanded, type ResourceExpansionState } from './resourceExpansion';
 import { BatchActionBar } from './BatchActionBar';
 import { ScenarioDialog } from './ScenarioDialog';
 import { SendToTenderDialog } from './SendToTenderDialog';
@@ -101,7 +102,7 @@ import { CatalogPickerModal, type CatalogResource } from './CatalogPickerModal';
 import { CustomColumnsDialog } from './CustomColumnsDialog';
 import { BOQVariablesDialog } from './BOQVariablesDialog';
 import { CostPerAreaBenchmark } from './CostPerAreaBenchmark';
-import { RenumberDialog } from './RenumberDialog';
+import { RenumberDialog, type RenumberScheme, type RenumberCustom } from './RenumberDialog';
 import { LinkedPositionsModal } from './LinkedPositionsModal';
 
 /* ── Re-exports for tests ────────────────────────────────────────────── */
@@ -181,12 +182,24 @@ export function BOQEditorPage() {
     enabled: !!boq?.project_id,
   });
 
+  /* ── Deferred warm-up for non-critical queries ─────────────────────
+     The editor's first paint used to fire seven heavy requests at once
+     (sensitivity, cost-risk, resource rollup, BIM models, AACE class ...)
+     which queued on the connection pool and held the page at ~4s. The
+     analysis panels now fetch on expand; the remaining nice-to-haves
+     below wait one breath after mount so the grid data wins the race. */
+  const [deferredReady, setDeferredReady] = useState(false);
+  useEffect(() => {
+    const id = window.setTimeout(() => setDeferredReady(true), 1500);
+    return () => window.clearTimeout(id);
+  }, []);
+
   /* ── Fetch BIM models for the project (used for mini 3D preview) ─── */
 
   const { data: bimModelsData } = useQuery({
     queryKey: ['bim-models', boq?.project_id],
     queryFn: () => fetchBIMModels(boq!.project_id),
-    enabled: !!boq?.project_id,
+    enabled: !!boq?.project_id && deferredReady,
     staleTime: 10 * 60_000,
   });
 
@@ -274,6 +287,40 @@ export function BOQEditorPage() {
   });
 
   const markups: Markup[] = markupsData?.markups ?? [];
+
+  /* ── Authoritative Grand Total (audit #156) ───────────────────────────
+   *  The toolbar's Grand-Total card used to print a client-side chain whose
+   *  tax came from ``getVatRateFromMarkups`` — a ``.find`` that takes only the
+   *  FIRST percentage tax markup. The shipped Brazil BDI template creates two
+   *  (PIS+COFINS 3.65% and ISS 3.0%, ``service.py`` DEFAULT_MARKUP_TEMPLATES),
+   *  so the card silently under-stated the total by ~3% of the subtotal while
+   *  the Cost Breakdown panel a screen below printed the full figure under the
+   *  same "Grand Total" label. A fixed-amount tax markup vanished from the card
+   *  entirely, and a reordered tax markup landed on the wrong base.
+   *
+   *  Widening the ``.find`` into a ``.reduce`` would have left two producers of
+   *  one number, and the next template shape would have split them again. So
+   *  the card now READS the server's figure instead of racing it. This query
+   *  deliberately uses the SAME key and the SAME queryFn as CostBreakdownPanel
+   *  (``CostBreakdownPanel.tsx``): React Query serves both observers from one
+   *  cache entry, so the two renders of "Grand Total" cannot disagree at any
+   *  point in time, loading and refetching included. Keep the options aligned
+   *  with that panel — divergent options on a shared key cause refetch thrash.
+   *
+   *  Authority: ``BOQService.get_cost_breakdown`` in
+   *  ``backend/app/modules/boq/service.py`` — ``direct_cost + Σ(every active
+   *  markup)``, N tax lines and fixed amounts included, each at its own
+   *  ``sort_order`` position in the cascade.
+   *
+   *  Enabled to mirror the panel's own mount guard (``boqId && hasPositions``)
+   *  so a BOQ with no positions issues no extra request.
+   */
+  const { data: costBreakdown } = useQuery({
+    queryKey: ['boq-cost-breakdown', boqId],
+    queryFn: () => boqApi.getCostBreakdown(boqId!),
+    enabled: !!boqId && (boq?.positions.length ?? 0) > 0,
+    staleTime: 5000,
+  });
 
   /* Issue #136 — server-enforced deep-nesting cap. Static across the
    * session; the editor disables "add child / sub-section" once a row is
@@ -422,7 +469,7 @@ export function BOQEditorPage() {
   /** Stable ref for trackedDelete — allows keyboard shortcut access before declaration. */
   const trackedDeleteRef = useRef<((id: string) => void) | null>(null);
   /** Stable ref for handleExport — allows keyboard shortcut access before declaration. */
-  const handleExportRef = useRef<((format: 'excel' | 'csv' | 'pdf' | 'gaeb') => void) | null>(null);
+  const handleExportRef = useRef<((format: 'excel' | 'csv' | 'pdf' | 'gaeb' | 'bc3') => void) | null>(null);
   /** Stable ref for the AI-copilot toggle (Alt+I) — set after declaration so
    *  the keyboard handler can reach it without widening its dependency array. */
   const toggleAICopilotRef = useRef<(() => void) | null>(null);
@@ -746,8 +793,8 @@ export function BOQEditorPage() {
   const [renumberDialogOpen, setRenumberDialogOpen] = useState(false);
 
   const renumberMutation = useMutation({
-    mutationFn: ({ scheme, pad }: { scheme: 'gap10' | 'gap100' | 'sequential' | 'dotted'; pad: boolean }) =>
-      boqApi.renumberPositions(boqId!, { scheme, pad }),
+    mutationFn: ({ scheme, pad, start, step }: { scheme: RenumberScheme; pad: boolean; start?: number; step?: number }) =>
+      boqApi.renumberPositions(boqId!, { scheme, pad, start, step }),
     onSuccess: (result) => {
       invalidateAll();
       setRenumberDialogOpen(false);
@@ -889,8 +936,8 @@ export function BOQEditorPage() {
   }, []);
 
   const handleRenumberApply = useCallback(
-    (scheme: 'gap10' | 'gap100' | 'sequential' | 'dotted', pad: boolean) => {
-      renumberMutation.mutate({ scheme, pad });
+    (scheme: RenumberScheme, pad: boolean, custom: RenumberCustom) => {
+      renumberMutation.mutate({ scheme, pad, start: custom.start, step: custom.step });
     },
     [renumberMutation],
   );
@@ -1046,6 +1093,29 @@ export function BOQEditorPage() {
       return allIn ? new Set<string>() : new Set(allSectionIds);
     });
   }, [allSectionIds]);
+
+  /* ── Show / hide every position's resources at once ────────────────
+   * The grid owns the expansion state (see BOQGridHandle.setAllResourcesExpanded
+   * for why it is not lifted); the page only mirrors the counts so the toolbar
+   * can label the button and disable it on a BOQ with nothing to open.
+   *
+   * Showing also expands the sections. Resources live inside positions, and a
+   * position inside a collapsed section is not rendered, so "show all
+   * resources" with a collapsed section would open rows nobody can see and the
+   * button would read as broken. Hiding deliberately does NOT re-collapse the
+   * sections: the user asked to put the resources away, not to undo whatever
+   * grouping they had set up. */
+  const [resourceExpansion, setResourceExpansion] = useState<ResourceExpansionState>({
+    expandable: 0,
+    expanded: 0,
+  });
+  const resourcesAllExpanded = allResourcesExpanded(resourceExpansion);
+
+  const handleToggleAllResources = useCallback(() => {
+    const next = !allResourcesExpanded(resourceExpansion);
+    if (next) setCollapsedSections(new Set<string>());
+    boqGridRef.current?.setAllResourcesExpanded(next);
+  }, [resourceExpansion]);
 
   /* ── Search + quick QA filters (grid view only) ────────────────────── */
   const [boqSearch, setBoqSearch] = useState('');
@@ -2036,7 +2106,7 @@ export function BOQEditorPage() {
   /* ── Export / Version History state ─────────────────────────────────── */
 
   const [showVersionHistory, setShowVersionHistory] = useState(false);
-  const [exportWarning, setExportWarning] = useState<{ format: 'excel' | 'csv' | 'pdf' | 'gaeb'; score: number } | null>(null);
+  const [exportWarning, setExportWarning] = useState<{ format: 'excel' | 'csv' | 'pdf' | 'gaeb' | 'bc3'; score: number } | null>(null);
   const [gaebPreviewOpen, setGaebPreviewOpen] = useState(false);
 
   /* ── Computed data ─────────────────────────────────────────────────── */
@@ -2234,6 +2304,16 @@ export function BOQEditorPage() {
     return last ? last.runningTotal : directCost;
   }, [directCost, markupTotals]);
 
+  /* Client-side VAT / gross. This chain is NOT authoritative and must not be
+   * printed under a "Grand Total" label — ``vatRate`` resolves a single tax
+   * markup, so a BOQ with two tax lines (Brazil BDI) or a fixed-amount tax
+   * loses the rest. It stays client-side because the grid footer and the
+   * client Excel/PDF exports need net / VAT / gross as three separate rows
+   * that react to a cell edit instantly, which a server round-trip cannot do.
+   * The authority for the total of everything is the server's
+   * ``cost-breakdown.grand_total`` (see the ``costBreakdown`` query above),
+   * which is what the toolbar card, the Markup panel and the Cost Breakdown
+   * panel print. Audit #156. */
   const vatAmount = netTotal * vatRate;
   const grossTotal = netTotal + vatAmount;
 
@@ -2321,12 +2401,22 @@ export function BOQEditorPage() {
       setDisplayCurrency('');
     }
   }, [project, displayCurrency, displayCurrencyMeta, setDisplayCurrency]);
-  // FX rates store rate-to-base, so converting from base → display is
-  // ``base_amount / rate``. Example: base ARS, rate.USD = 1200 ⇒ 12 000 ARS
-  // shown as 10 USD.
-  const grossTotalDisplay = displayCurrencyMeta
-    ? grossTotal / displayCurrencyMeta.rate
-    : grossTotal;
+  /* Grand Total for the toolbar card, taken from the server (audit #156 — see
+   * the ``costBreakdown`` query above for why). ``null`` until the server has
+   * answered: the card then renders a placeholder rather than quietly falling
+   * back to the client ``grossTotal``, because a silent fallback is how the
+   * two figures came to disagree in the first place.
+   *
+   * FX rates store rate-to-base, so converting from base → display is
+   * ``base_amount / rate``. Example: base ARS, rate.USD = 1200 ⇒ 12 000 ARS
+   * shown as 10 USD. */
+  const serverGrandTotal = costBreakdown ? toNum(costBreakdown.grand_total) : null;
+  const grandTotalDisplay =
+    serverGrandTotal == null
+      ? null
+      : displayCurrencyMeta
+        ? serverGrandTotal / displayCurrencyMeta.rate
+        : serverGrandTotal;
   const displaySymbol = displayCurrencyMeta ? displayCurrencyMeta.currency : currencySymbol;
 
   /* ── Quality score ───────────────────────────────────────────────── */
@@ -2871,7 +2961,7 @@ export function BOQEditorPage() {
 
   /** Actually perform the export (download file). */
   const doExport = useCallback(
-    async (format: 'excel' | 'csv' | 'pdf' | 'gaeb') => {
+    async (format: 'excel' | 'csv' | 'pdf' | 'gaeb' | 'bc3') => {
       // Client-side Excel export via SheetJS
       if (format === 'excel' && positions.length > 0) {
         try {
@@ -2952,7 +3042,7 @@ export function BOQEditorPage() {
       if (r.ok) {
         const blob = await r.blob();
         const extensions: Record<string, string> = {
-          excel: 'xlsx', csv: 'csv', pdf: 'pdf', gaeb: 'xml',
+          excel: 'xlsx', csv: 'csv', pdf: 'pdf', gaeb: 'xml', bc3: 'bc3',
         };
         triggerDownload(blob, `${boq?.name ?? 'boq'}.${extensions[format] ?? format}`);
         addToast({ type: 'success', title: t('boq.file_downloaded', { defaultValue: 'File downloaded' }) });
@@ -2974,7 +3064,7 @@ export function BOQEditorPage() {
 
   /** Pre-export validation check: warn if quality < 60%, GAEB preview before export. */
   const handleExport = useCallback(
-    (format: 'excel' | 'csv' | 'pdf' | 'gaeb') => {
+    (format: 'excel' | 'csv' | 'pdf' | 'gaeb' | 'bc3') => {
       // Show GAEB confirmation dialog before quality check
       if (format === 'gaeb') {
         setGaebPreviewOpen(true);
@@ -3321,7 +3411,16 @@ export function BOQEditorPage() {
           base_price: res.unit_rate,
           min_price: res.unit_rate,
           max_price: res.unit_rate,
-          currency: currencySymbol === '€' ? 'EUR' : currencySymbol === '£' ? 'GBP' : currencySymbol === '$' ? 'USD' : 'EUR',
+          // The project's own code, not a code reconstructed from its symbol.
+          // The reconstruction recognised three symbols and answered EUR for
+          // everything else, so a project in CLP, BRL, PLN or INR wrote its
+          // catalogue rows in euros. It could also be confidently wrong rather
+          // than merely wrong: the Chilean peso's symbol is a dollar sign.
+          // When the project never set a currency the field is omitted rather
+          // than sent blank, so the catalogue applies its own declared default.
+          // Nothing on that path backfills from the region, and an empty string
+          // passes validation and lands in the column as a currencyless row.
+          currency: currencyCode || undefined,
           source: 'boq_import',
           region: 'CUSTOM',
           specifications: {
@@ -3343,7 +3442,7 @@ export function BOQEditorPage() {
         });
       }
     },
-    [boq?.positions, boqId, currencySymbol, addToast, t],
+    [boq?.positions, boqId, currencyCode, addToast, t],
   );
 
   /** Save the variant-header row to the user's catalog under a custom name.
@@ -3370,14 +3469,18 @@ export function BOQEditorPage() {
       if (!trimmed) return;
       // Currency resolution chain: per-variant override (rare) → position
       // metadata.currency (set when the CWICR row was applied to the
-      // position) → BOQ symbol fallback. The catalog should keep the
-      // article in its native currency, not the project base — that
+      // position) → the project's own currency code. The catalog should keep
+      // the article in its native currency, not the project base — that
       // matches the rest of the variant pipeline.
+      //
+      // The last link used to rebuild a code out of the display symbol and
+      // answer EUR for every symbol it did not recognise, which is most of
+      // them. It reads as a fallback and behaves as an assertion. Undefined
+      // when the project set no currency either, so the field is left out of
+      // the payload and the catalogue applies its own default.
       const posMetaCurrency = (meta.currency as string | undefined) || undefined;
       const catalogCurrency =
-        (chosen.currency as string | undefined) ||
-        posMetaCurrency ||
-        (currencySymbol === '€' ? 'EUR' : currencySymbol === '£' ? 'GBP' : currencySymbol === '$' ? 'USD' : 'EUR');
+        (chosen.currency as string | undefined) || posMetaCurrency || currencyCode || undefined;
       const code = `MY-VAR-${Date.now().toString(36).toUpperCase()}`;
       try {
         await apiPost('/v1/catalog/', {
@@ -3412,7 +3515,7 @@ export function BOQEditorPage() {
         });
       }
     },
-    [boq?.positions, boqId, currencySymbol, addToast, t],
+    [boq?.positions, boqId, currencyCode, addToast, t],
   );
 
   /** Re-pick the variant on an already-added resource entry (v2.6.26+).
@@ -4737,6 +4840,9 @@ export function BOQEditorPage() {
           onShowShortcuts={() => setShowShortcuts(true)}
           onToggleCollapseAll={handleToggleAllSections}
           allSectionsCollapsed={allSectionsCollapsed}
+          onToggleAllResources={handleToggleAllResources}
+          resourcesAllExpanded={resourcesAllExpanded}
+          expandableResourceCount={resourceExpansion.expandable}
           summary={hasPositions ? {
             sectionCount: miniSummaryStats.sectionCount,
             positionCount: miniSummaryStats.positionCount,
@@ -4747,8 +4853,7 @@ export function BOQEditorPage() {
             fxRates,
             displayCurrency,
             onChangeDisplayCurrency: setDisplayCurrency,
-            grossTotal,
-            grossTotalDisplay,
+            grandTotalDisplay,
             displaySymbol,
             displayRate: displayCurrencyMeta?.rate ?? null,
           } : null}
@@ -4802,6 +4907,10 @@ export function BOQEditorPage() {
           onDeleteSection={handleDeleteSection}
           collapsedSections={effectiveCollapsedSections}
           onToggleSection={toggleSection}
+          // `positions` here is the FILTERED set, so the toggle counts and acts
+          // on what the user can actually see - searching down to eight rows and
+          // hitting "show resources" opens those eight, not the whole BOQ.
+          onResourceExpansionChange={setResourceExpansion}
           highlightPositionId={newPositionId ?? bimScrollTargetId ?? undefined}
           currencySymbol={currencySymbol}
           currencyCode={currencyCode}
@@ -4925,7 +5034,9 @@ export function BOQEditorPage() {
       {boqId && hasPositions && <div className="mt-6"><CostBreakdownPanel boqId={boqId} locale={locale} /></div>}
 
       {/* ── AACE Estimate Classification ──────────────────────────────── */}
-      {boqId && hasPositions && <div className="mt-6"><EstimateClassification boqId={boqId} /></div>}
+      {/* Mounted after the deferred warm-up so its request stays out of the
+          first-paint burst; the strip appears a moment later below the fold. */}
+      {boqId && hasPositions && deferredReady && <div className="mt-6"><EstimateClassification boqId={boqId} /></div>}
 
       {/* ── Sensitivity Analysis (Tornado Chart) ──────────────────────── */}
       {boqId && hasPositions && <div className="mt-6"><SensitivityChart boqId={boqId} locale={locale} /></div>}
@@ -5329,8 +5440,19 @@ export function BOQEditorPage() {
             <h3 id="boq-add-section-title" className="text-sm font-semibold text-content-primary mb-3">
               {t('boq.add_section', { defaultValue: 'Add Section' })}
             </h3>
+            {/* Issue #407 — this dialog is not inside a <form>, so an input with
+                no name and no id gets grouped page-wide by the browser's autofill
+                heuristics and was offering saved payment data over a chapter name.
+                A stable name/id plus an accessible name identify the field, which
+                is what actually defeats the heuristic; `autoComplete="off"` alone
+                is routinely overridden on fields the browser thinks are payment
+                or address fields. */}
             <input
               type="text"
+              id="boq-section-name"
+              name="boq-section-name"
+              autoComplete="off"
+              aria-label={t('boq.section_name_prompt', { defaultValue: 'Enter section name:' })}
               value={sectionNameInput}
               onChange={(e) => setSectionNameInput(e.target.value)}
               onKeyDown={(e) => { if (e.key === 'Enter') handleConfirmAddSection(); }}

@@ -14,9 +14,13 @@ repos:
         args: ['--maxkb=1024']
       - id: detect-private-key
 
-  # Python linting & formatting
+  # Python linting & formatting. Pinned to the same ruff the CI gate and
+  # backend/pyproject.toml dev extra use (ruff==0.15.20): the "ruff format
+  # --check" gate compares against the formatter's exact output, so a hook on
+  # an older ruff would reformat differently and fail CI on code that passed
+  # locally. Bump this in lockstep with the pyproject pin.
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.9.0
+    rev: v0.15.20
     hooks:
       - id: ruff
         args: [--fix]
@@ -61,6 +65,20 @@ repos:
         language: system
         pass_filenames: true
 
+      # Keep the accents in the demo packs. The German, Portuguese, Spanish and
+      # French seed text was authored without them ("Koecherfundamente",
+      # "Instalacoes", "Batiment") and now carries them; this stops a corrected
+      # spelling being written back the old way. It is a denylist of the exact
+      # spellings that were broken in this repo, per file, because no rule about
+      # German or Portuguese orthography can tell "Wasser" from "Strasse" or
+      # Spanish "agua" from Portuguese "água" without false positives.
+      - id: seed-diacritics-check
+        name: Keep accents in the demo seed text
+        entry: python scripts/check_seed_diacritics.py
+        language: system
+        pass_filenames: true
+        files: ^backend/app/core/(demo_projects\.py|demo_packs/.*\.py)$
+
       # Keep internal-only planning, strategy, QA, audit and runbook files out
       # of the repo. They are local only; this fails the commit if one is
       # staged. CI and the publish pipelines run the same script (against the
@@ -81,3 +99,160 @@ repos:
         entry: python scripts/check_commit_trailers.py
         language: system
         stages: [commit-msg]
+
+      # Reject a shell fragment sitting where the subject line should be.
+      # Twelve commits already open with "@" before their real subject, the
+      # v14.6.0 release commit among them: a PowerShell here-string opener
+      # written on the same line as "git commit -m" is read as the start of the
+      # message. The twelve are published and one carries a tag, so they are
+      # allowlisted by SHA inside the script and everything after them is
+      # guarded. CI runs the same script across history.
+      - id: commit-subject-check
+        name: Block shell artefacts in the commit subject line
+        entry: python scripts/check_commit_subject.py
+        language: system
+        stages: [commit-msg]
+
+      # Catch doubled Unicode escapes in locale values (`\\u2013` where a
+      # correct value has one backslash, `–`). A doubled backslash is
+      # syntactically valid TypeScript, so tsc, the build and key-count
+      # checks all stay green; it only shows as literal `–` garbage on
+      # screen. Found and fixed 4 keys / 78 values across 28 locales
+      # (a023d1e42, c452e3ecd); this guard is what stops a fifth instance
+      # shipping unnoticed. CI runs the same script on every push.
+      - id: locale-escape-check
+        name: Block doubled Unicode escapes in locale files
+        entry: python scripts/check_locale_escapes.py
+        language: system
+        pass_filenames: false
+        files: ^frontend/src/app/locales/.*\.ts$
+
+      # Scan the whole of en.ts for values byte-identical to their source in
+      # 24+ of 28 non-en locales, and require every hit to land in exactly
+      # one of two never-merged lists: i18n_leak_allowlist.json (identical on
+      # purpose - abbreviations, standards codes, product names) or
+      # i18n_leak_baseline.json (declared leak debt, an explicit key ->
+      # leaked-locale set that may only shrink). Six commits on 2026-07-26
+      # shipped 422 keys / 11360 cells this way - five under a message
+      # claiming translation, one an ordinary feature commit that happened to
+      # add keys along the way; every key existed and every coverage check
+      # passed, so nothing caught it until #181 found the first one by hand.
+      # This guard also rejects a "repair" that deletes a key instead of
+      # translating it (fallbackLng=en still shows English either way), and
+      # a small third list, i18n_leak_pending_review.json, holds the handful
+      # of keys that don't cleanly fit either tell (e.g. a founder's name,
+      # transliterated in two locales and left in Latin script everywhere
+      # else) - reported every run, never gating. A second, complementary
+      # detector catches what the count threshold structurally cannot: 3+
+      # keys sharing one exact identical-locale set at ANY band, which found
+      # two more incidents below the threshold (costExplorer, pipeline.*)
+      # via coherence rather than count. It runs forward-only against
+      # i18n_leak_cluster_snapshot.json, a frozen snapshot of already-seen
+      # locale-set shapes, so it only fails on a genuinely new cluster
+      # forming, not on retriaging ~2600 keys of ordinary per-locale
+      # loanword coincidence every run. CI runs the same script.
+      - id: i18n-leak-baseline-check
+        name: Gate untracked byte-identical-to-en.ts locale values
+        entry: python scripts/check_i18n_leak_baseline.py
+        language: system
+        pass_filenames: false
+        files: ^(frontend/src/app/locales/.*\.ts|scripts/i18n_leak_(allowlist|baseline|pending_review|cluster_snapshot)\.json)$
+
+      # Both guards above start from a key that exists. Neither can see a key
+      # that is in no locale file at all: there is no value to read and none
+      # to compare against, so `t(key, {defaultValue})` falls back and ships
+      # the English default to all 29 languages with every gate green. #175
+      # went out exactly that way - service.sla_breached and service.sla_late
+      # became keys, no locale file ever got them, and the SLA chip read in
+      # English everywhere through a full release. This resolves every such
+      # call site against all 29 bundles (counting CLDR plural forms, without
+      # which it reports 23 gaps where there are 13) and gates the rest
+      # against i18n_orphan_baseline.json, a key -> missing-locale set that
+      # may only shrink. CI runs the same script.
+      - id: i18n-orphan-key-check
+        name: Gate t() keys no locale file can answer
+        entry: python scripts/check_i18n_orphan_keys.py
+        language: system
+        pass_filenames: false
+        files: ^(frontend/src/.*\.tsx?|scripts/i18n_orphan_baseline\.json)$
+
+      # The orphan guard above asks whether a key is reachable at all, and
+      # says in its own comments that it deliberately does not ask whether a
+      # language has every form it needs: a Russian file carrying only
+      # _other passes there. This asks the second question. i18next does not
+      # fall back to _other inside a language - it walks the fallback chain
+      # and prints English - so a Turkish key with _other and no _one shows
+      # an English sentence for every count of one, and nothing else we own
+      # can see it. Counted keys are found from the call sites, because a
+      # suffix is not a plural: err_div_by_zero is division by zero.
+      - id: i18n-plural-form-check
+        name: Gate counted keys missing a form their language needs
+        entry: python scripts/check_i18n_plural_forms.py
+        language: system
+        pass_filenames: false
+        files: ^(frontend/src/.*\.tsx?|scripts/i18n_plural_baseline\.json)$
+
+      # Both guards above ask about a key's name or its value. This one asks
+      # where the key sits, which nothing else does. A locale file is one
+      # object holding one member, "translation", and i18n.ts hands i18next
+      # that member alone. A key appended a level higher, beside the
+      # dictionary instead of inside it, parses and builds and is never
+      # looked up, and because every call site carries an English
+      # defaultValue the screen renders English in all 30 languages with
+      # every other gate green. That is exactly how the three statutory
+      # modules shipped: 6969 translated keys, none of them reachable. No
+      # baseline, because a sibling key is never correct.
+      - id: i18n-key-nesting-check
+        name: Gate locale keys written beside the dictionary
+        entry: python scripts/check_i18n_key_nesting.py
+        language: system
+        pass_filenames: false
+        files: ^frontend/src/app/locales/.*\.ts$
+
+      # The three guards above ask whether a key is reachable, complete and
+      # correctly placed. All three pass on a value written in the wrong
+      # language, because it is present, escaped and not English. On 10.08
+      # the live site served the Korean title 종합 노무 단가 산정 on a Thai
+      # case page: 42 of th.ts's case slugs hold values copied whole out of
+      # ko.ts, and nine other locales carry one wrong-language word inside an
+      # otherwise correct sentence. Only a reader of that language could see
+      # it. This asks the one remaining question, whether the value is
+      # written in a script the language actually uses.
+      - id: i18n-script-mixing-check
+        name: Gate locale values written in someone else's alphabet
+        entry: python scripts/check_i18n_script_mixing.py
+        language: system
+        pass_filenames: false
+        files: ^(frontend/src/app/locales/.*\.ts|scripts/i18n_script_baseline\.json)$
+
+      # A collection endpoint that starts returning {items, total, offset,
+      # limit} breaks every caller still reading a bare array. TypeScript
+      # catches most of that, but not the case this exists for: React Query
+      # caches by key and the key is a string, so when two files share
+      # queryKey: ['schedules'] and only one is migrated, the cache hands the
+      # wrong shape to the other at runtime with the build green. The unit of
+      # migration is therefore one endpoint plus every consumer of it, in one
+      # commit, and this counts both sides. It self-tests before every scan
+      # because the matching is narrow enough that a later tightening could
+      # silence it, and a guard that cannot refuse looks exactly like a clean
+      # tree.
+      - id: page-envelope-consumer-check
+        name: Gate half-migrated collection endpoints
+        entry: python scripts/check_page_envelope_consumers.py
+        language: system
+        pass_filenames: false
+        files: ^(frontend/src/.*\.tsx?|scripts/check_page_envelope_consumers\.py)$
+
+      # Grew out of #126: a migration that rewrote a 1724 MB table inside the
+      # single transaction Alembic wraps a whole upgrade() in died with
+      # DiskFull on a real box. Rewriting pre-existing data is not forbidden -
+      # the hook fails only when a flagged revision has no
+      # "# data-rewrite-ack: table=... growth=... rows=..." comment for a
+      # table it touches, so the size question gets asked before the
+      # revision ships. CI runs the same script.
+      - id: migration-data-rewrite-ack-check
+        name: Gate migrations that rewrite pre-existing data with no acknowledgement
+        entry: python scripts/check_migration_data_rewrites.py
+        language: system
+        pass_filenames: false
+        files: ^backend/alembic/versions/.*\.py$

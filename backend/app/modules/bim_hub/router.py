@@ -81,6 +81,7 @@ from app.core.upload_streaming import StreamedUpload, stream_upload_to_temp
 from app.core.validation.messages import translate
 from app.dependencies import CurrentUserId, RequirePermission, RequireRole, SessionDep, accessible_project_ids
 from app.modules.bim_hub import file_storage as bim_file_storage
+from app.modules.bim_hub.mesh_formats import is_mesh_geometry_ext, mesh_upload_hint
 from app.modules.bim_hub.schemas import (
     AssetInfoUpdateRequest,
     AssetListResponse,
@@ -1222,10 +1223,19 @@ async def upload_bim_data(
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Direct CAD file upload (RVT, IFC, DWG, DGN, FBX, OBJ, 3DS)
+# Direct CAD file upload (RVT, IFC, DWG, DGN)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-_ALLOWED_CAD_EXTENSIONS = {".rvt", ".ifc", ".dwg", ".dgn", ".fbx", ".obj", ".3ds"}
+# The formats a server-side converter can actually turn into a canonical BIM
+# model. This set is also printed verbatim as the "Accepted:" list when an
+# upload is refused, so it has to be the truth rather than an aspiration.
+#
+# FBX, OBJ and 3DS used to sit here. They are geometry-only meshes, every
+# caller runs ``is_mesh_geometry_ext`` first and routes them to the in-browser
+# importer, so the three were unreachable - they could never be accepted, yet
+# the rejection message kept advertising them to the next person who uploaded
+# something else. See ``mesh_formats.py``.
+_ALLOWED_CAD_EXTENSIONS = {".rvt", ".ifc", ".dwg", ".dgn"}
 
 # Formats that require an external converter binary. IFC has a built-in
 # text fallback parser, so it's NOT in this set; XLSX/CSV go through a
@@ -2154,6 +2164,18 @@ async def upload_cad_file(
         )
 
     ext = pathlib.Path(filename).suffix.lower()
+    # Geometry-only 3D mesh formats (OBJ/STL/glTF/GLB/DAE/FBX/PLY/3DS/…) are
+    # not server-convertible CAD - the BIM Hub 3D uploader reads them directly
+    # in the browser and posts a normalized GLB through the data+geometry
+    # upload. Short-circuit them here with a friendly pointer instead of the
+    # generic "unsupported" error (or a confusing magic-byte mismatch for the
+    # few whose extension is in the CAD set), so nothing is stored as a dead,
+    # never-converting model.
+    if is_mesh_geometry_ext(ext):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=mesh_upload_hint(ext, filename),
+        )
     if ext not in _ALLOWED_CAD_EXTENSIONS:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -2193,17 +2215,22 @@ async def upload_cad_file(
             from app.modules.boq.cad_import import find_converter
 
             if find_converter(ext.lstrip(".")) is None:
-                new_model_id = uuid.uuid4()
-                saved_cad_key = await bim_file_storage.save_original_cad_from_path(
-                    project_uuid,
-                    new_model_id,
-                    ext,
-                    upload.path,
-                    size=upload.size,
-                )
                 display_name = (name or pathlib.Path(filename).stem).strip() or filename
                 from app.modules.bim_hub.schemas import BIMModelCreate
 
+                # The row is created before the file is saved, so the blob can
+                # be keyed by the model's own id. It used to be the other way
+                # round: a UUID was minted to key the blob with, the row then
+                # took a different primary key from the database, and the
+                # minted one was what the response and the reprocess link were
+                # built from. That broke the feature at both ends. The response
+                # named a model no row carried, and ``retry`` derives the blob
+                # key from the model id, so even with the right id in hand it
+                # looked for the file under a name nothing had written and
+                # answered "original CAD file is no longer available". Clicking
+                # Re-process is exactly what the error message on this row
+                # tells people to do.
+                #
                 # NB: ``error_message`` is set via a follow-up update because
                 # ``BIMModelCreate`` doesn't expose that field - it lives on
                 # ``BIMModelUpdate`` so freshly-created records start clean.
@@ -2216,14 +2243,21 @@ async def upload_cad_file(
                         name=display_name,
                         discipline=discipline,
                         model_format=ext.lstrip("."),
-                        canonical_file_path=saved_cad_key,
                         status="needs_converter",
                     ),
                     user_id=user_id,
                 )
+                saved_cad_key = await bim_file_storage.save_original_cad_from_path(
+                    project_uuid,
+                    pending_model.id,
+                    ext,
+                    upload.path,
+                    size=upload.size,
+                )
                 await service.update_model(
                     pending_model.id,
                     BIMModelUpdate(
+                        canonical_file_path=saved_cad_key,
                         error_message=(
                             f"{ext.upper().lstrip('.')} converter not installed - "
                             f"install it from the BIM converter banner, then "
@@ -2235,7 +2269,7 @@ async def upload_cad_file(
                 logger.info(
                     "Saved %s upload pending converter - model=%s, key=%s, %d bytes",
                     ext,
-                    new_model_id,
+                    pending_model.id,
                     saved_cad_key,
                     upload.size,
                 )
@@ -2255,7 +2289,7 @@ async def upload_cad_file(
                             f"Re-process on the model card to finish the upload."
                         ),
                         "install_endpoint": install_endpoint,
-                        "model_id": str(new_model_id),
+                        "model_id": str(pending_model.id),
                         "name": display_name,
                         "file_size": upload.size,
                         "element_count": 0,
@@ -2265,7 +2299,7 @@ async def upload_cad_file(
                         "Retry-After": "60",
                         "Link": (
                             f'<{install_endpoint}>; rel="install-converter", '
-                            f"</api/v1/bim_hub/{new_model_id}/retry/>; "
+                            f"</api/v1/bim_hub/{pending_model.id}/retry/>; "
                             f'rel="reprocess-model"'
                         ),
                     },
@@ -2482,6 +2516,14 @@ async def create_model_from_document(
             }
 
     ext = _Path(doc.name or "").suffix.lower()
+    # Geometry-only mesh formats are read in-browser by the BIM Hub 3D
+    # uploader, not converted on the server - point the user there instead of
+    # creating a model that could never render (mirrors the upload-cad guard).
+    if is_mesh_geometry_ext(ext):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=mesh_upload_hint(ext, doc.name),
+        )
     if ext not in _ALLOWED_CAD_EXTENSIONS:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,

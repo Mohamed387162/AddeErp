@@ -12,6 +12,10 @@ venv/
 # Node
 node_modules/
 frontend/dist/
+# Isolated gate-build output: building straight into dist/ EPERMs against
+# the running local stand's open file handles, so gate builds target
+# dist-gate/ and get copied over dist/ afterwards.
+frontend/dist-gate/
 
 # IDE
 .vscode/
@@ -101,8 +105,14 @@ data/exports/
 data/cwicr/cache/
 data/approvals/
 data/transmittals/
+data/geo_hub/
 data/tilesets/
 data/reports/
+data/takeoff_documents/
+data/dwg_uploads/
+data/dwg_entities/
+data/dwg_thumbnails/
+data/pointcloud/
 frontend/debug-bim/
 
 # MCP artifacts
@@ -434,6 +444,14 @@ frontend/scripts/_i18n_*.py
 # Pre-redesign backups (the existing *.backup.* rule misses the .bak suffix).
 *.pre-redesign.bak
 
+# --- Provenance / watermark tooling: local only, never publish ---
+# The watermark generator, its registry and the integrity verifier document
+# the covert marker scheme, so they stay local and out of the public repo
+# (constraint #9). The markers themselves remain planted in shipped source;
+# only the tooling that explains them is withheld.
+/tools/watermark/
+/scripts/integrity_check.py
+
 # --- Internal working notes: local only, never publish (constraint #9) ---
 # Underscore-prefixed markdown / text files anywhere in the tree are scratch:
 # agent handoffs, audit residue, a11y sweeps, planning notes, per-issue reply
@@ -441,3 +459,44 @@ frontend/scripts/_i18n_*.py
 # scripts/check_repo_hygiene.py and the wheel exclude enforce the same rule.
 **/_*.md
 **/_*.txt
+
+# --- Public website: never in the product repository (constraint #9) ---
+# marketing-site and the archived website-marketing tree are deployed on their
+# own and the live host is the source of truth. Tracking them here produced a
+# second copy that drifted from what visitors actually see.
+/marketing-site/
+/website-marketing/
+
+# Documentation build helpers: internal tooling, not for readers of the repo.
+/docs/expand_docs.py
+/docs/expand_docs2.py
+
+# Session working directory: translation intermediates, audit dumps and one-off
+# scripts. Local only, and it holds source-language drafts we do not publish.
+/scratchpad/
+# Module inventory dump: regenerated on demand for the marketing honeycomb,
+# not an input to anything in this repository.
+/modules.json
+
+# --- Personal data: never in this repository, which is public ---
+# The marketing host captures signups and enquiries as JSONL under /root/clawd,
+# and an export built for a mailing tool is a CSV of real people. A copy of one
+# of those files, or an export from it, must not be committable even by
+# accident. scripts/check_repo_hygiene.py blocks the same names, so a file that
+# slips past this list still fails the gate. Keep the two in step.
+demo-registrations*.jsonl
+demo-tokens*.json
+newsletter-subscribers*.jsonl
+license-requests*.jsonl
+partner-applications*.jsonl
+contact-requests*.jsonl
+email-delivery-failures*.jsonl
+*subscribers*.csv
+*newsletter*.csv
+*email-export*.csv
+*contacts-export*.csv
+*leads-export*.csv
+*audience*.csv
+
+# Locale bootstrap batches, see scripts/i18n_new_locale.py
+.i18n-work/

@@ -4,18 +4,18 @@ import { useState, useRef, useEffect, useCallback } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useNavigate, useLocation } from 'react-router-dom';
 import { useQuery } from '@tanstack/react-query';
-import { Search, ChevronDown, ChevronRight, LogOut, User, Settings, Menu, MessageSquarePlus, FolderOpen, CheckCircle2, XCircle, Bug, BookOpen, Loader2, Upload, HelpCircle, GraduationCap, Mail, ExternalLink, Github, Sun, Moon, Monitor, Info, Globe } from 'lucide-react';
+import { Search, ChevronDown, ChevronRight, LogOut, User, Settings, Menu, MessageSquarePlus, FolderOpen, CheckCircle2, XCircle, Bug, BookOpen, Loader2, Upload, HelpCircle, GraduationCap, Mail, ExternalLink, Github, Sun, Moon, Monitor, Globe } from 'lucide-react';
 import clsx from 'clsx';
 import { SUPPORTED_LANGUAGES, getLanguageByCode, changeLanguage } from '../i18n';
 import { useAuthStore } from '@/stores/useAuthStore';
 import { useUploadQueueStore } from '@/stores/useUploadQueueStore';
 import { useProjectContextStore } from '@/stores/useProjectContextStore';
-import { useModuleInfoStore } from '@/stores/useModuleInfoStore';
 import { useThemeStore } from '@/stores/useThemeStore';
-import { CountryFlag, PartnerLogoBadge } from '@/shared/ui';
+import { CountryFlag, ModuleInfoButton, PartnerLogoBadge } from '@/shared/ui';
 import { usePartnerPack } from '@/shared/hooks/usePartnerPack';
 import { NotificationBell } from '@/shared/ui/NotificationBell';
 import { HeaderNewsButton } from '@/shared/ui/HeaderNewsButton';
+import { ModuleBuilderButton } from '@/features/module-builder';
 import { apiGet } from '@/shared/lib/api';
 import { copyToClipboard } from '@/shared/lib/browser';
 import {
@@ -27,11 +27,12 @@ import {
 import { APP_VERSION, APP_BUILD_FINGERPRINT } from '@/shared/lib/version';
 import { useToastStore } from '@/stores/useToastStore';
 import { useI18nReady } from '@/shared/lib/useI18nReady';
-import { isTauri, openAppInBrowser } from '@/shared/lib/desktop';
+import { isTauri, openAppInBrowser, openLink } from '@/shared/lib/desktop';
 import { SupportUsButton } from './SupportUsButton';
 import { SubscribeButton } from './SubscribeButton';
 import { ProjectJourneyButton } from './ProjectJourney';
 import { getRouteIcon } from './routeIcons';
+import { isModuleI18nKey } from '@/modules/_i18n';
 
 /**
  * Map the English page titles passed from App.tsx routes to i18n keys.
@@ -43,14 +44,16 @@ import { getRouteIcon } from './routeIcons';
  * (current behaviour), so adding a route without a mapping degrades gracefully
  * rather than showing a raw key.
  */
-const TITLE_I18N_MAP: Record<string, string> = {
+export const TITLE_I18N_MAP: Record<string, string> = {
   // Overview
   'Dashboard': 'nav.dashboard',
   'Projects': 'nav.projects',
   'New Project': 'projects.new_project',
   'Project': 'nav.projects',
   'Project Settings': 'nav.settings',
-  'Project Files': 'nav.project_files',
+  // Legacy title of the module now called Documents. Kept so a page still
+  // emitting the old title resolves to the current name rather than the old one.
+  'Project Files': 'nav.documents',
   'Project Intelligence': 'nav.estimation_dashboard',
   // Estimation
   'Match Elements': 'match_elements.title',
@@ -61,17 +64,27 @@ const TITLE_I18N_MAP: Record<string, string> = {
   'BOQ Templates': 'nav.templates',
   // Catalogues
   'Cost Database': 'nav.costs',
+  'Cost Explorer': 'nav.cost_explorer',
   'Import Cost Database': 'costs.import_title',
+  // First-party module routes now state their title as a key, so these entries
+  // only catch a module that still ships the English literal.
+  'GAEB Exchange': 'nav.gaeb_exchange',
   'Resource Catalog': 'nav.resource_catalog',
   'Assemblies': 'nav.assemblies',
-  'New Assembly': 'assemblies.new',
-  'Assembly Editor': 'assemblies.editor',
+  'New Assembly': 'assemblies.new_assembly',
+  // No locale names the single-assembly editor, so it takes the module's own
+  // name. The keys these two used to point at, assemblies.new and
+  // assemblies.editor, exist in no locale at all, which the defaultValue
+  // fallback turned into a silently English heading.
+  'Assembly Editor': 'assemblies.title',
   // Takeoff & CAD/BIM
   'Quantity Takeoff': 'nav.takeoff_overview',
   'PDF Takeoff': 'nav.takeoff',
   'DWG Takeoff': 'nav.dwg_takeoff',
   'CAD/BIM Takeoff': 'nav.cad_takeoff',
-  'Data Explorer': 'nav.cad_bim_explorer',
+  // #149: keyed on the <P title> App.tsx passes for /data-explorer. Both sides
+  // renamed together; a miss here falls back to the raw English title.
+  'CAD-BIM BI Explorer': 'nav.cad_bim_explorer',
   'BIM Viewer': 'nav.bim_viewer',
   'BIM Federations': 'nav.bim_federations',
   'BIM Rules': 'nav.bim_rules',
@@ -154,19 +167,130 @@ const TITLE_I18N_MAP: Record<string, string> = {
   'Audit Log': 'sidebar.admin_grid.audit',
   'Governance': 'sidebar.admin_grid.governance',
   'Modules': 'nav.modules',
+  // A module installed from the catalogue renders under a route that titles
+  // every one of them "Module". The word was translated everywhere already, as
+  // a filter label over in quantities, but a page heading has no business
+  // reading its name out of another module's namespace, so the modules
+  // namespace now carries it too.
+  'Module': 'modules.module_title',
+  'E-invoice Clearance': 'nav.einvoice_clearance',
   'Settings': 'nav.settings',
   'About': 'nav.about',
   'Not Found': 'error.not_found',
+
+  /* The map had grown to cover about half the routes, and the half it missed
+     included the opening screen of most modules: the heading and the browser
+     tab printed English on an otherwise German session. Everything below is a
+     route whose words are already translated under some key, so these are
+     mappings and not new strings. Where the sidebar names the destination a
+     little differently - "Allowances & Contingency" for the route titled
+     "Allowances" - the sidebar wins, because the point of this map is that the
+     two can never disagree. */
+
+  // Estimation
+  'AI Estimate Builder': 'nav.ai_estimator',
+  'Assembly Library': 'nav.assembly_library',
+  'Basis of Estimate': 'nav.estimate_basis',
+  'Conceptual Estimate': 'nav.rom_estimate',
+  'Estimate Copilot': 'nav.estimate_copilot',
+  'Allowances': 'nav.allowances',
+  'Preliminaries': 'nav.preliminaries',
+  'Waste Factors': 'nav.waste_factors',
+  'Production Norms': 'nav.norm_expansion',
+  'Resource Summary': 'nav.resource_summary',
+  'Cost Match': 'nav.cost_match',
+  'Price Index': 'nav.price_index',
+  'Source Data': 'source_data.title',
+  'Databases & Resources': 'nav.setup_databases',
+  'Currencies': 'nav.fx',
+  // Takeoff & CAD/BIM
+  'Point Cloud': 'nav.point_cloud',
+  'Model Review': 'nav.model_review',
+  'Model Issues': 'nav.model_issues',
+  'Issues': 'nav.issues',
+  'Clash Profiles': 'clash.profiles.title',
+  'Design Options': 'nav.design_options',
+  'Drawing Sheets': 'sheets.page_title',
+  'Plan Room': 'nav.plan_room',
+  'Project map': 'geo_hub.project_title',
+  'Development map': 'geo_hub.development_title',
+  // Commercial
+  'Change Intelligence': 'nav.change_intelligence',
+  'Claims Evidence': 'nav.claims_evidence',
+  'Progress Claim': 'contracts.claim',
+  'Withholding Tax': 'nav.tax_withholding',
+  'Authority Submissions': 'authority_submission.title',
+  'Review Authority': 'review_authority.title',
+  'Interface Register': 'nav.interface_management',
+  'Management of Change': 'moc.title',
+  'Event Reconciliation': 'nav.reconciliation',
+  // Planning
+  'Takt Planning': 'nav.takt',
+  'Capacity Planning': 'nav.capacity_planning',
+  'Resource Leveling': 'nav.resource_leveling',
+  'Progress': 'nav.progress',
+  'Construction Control': 'nav.construction_control',
+  // Field & site
+  'Field Time': 'nav.field_time',
+  'Labor Rates': 'nav.labor_rates',
+  'Payroll': 'nav.payroll',
+  'Site Supervision': 'site_supervision.title',
+  'Site Mobilisation': 'nav.site_prep',
+  'Site Logistics': 'nav.site_logistics',
+  'Site Inventory': 'nav.site_inventory',
+  'Temporary Works': 'nav.temporary_works',
+  'Formwork': 'formwork.title',
+  'Off-site / Prefab': 'nav.prefab',
+  'Forms & checklists': 'nav.forms',
+  // Quality, handover & sustainability
+  'Commissioning': 'nav.commissioning',
+  'Handover & Closeout': 'closeout.title',
+  'Defects Liability': 'defects_liability.title',
+  'ESG Site Performance': 'nav.esg',
+  // Communication & documentation
+  'Inbox': 'inbox.title',
+  'Notifications': 'nav.notifications',
+  'Deadlines': 'deadlines.title',
+  'Phone Log': 'nav.phone_log',
+  'Inbound Capture': 'nav.inbound_capture',
+  'Email Delay Scan': 'nav.inbound_email',
+  'Document Connectors': 'nav.connectors',
+  'Approvals register': 'files.approvals.register_title',
+  'Recycle Bin': 'files.trash.title',
+  'Find Records': 'nav.find_records',
+  'E-Signatures': 'signing.title',
+  // Finance & analytics
+  'Payment Clock': 'nav.payment_clock',
+  'Cost-Value Reconciliation': 'nav.cvr',
+  'Earned Value': 'nav.full_evm',
+  'EAC Block Editor': 'eac.editor.title',
+  'Value Realized': 'nav.value',
+  'Portfolio': 'portfolio.title',
+  'Route Classifier': 'project_route.title',
+  // Learning & admin
+  'Cases': 'nav.cases',
+  'How it works': 'howto.page_title',
+  'Inside track': 'inside.page_title',
+  'Module Builder': 'nav.module_builder',
+  'Pipelines': 'nav.pipelines',
+  'Integrations': 'nav.integrations',
+  'Credentials': 'nav.credentials',
+  'Teams and Visibility': 'teams.title',
 };
 
 /**
  * Resolve the i18n key for a page title (or `null` when there is no mapping).
  * Shared with AppLayout so the browser-tab `document.title` translates the
  * same way the on-screen heading does.
+ *
+ * A module route states its title as a key already (`ModuleRoute.title`), so
+ * such a title is its own answer. Without this the map would miss it, the tab
+ * would print the raw key, and the heading and the tab would disagree about
+ * the same page.
  */
 export function resolvePageTitleKey(title: string | undefined): string | null {
   if (!title) return null;
-  return TITLE_I18N_MAP[title] ?? null;
+  return TITLE_I18N_MAP[title] ?? (isModuleI18nKey(title) ? title : null);
 }
 
 interface HeaderProps {
@@ -192,7 +316,7 @@ export function Header({ title, onMenuClick }: HeaderProps) {
   const packActive = usePartnerPack().data?.active === true;
   const location = useLocation();
   const translatedTitle = title
-    ? t(TITLE_I18N_MAP[title] ?? title, { defaultValue: title })
+    ? t(resolvePageTitleKey(title) ?? title, { defaultValue: title })
     : undefined;
   // Icon for the active module, mirroring the matching sidebar row. Shown as
   // a small chip before the top-bar title so each module is identifiable at
@@ -269,13 +393,17 @@ export function Header({ title, onMenuClick }: HeaderProps) {
           </>
         )}
 
-        {/* Collapsed module-info re-opener. When the page's DismissibleInfo
-            card is collapsed it vanishes from the page entirely (founder
-            decision 2026-06-06) and registers here: project pill › module
-            name › THIS icon. One click re-expands the card in the page.
-            Visible at every breakpoint - on mobile the in-page card is the
-            only other surface, so this is the sole way back. */}
-        <ModuleInfoReopener />
+        {/* Collapsed module-info re-opener. When a page's info block is
+            collapsed it vanishes from the page entirely (founder decision
+            2026-06-06) and registers here: project pill › module name › THIS
+            icon. One click re-expands it in the page.
+
+            This is the ONLY re-open control in the product (founder
+            2026-08-07). It sits outside the `translatedTitle` block on
+            purpose: the title is `hidden lg:flex`, and below lg the icon is
+            the sole way back, so gating it on the title would strand a
+            collapsed block on every narrow screen. */}
+        <ModuleInfoButton />
       </div>
 
       {/* ── Partner co-brand chip (center column) ───────────────────────
@@ -363,6 +491,10 @@ export function Header({ title, onMenuClick }: HeaderProps) {
             report doesn't have to scan past the marketing CTAs. */}
         <NotificationBell />
         <HeaderNewsButton />
+        {/* Building a module is something you do from wherever you noticed the
+            platform was missing one, so it lives here rather than in the
+            sidebar. Renders nothing for anyone who may not install one. */}
+        <ModuleBuilderButton />
         <SupportUsButton />
         <SubscribeButton />
         <BugReportMenu />
@@ -384,31 +516,6 @@ export function Header({ title, onMenuClick }: HeaderProps) {
         <UserMenu />
       </div>
     </header>
-  );
-}
-
-/* ── Module info re-opener (top bar) ──────────────────────────────────── */
-
-/** Small info icon after the module title, shown ONLY while the page's
- *  DismissibleInfo card is collapsed. Clicking it re-expands the card
- *  (and this icon disappears, because the card unregisters itself). */
-function ModuleInfoReopener() {
-  const { t } = useTranslation();
-  const hasCollapsed = useModuleInfoStore((s) => s.entries.length > 0);
-  const expandAll = useModuleInfoStore((s) => s.expandAll);
-  if (!hasCollapsed) return null;
-  const label = t('common.module_info', { defaultValue: 'Module information' });
-  return (
-    <button
-      type="button"
-      onClick={expandAll}
-      aria-label={label}
-      title={label}
-      data-testid="header-module-info"
-      className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-content-tertiary transition-colors hover:bg-surface-secondary hover:text-content-secondary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-border-focus"
-    >
-      <Info size={15} strokeWidth={1.75} />
-    </button>
   );
 }
 
@@ -519,7 +626,7 @@ function BugReportMenu() {
     setOpen(false);
     const { url, body } = buildBugReportUrl(t);
     if (url) {
-      window.open(url, '_blank', 'noopener,noreferrer');
+      openLink(url);
       return;
     }
     void copyToClipboard(body).then((ok) => {
@@ -565,7 +672,7 @@ function BugReportMenu() {
       app_version: APP_VERSION,
       platform: navigator.userAgent.includes('Win') ? 'Windows' : navigator.userAgent.includes('Mac') ? 'macOS' : 'Linux',
     });
-    window.open(`https://openconstructionerp.com/contact.html?${params}`, '_blank');
+    openLink(`https://openconstructionerp.com/contact.html?${params}`);
   };
 
   const handleDownloadLog = () => {
@@ -791,7 +898,7 @@ function HelpMenu() {
       feedback: 'true',
       app_version: APP_VERSION,
     });
-    window.open(`https://openconstructionerp.com/contact.html?${params}`, '_blank');
+    openLink(`https://openconstructionerp.com/contact.html?${params}`);
   };
 
   return (
@@ -869,13 +976,14 @@ function HelpMenu() {
               role="menuitem"
               onClick={() => {
                 setOpen(false);
-                void openAppInBrowser().then((ok) => {
-                  if (!ok) {
+                void openAppInBrowser().then((result) => {
+                  if (!result.ok) {
                     addToast({
                       type: 'warning',
                       title: t('desktop.open_in_browser_failed', {
                         defaultValue: 'Could not open your browser',
                       }),
+                      message: result.reason,
                     });
                   }
                 });
@@ -1024,7 +1132,7 @@ const ROUTE_COMPONENT_MAP: ReadonlyArray<readonly [string, string]> = [
   ['/clash', 'Clash Detection'],
   ['/coordination', 'Model Coordination'],
   ['/assets', 'Asset Register'],
-  ['/data-explorer', 'Data Explorer'],
+  ['/data-explorer', 'CAD-BIM BI Explorer'],
   ['/match-elements', 'CAD-BIM Match to Cost'],
   ['/boq', 'BOQ'],
   ['/templates', 'BOQ Templates'],
@@ -1045,7 +1153,7 @@ const ROUTE_COMPONENT_MAP: ReadonlyArray<readonly [string, string]> = [
   ['/tendering', 'Tendering'],
   ['/changeorders', 'Change Orders'],
   ['/photos', 'Project Photos'],
-  ['/files', 'Files'],
+  ['/files', 'Documents'],
   ['/risks', 'Risk Register'],
   ['/markups', 'Markups'],
   ['/punchlist', 'Punch List'],
@@ -1078,6 +1186,13 @@ const ROUTE_COMPONENT_MAP: ReadonlyArray<readonly [string, string]> = [
   ['/portal', 'Client & Partner Portal'],
   ['/resources', 'Resources & Crew'],
   ['/contracts', 'Contracts'],
+  ['/payment-clock', 'Payment Clock'],
+  ['/tax-withholding', 'Withholding Tax'],
+  ['/einvoice-clearance', 'E-invoice Clearance'],
+  ['/inbound-email', 'Email Delay Scan'],
+  ['/cost-match', 'Cost Match'],
+  ['/full-evm', 'Earned Value'],
+  ['/fx', 'Currencies'],
   ['/ai-estimate', 'AI Quick Estimate'],
   ['/ai-agents', 'AI Agents'],
   ['/advisor', 'AI Cost Advisor'],
@@ -1149,6 +1264,11 @@ function buildBugReportUrl(
     `- User agent: ${navigator.userAgent}`,
     `- Build: ${APP_BUILD_FINGERPRINT}`,
     last ? `- Captured at: ${last.at}` : '',
+    // The page the error happened on, which is not always the page the user
+    // is filing from. Component/Page above name the current route and drive
+    // the title, so when the two disagree triage needs to see it rather than
+    // assume the stack belongs to the named surface (#391).
+    last ? `- Error page: ${last.url}` : '',
     '',
     '### Last error captured',
     errorBlock,
@@ -1454,7 +1574,7 @@ function ProjectSwitcher() {
           )}
           title={activeProjectId
             ? t('projects.open_current', { defaultValue: 'Open this project' })
-            : t('schedule.select_project', { defaultValue: 'Select Project' })}
+            : t('projects.select_active', { defaultValue: 'Select Project' })}
         >
           {/* Leading icon square — colored tile in active mode; pulsing
               dot in CTA mode so the eye is drawn to "act here". */}
@@ -1474,7 +1594,7 @@ function ProjectSwitcher() {
             'truncate',
             activeProjectId ? 'font-semibold' : 'font-medium',
           )}>
-            {activeProjectName || t('schedule.select_project', { defaultValue: 'Select Project' })}
+            {activeProjectName || t('projects.select_active', { defaultValue: 'Select Project' })}
           </span>
         </button>
         <button

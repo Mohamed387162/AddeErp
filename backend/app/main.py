@@ -30,6 +30,7 @@ _os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 _os.environ.setdefault("OMP_NUM_THREADS", "1")
 _os.environ.setdefault("MKL_NUM_THREADS", "1")
 
+import asyncio
 import hashlib as _hashlib
 import logging
 import os
@@ -38,6 +39,8 @@ import time
 import uuid
 import uuid as _instance_uuid
 from typing import Any
+
+_APP_BUILD_TAG: str = "a037e172eb9c84f9"
 
 # Unique instance fingerprint - proves this specific deployment origin
 _INSTANCE_ID = str(_instance_uuid.uuid4())
@@ -57,9 +60,43 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.config import Settings, build_provenance_tag, desktop_mode, get_settings
 from app.core.deployment_posture import build_data_security_posture
 from app.core.module_loader import module_loader
-from app.dependencies import RequireRole, get_current_user_id
+from app.core.self_upgrade import (
+    FROZEN_REFUSAL,
+    claim_upgrade,
+    current_upgrade,
+    is_frozen_build,
+    run_upgrade,
+)
+from app.dependencies import RequireRole, get_current_user_id, rls_request_context
 
 logger = logging.getLogger(__name__)
+
+
+def _database_target() -> str:
+    """Describe where the database connection was aimed, without the password.
+
+    A name-resolution failure reports only what the resolver was handed, so
+    ``[Errno -2] Name or service not known`` arrives naming nothing the
+    operator can check. The host *as parsed* is the useful thing to print: a
+    password containing ``@`` moves the split point in the URL's userinfo, so
+    ``oe:pa@ss@postgres`` parses its host as ``ss@postgres``, which resolves
+    nowhere. That is visible on sight here and invisible everywhere else.
+
+    Never renders the password. Returns an empty string if anything at all
+    goes wrong, because this only ever runs on a failure path.
+    """
+    try:
+        from sqlalchemy.engine import make_url
+
+        url = make_url(get_settings().database_url)
+        target = url.host or "(no host)"
+        if url.port:
+            target = f"{target}:{url.port}"
+        if url.database:
+            target = f"{target}/{url.database}"
+        return target[:80]
+    except Exception:  # noqa: BLE001 - diagnostics must never mask the real error
+        return ""
 
 
 def _emit_server_fail(exc: BaseException) -> None:
@@ -81,6 +118,11 @@ def _emit_server_fail(exc: BaseException) -> None:
         reason = f"{type(exc).__name__}: {exc}".replace("\n", " ").replace("\r", " ").strip()
         if len(reason) > 180:
             reason = reason[:177] + "..."
+        # Neutral label rather than a diagnosis: this runs for every fatal
+        # startup failure, including ones the database had nothing to do with.
+        target = _database_target()
+        if target:
+            reason = f"{reason} | db={target}"
         from app.core.embedded_pg import emit_stage
 
         emit_stage("server", "fail", reason)
@@ -626,7 +668,7 @@ async def _seed_demo_account() -> None:
         {
             "email": "demo@openconstructionerp.com",
             "env_var": "DEMO_USER_PASSWORD",
-            "full_name": "Demo User",
+            "full_name": "Elena Marchetti",
             "role": "admin",
         },
         {
@@ -770,10 +812,10 @@ async def _seed_demo_account() -> None:
         #     project(s) so the workspace reflects the partner's region,
         #     currency and classification - nothing else.
         #
-        #   GENERIC MODE (no pack): seed the rich nine-project showcase - the
-        #     eight country projects in SHOWCASE_DEMO_IDS plus the flagship
-        #     reference project installed further below - so a fresh, vanilla
-        #     install lands a fully worked-out, globe-spanning portfolio.
+        #   GENERIC MODE (no pack): seed the rich showcase - the country
+        #     projects in SHOWCASE_DEMO_IDS plus the flagship reference
+        #     project installed further below - so a fresh, vanilla install
+        #     lands a fully worked-out, globe-spanning portfolio.
         #
         # Both paths install each project in its own try/except so one failure
         # never aborts the rest of the seed.
@@ -832,8 +874,8 @@ async def _seed_demo_account() -> None:
             else:
                 # GENERIC MODE - seed the rich showcase by default. Tests ask for
                 # a fast startup (OE_TEST_FAST_STARTUP), and operators can opt out
-                # with OE_SKIP_SHOWCASE=1; both skip the eight-project loop. The
-                # flagship below still installs and provides the ninth project.
+                # with OE_SKIP_SHOWCASE=1; both skip the showcase loop. The
+                # flagship below still installs alongside it.
                 _fast_startup = os.environ.get("OE_TEST_FAST_STARTUP", "").lower() in (
                     "1",
                     "true",
@@ -1058,6 +1100,12 @@ def create_app() -> FastAPI:
         openapi_url="/api/openapi.json" if not settings.is_production else None,
         swagger_ui_oauth2_redirect_url=("/api/docs/oauth2-redirect" if not settings.is_production else None),
         redirect_slashes=False,
+        # Row-level-security: bind the caller's tenant to the request context on
+        # every route, so the after_begin GUC listener (app.core.rls) can scope
+        # tenant-owned tables in PostgreSQL. Anonymous callers bind no tenant.
+        # Inert until OE_RLS_ENFORCE is enabled and requests connect through the
+        # non-superuser role.
+        dependencies=[Depends(rls_request_context)],
         # NOTE: do NOT set default_response_class=ORJSONResponse here.
         # FastAPI's own deprecation warning explains why: "FastAPI now
         # serializes data directly to JSON bytes via Pydantic when a
@@ -1117,6 +1165,11 @@ def create_app() -> FastAPI:
         allow_credentials=True,
         allow_methods=["GET", "HEAD", "POST", "PATCH", "PUT", "DELETE", "OPTIONS"],
         allow_headers=["Content-Type", "Authorization", "Accept", "Accept-Language"],
+        # A list route that pages returns the number of matches behind the page
+        # in X-Total-Count. A browser hides every response header a server does
+        # not name here, so without this the count reaches a frontend served
+        # from another origin and cannot be read there.
+        expose_headers=["X-Total-Count"],
     )
 
     # ── API Version header ──────────────────────────────────────────────
@@ -1489,20 +1542,25 @@ def create_app() -> FastAPI:
             logger.warning("Alembic head check failed: %s", _exc)
             result["alembic_head_matches"] = None
 
-        # Frontend dist presence - the wheel ships ``app/_frontend_dist/``,
-        # a repo checkout serves ``frontend/dist``; a missing ``index.html``
-        # in BOTH locations means the SPA shell will 404 and users see a
-        # blank page even though /api endpoints work. Mirror the lookup
-        # order of ``cli_static.get_frontend_dir`` so dev mode is not
-        # falsely reported as degraded.
+        # Frontend dist presence. The flag must describe what THIS process
+        # serves, not what the disk holds right now: a process that started
+        # while dist was mid-rebuild mounted nothing and 404s every UI route
+        # even after the rebuild lands, and a mounted tree can lose its
+        # index.html to a later rebuild while a live directory probe still
+        # looks green. Fall back to the on-disk probe only in API-only mode,
+        # where "present" can only mean "a servable build exists for the
+        # next start".
         try:
-            from app.cli_static import get_frontend_dir
+            from app.cli_static import get_frontend_dir, mounted_frontend_intact
 
-            try:
-                get_frontend_dir()
-                result["frontend_dist_present"] = True
-            except FileNotFoundError:
-                result["frontend_dist_present"] = False
+            _intact = mounted_frontend_intact()
+            if _intact is None:
+                try:
+                    get_frontend_dir()
+                    _intact = True
+                except FileNotFoundError:
+                    _intact = False
+            result["frontend_dist_present"] = _intact
             if not result["frontend_dist_present"]:
                 result["status"] = "degraded"
         except Exception:
@@ -1602,8 +1660,9 @@ def create_app() -> FastAPI:
                 "status": "connected",
                 "engine": "postgresql",
             }
-        except Exception as exc:
-            result["database"] = {"status": "error", "error": str(exc)[:100]}
+        except Exception:
+            logger.warning("System status DB probe failed", exc_info=True)
+            result["database"] = {"status": "error", "error": "unavailable"}
 
         # Vector DB check (LanceDB or Qdrant).
         #
@@ -1839,6 +1898,9 @@ def create_app() -> FastAPI:
             latest = current
 
         update_available = _semver_tuple(latest) > _semver_tuple(current)
+        # A frozen build has no pip to upgrade itself with, so advertising the
+        # pip command there sends the user down a path that cannot work.
+        frozen = is_frozen_build()
         result = {
             "current_version": current,
             "latest_version": latest,
@@ -1846,43 +1908,66 @@ def create_app() -> FastAPI:
             "release_url": release_url,
             "release_notes": release_notes,
             "published_at": published_at,
-            "upgrade_command": "pip install --upgrade openconstructionerp",
+            "self_upgrade_supported": not frozen,
+            "upgrade_command": (
+                "Download and run the latest installer" if frozen else "pip install --upgrade openconstructionerp"
+            ),
         }
         setattr(app.state, cache_key, {"data": result, "checked_at": time.time()})
         return result
 
-    @app.post("/api/system/upgrade", tags=["System"])
+    @app.post(
+        "/api/system/upgrade",
+        tags=["System"],
+        dependencies=[Depends(RequireRole("admin"))],
+        response_model=None,
+        status_code=status.HTTP_202_ACCEPTED,
+    )
     async def trigger_upgrade(
         version: str | None = None,
         force: bool = False,
-    ) -> dict[str, Any]:
-        """Run ``pip install --upgrade openconstructionerp`` in this venv.
+    ) -> JSONResponse:
+        """Start ``pip install --upgrade openconstructionerp`` in this venv.
 
-        Best-effort one-click upgrade. We shell out to the **same**
-        interpreter that's serving the API so the upgrade lands in the
-        right venv (Issue #96 - Windows launcher uses
-        ``%LOCALAPPDATA%/OpenConstructionERP/venv``, not the user's
-        global Python). Captures stdout+stderr so the UI can show the
-        installer log.
+        Returns ``202`` with a job id as soon as the work is scheduled;
+        poll ``GET /api/system/upgrade/status`` for the outcome and the
+        pip log. It used to run inline and answer only when pip was
+        finished, which no browser waits for: the client gave up at 45
+        seconds and reported a failure over an upgrade still in progress
+        (issue #430). Worse, with a single worker the whole server was
+        unreachable while it ran.
+
+        Asking again while one is running answers ``409`` with that job
+        rather than starting a second pip against the same site-packages.
+
+        We shell out to the **same** interpreter that's serving the API so
+        the upgrade lands in the right venv (Issue #96 - Windows launcher
+        uses ``%LOCALAPPDATA%/OpenConstructionERP/venv``, not the user's
+        global Python).
 
         **Important - the running process keeps the OLD wheel in memory.**
         Python caches imports; pip can replace files on disk but cannot
-        swap modules already loaded. The response includes
+        swap modules already loaded. The finished job carries
         ``restart_required=true`` and the new version pulled from
         ``importlib.metadata`` so the UI can prompt the user to restart
         their launcher (``openconstructionerp serve``) or, on managed
         installs, the host's systemd unit.
 
-        Gated by ``ALLOW_RUNTIME_UPGRADE=true`` (default off in
-        production) - VPS / staging installs use a deploy pipeline, not
-        in-app upgrades. Localhost dev / Windows-installer installs ship
-        with the flag on so the Settings panel works out of the box.
+        **Admin only.** Requires an authenticated user with the ``admin``
+        role (``RequireRole("admin")``); an unauthenticated or non-admin
+        caller is rejected before any pip process starts. This closes the
+        earlier gap where the route ran with no authentication at all, so a
+        quickstart install reachable on the network could be forced to
+        reinstall / downgrade by anyone.
+
+        Additionally gated by ``ALLOW_RUNTIME_UPGRADE`` (defaults on).
+        Managed deployments that upgrade through a deploy pipeline can set
+        ``ALLOW_RUNTIME_UPGRADE=false`` to disable the route entirely;
+        localhost dev and the desktop / Windows-installer builds leave it
+        on so the Settings panel works out of the box.
         """
         import os
-        import subprocess
         import sys
-        import sysconfig
-        from pathlib import Path
 
         if os.environ.get("ALLOW_RUNTIME_UPGRADE", "true").lower() not in (
             "true",
@@ -1898,6 +1983,12 @@ def create_app() -> FastAPI:
                 ),
             )
 
+        # A frozen build would feed the pip command below back into its own CLI
+        # instead of upgrading anything (issue #403), so point at the installer,
+        # which is the route that actually works there.
+        if is_frozen_build():
+            raise HTTPException(status_code=409, detail=FROZEN_REFUSAL)
+
         target = "openconstructionerp"
         if version and version.replace(".", "").replace("-", "").isalnum():
             target = f"openconstructionerp=={version}"
@@ -1906,79 +1997,53 @@ def create_app() -> FastAPI:
         if force:
             cmd.insert(-1, "--force-reinstall")
 
-        # On Windows the running launcher keeps an open handle on its own
-        # console-script .exe, so pip cannot overwrite it and the whole
-        # install aborts with WinError 32 ("file in use by another process").
-        # Windows *does* allow renaming a running .exe, so move the locked
-        # launchers aside first; pip then writes fresh ones in their place.
-        # The renamed stubs stay locked until this process exits and are
-        # swept on the next upgrade. If pip ends up not regenerating a
-        # launcher (e.g. the target was already satisfied), we restore it.
-        renamed: list[tuple[Path, Path]] = []
-        if sys.platform == "win32":
-            scripts_dir = Path(sysconfig.get_path("scripts"))
-            for stale in scripts_dir.glob("*.oce-old-*"):
-                try:
-                    stale.unlink()
-                except OSError:
-                    pass  # a leftover still locked by an older process - skip
-            for exe_name in (
-                "openconstructionerp.exe",
-                "openconstructionerp-server.exe",
-                "openestimate.exe",
-                "openestimate-server.exe",
-            ):
-                exe = scripts_dir / exe_name
-                if not exe.exists():
-                    continue
-                aside = exe.with_name(f"{exe.name}.oce-old-{os.getpid()}")
-                try:
-                    exe.rename(aside)
-                    renamed.append((exe, aside))
-                except OSError:
-                    pass  # best effort - let pip surface the real error
+        job, started = claim_upgrade(cmd, settings.app_version)
+        if not started:
+            # Already running. Hand back the one in flight rather than a second
+            # pip against the same site-packages, and say so in the status code
+            # so a client can tell "attached to yours" from "started mine".
+            return JSONResponse(status_code=status.HTTP_409_CONFLICT, content=job.as_dict())
 
-        proc = subprocess.run(  # noqa: S603 - args are sanitised above
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=600,
-        )
+        def _finished(_task: asyncio.Task[Any]) -> None:
+            # The installed version has moved, so the cached answer to "is an
+            # upgrade available" is about a version that is no longer running.
+            if hasattr(app.state, "_version_check_cache"):
+                del app.state._version_check_cache
 
-        # Never leave the user without a launcher: if pip did not recreate
-        # one we moved aside, put the original back.
-        for original, aside in renamed:
-            if not original.exists() and aside.exists():
-                try:
-                    aside.rename(original)
-                except OSError:
-                    pass
+        task = asyncio.create_task(asyncio.to_thread(run_upgrade, job))
+        # Held on app.state because the event loop keeps only a weak reference
+        # to a running task, and a collected one would abandon the upgrade.
+        app.state._upgrade_task = task
+        task.add_done_callback(_finished)
 
-        new_version = settings.app_version
-        try:
-            from importlib.metadata import version as _v
+        return JSONResponse(status_code=status.HTTP_202_ACCEPTED, content=job.as_dict())
 
-            new_version = _v("openconstructionerp")
-        except Exception:  # noqa: BLE001
-            pass
+    @app.get(
+        "/api/system/upgrade/status",
+        tags=["System"],
+        dependencies=[Depends(RequireRole("admin"))],
+    )
+    async def upgrade_status() -> dict[str, Any]:
+        """How the upgrade this process started is going, or how it went.
 
-        if hasattr(app.state, "_version_check_cache"):
-            del app.state._version_check_cache
+        Poll this after ``POST /api/system/upgrade``. ``status`` is ``running``,
+        ``succeeded`` or ``failed``, and the pip log is carried along the whole
+        way so a failure can be read rather than guessed at.
 
-        return {
-            "ok": proc.returncode == 0,
-            "exit_code": proc.returncode,
-            "command": " ".join(cmd),
-            "stdout": proc.stdout[-4000:],
-            "stderr": proc.stderr[-2000:],
-            "installed_version": new_version,
-            "running_version": settings.app_version,
-            "restart_required": new_version != settings.app_version,
-            "restart_hint": (
-                "Restart your launcher (start.bat / `openconstructionerp serve`) "
-                "or the host's systemd unit to load the new version."
-            ),
-        }
+        Answers ``status: "idle"`` when this process has not run one. That is
+        also the honest answer straight after a restart, including the restart
+        the upgrade itself asked for: the record lived in the memory of the
+        process that was replaced. By then ``running_version`` is the thing
+        worth reading anyway.
+        """
+        job = current_upgrade()
+        if job is None:
+            return {
+                "status": "idle",
+                "job_id": None,
+                "running_version": settings.app_version,
+            }
+        return job.as_dict()
 
     @app.get("/api/system/converters/version-check", tags=["System"])
     async def check_converter_versions() -> dict[str, Any]:
@@ -2592,6 +2657,18 @@ def create_app() -> FastAPI:
             # without DDL rights (or any other failure) just logs a warning and
             # leaves schema management to the operator's `alembic upgrade head`,
             # exactly as before.
+            # Collapse any duplicate from-source takeoff documents before the
+            # index heal below adds their unique index (issue #369). A leftover
+            # duplicate makes CREATE UNIQUE INDEX fail, so the merge must run
+            # first. Idempotent and cheap when clean; non-fatal like the heal.
+            try:
+                from app.modules.takeoff.dedup import collapse_duplicate_source_documents
+
+                async with engine.begin() as conn:
+                    await collapse_duplicate_source_documents(conn)
+            except Exception:
+                logger.warning("Takeoff duplicate-document heal skipped (non-fatal)", exc_info=True)
+
             from app.core.postgres_migrator import postgres_auto_migrate
 
             try:
@@ -2600,6 +2677,25 @@ def create_app() -> FastAPI:
                     logger.info("PostgreSQL auto-migration: %d schema objects (columns + indexes) added", migrated)
             except Exception:
                 logger.warning("PostgreSQL auto-migration skipped (non-fatal)", exc_info=True)
+
+            # The heal above adds oe_progress_entry.seq to a pre-v3258 table as
+            # ADD COLUMN ... DEFAULT nextval(...), and PostgreSQL numbers the
+            # existing rows while rewriting the table, so they come out in heap
+            # order - while the Alembic migration numbers them by recorded_at.
+            # "Latest wins" in the progress module leads with seq, so the same
+            # rows answered differently depending on which path built the
+            # schema. Put them back in observation order. Runs AFTER the heal
+            # (takeoff's merge above runs before it) because the column it
+            # repairs is one the heal itself creates - going first would leave
+            # a boot-long window of wrong readings. Idempotent: a single scan
+            # that finds nothing out of order and stops, on every later boot.
+            try:
+                from app.modules.progress.seq_repair import repair_progress_entry_seq
+
+                async with engine.begin() as conn:
+                    await repair_progress_entry_seq(conn)
+            except Exception:
+                logger.warning("Progress seq order repair skipped (non-fatal)", exc_info=True)
 
             async with engine.begin() as conn:
                 await conn.run_sync(Base.metadata.create_all)
@@ -2616,35 +2712,51 @@ def create_app() -> FastAPI:
             # only fires when ops run migrations before the app ever boots).
             # Only stamps when the version table is empty/absent so it never
             # clobbers an existing migration state. Non-fatal.
-            def _stamp_head_if_unstamped(sync_conn: object) -> str | None:
-                from pathlib import Path as _StampPath
-
-                from alembic.config import Config as _StampConfig
-                from alembic.runtime.migration import MigrationContext as _StampMigCtx
-                from alembic.script import ScriptDirectory as _StampScriptDir
-
-                mig_ctx = _StampMigCtx.configure(sync_conn)
-                if mig_ctx.get_current_revision() is not None:
-                    return None  # already stamped - leave existing state untouched
-                ini = _StampPath(__file__).resolve().parent.parent / "alembic.ini"
-                if not ini.is_file():
-                    return None
-                script = _StampScriptDir.from_config(_StampConfig(str(ini)))
-                mig_ctx.stamp(script, "heads")
-                return script.get_current_head()
+            #
+            # This is also where alembic's version table gets CREATED on the
+            # canonical install, so it is where its column width is settled -
+            # see app/core/alembic_version_table.py and issue #399.
+            from app.core.alembic_version_table import stamp_head_if_unstamped
 
             try:
                 async with engine.begin() as conn:
-                    stamped = await conn.run_sync(_stamp_head_if_unstamped)
+                    stamped = await conn.run_sync(stamp_head_if_unstamped)
                 if stamped:
                     logger.info("Alembic version stamped to head %s on fresh DB", stamped)
             except Exception:
                 logger.debug("Alembic head stamp skipped (non-fatal)", exc_info=True)
+
+            # Provision multi-tenant row-level security (opt-in). Runs after
+            # create_all so every tenant table exists on both fresh and upgraded
+            # databases; a no-op that never touches the database while
+            # settings.rls_enforce is off, so it is inert on a default install.
+            try:
+                from app.core.rls_setup import provision_rls, verify_rls_role
+
+                rls_stats = await provision_rls(engine, Base)
+                if rls_stats.get("tables"):
+                    logger.info("RLS enforcement active: %d tenant tables policied", rls_stats["tables"])
+                # With the flag on, every request downgrades to oe_app; if that
+                # role is absent (external PG without CREATEROLE) requests 500.
+                # Surface it once at boot instead of on every request. No-op off.
+                await verify_rls_role(engine)
+            except Exception:
+                logger.warning("RLS provisioning skipped (non-fatal)", exc_info=True)
         else:
             logger.info("Using external database (Alembic manages schema)")
 
         # Load all modules (triggers module on_startup hooks)
         _section("Modules")
+        # Modules installed at runtime live in the instance's data directory,
+        # not in the source tree, so the import system has to be told about
+        # that directory before anything discovers or imports a module. A
+        # failure here is not fatal: the platform runs on its shipped modules.
+        try:
+            from app.core.module_runtime_root import attach_runtime_root
+
+            attach_runtime_root()
+        except Exception:
+            logger.warning("Runtime module root not attached", exc_info=True)
         await module_loader.load_all(app)
 
         # Mount OpenCDE API at the spec-compliant prefix /api/v1/opencde
@@ -3151,6 +3263,19 @@ def create_app() -> FastAPI:
                 start_sla_checker()
         except Exception:  # noqa: BLE001 - never block startup on the monitor
             logger.exception("Approval SLA monitor failed to start")
+
+        # Cross-module deadline sweeper (item #18): background sweep that nudges
+        # the owner when a tracked deadline (correspondence response, NCR
+        # corrective action, punch item) slips overdue and escalates it past the
+        # grace window. Same lightweight asyncio loop as the SLA monitor above;
+        # fail-soft so a hiccup never blocks startup.
+        try:
+            if not _fast_startup:
+                from app.modules.deadlines.sweeper import start_deadline_sweeper
+
+                start_deadline_sweeper()
+        except Exception:  # noqa: BLE001 - never block startup on the sweeper
+            logger.exception("Deadline sweeper failed to start")
 
         # Risk auto-escalation (item #24): hourly sweep that escalates risks
         # crossing their severity threshold or with a lapsed review date. The

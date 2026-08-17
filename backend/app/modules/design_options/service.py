@@ -68,36 +68,39 @@ _DIN276_GROUPS: dict[str, str] = {
     "800": "Financing",
 }
 
-# MasterFormat divisions (common subset; unknown divisions fall back to a
-# "Division NN" label so nothing is dropped).
+# Division scope descriptions (common subset; unknown divisions fall back
+# to a "Division NN" label so nothing is dropped). Numbers are
+# interoperability facts; the wording is our own and matches
+# us_pack/config.py - the proprietary division titles must never be
+# bundled (licensing denylist).
 _MASTERFORMAT_DIVISIONS: dict[str, str] = {
-    "00": "Procurement and contracting",
-    "01": "General requirements",
-    "02": "Existing conditions",
-    "03": "Concrete",
-    "04": "Masonry",
-    "05": "Metals",
-    "06": "Wood, plastics and composites",
-    "07": "Thermal and moisture protection",
-    "08": "Openings",
-    "09": "Finishes",
-    "10": "Specialties",
-    "11": "Equipment",
-    "12": "Furnishings",
-    "13": "Special construction",
-    "14": "Conveying equipment",
-    "21": "Fire suppression",
-    "22": "Plumbing",
-    "23": "Heating, ventilating and air conditioning",
-    "25": "Integrated automation",
-    "26": "Electrical",
-    "27": "Communications",
-    "28": "Electronic safety and security",
-    "31": "Earthwork",
-    "32": "Exterior improvements",
-    "33": "Utilities",
-    "34": "Transportation",
-    "35": "Waterway and marine construction",
+    "00": "Bidding and contract-formation documents",
+    "01": "General project requirements and temporary provisions",
+    "02": "Demolition, site assessment and existing structures",
+    "03": "Cast-in-place and precast concrete work",
+    "04": "Brick, block and stone work",
+    "05": "Structural and miscellaneous metal work",
+    "06": "Carpentry, millwork and composite framing",
+    "07": "Roofing, waterproofing and insulation",
+    "08": "Doors, windows and glazed assemblies",
+    "09": "Interior finishing: drywall, flooring, painting",
+    "10": "Built-in specialty items and signage",
+    "11": "Fixed building equipment",
+    "12": "Furniture, casework and window treatments",
+    "13": "Pre-engineered and special-purpose structures",
+    "14": "Elevators, escalators and lifts",
+    "21": "Sprinkler and fire-suppression systems",
+    "22": "Piping systems and sanitary fixtures",
+    "23": "Heating, cooling and ventilation systems",
+    "25": "Building automation and controls integration",
+    "26": "Power distribution and lighting systems",
+    "27": "Voice, data and network cabling",
+    "28": "Fire alarm, access control and surveillance",
+    "31": "Excavation, grading and earth support",
+    "32": "Paving, landscaping and site amenities",
+    "33": "Site water, sewer, storm and power services",
+    "34": "Rail, transit and transportation infrastructure",
+    "35": "Marine, dredging and waterfront work",
 }
 
 
@@ -242,9 +245,46 @@ class DesignOptionsService:
         return option
 
     async def delete_option(self, option: DesignOption) -> None:
-        """Hard-delete a single option."""
-        await self.repo.delete_option(option.id)
-        logger.info("Design option deleted: %s", option.id)
+        """Hard-delete a single option, clearing it as the set's baseline.
+
+        ``baseline_option_id`` is a soft pointer with no foreign key, so nothing
+        in the database clears it when the option it names goes away. Left
+        dangling it is worse than absent: the comparison finds no baseline
+        column and reports every delta as zero, while the fairness banner
+        withholds its "no baseline chosen" notice because the id is not null.
+        """
+        set_id = option.set_id
+        option_id = option.id
+        await self.repo.delete_option(option_id)
+        option_set = await self.repo.get_set(set_id)
+        if option_set is not None and option_set.baseline_option_id == option_id:
+            await self.repo.update_set_fields(set_id, baseline_option_id=None)
+            await self.session.flush()
+            logger.info("Design-option baseline cleared: set=%s (baseline option deleted)", set_id)
+        logger.info("Design option deleted: %s", option_id)
+
+    @staticmethod
+    def _match_session_reset(option: DesignOption, new_model_id: uuid.UUID | None) -> dict[str, object]:
+        """Fields that drop a match session scoped to a model being replaced.
+
+        ``match_session_id`` names a match run created from one specific model,
+        and ``generate`` reuses it whenever it is set. Carrying it across a
+        re-source would match, confirm and price the superseded design under
+        the new model's name - the same failure as a stale ``bim_model_id``,
+        one field over and invisible in the option's own row. Re-attaching the
+        model already in place is not a change, so the session survives that.
+
+        Args:
+            option: The option as it stands before the attach is applied.
+            new_model_id: The model it is about to point at, ``None`` when the
+                option is going back to awaiting conversion.
+
+        Returns:
+            The fields to merge into the update, empty when nothing changed.
+        """
+        if option.match_session_id is None or option.bim_model_id == new_model_id:
+            return {}
+        return {"match_session_id": None}
 
     async def attach_model(self, option: DesignOption, data: AttachModelRequest) -> DesignOption:
         """Pair an option with a converted BIM model or an existing document.
@@ -281,6 +321,7 @@ class DesignOptionsService:
                 status="model_attached",
                 error="",
                 metadata_=meta,
+                **self._match_session_reset(option, model.id),
             )
             logger.info("Design option %s linked to BIM model %s", option.id, model.id)
         else:
@@ -298,6 +339,7 @@ class DesignOptionsService:
             doc_meta = doc.metadata_ if isinstance(doc.metadata_, dict) else {}
             linked_model_id = doc_meta.get("source_id") if doc_meta.get("source_module") == "bim_hub" else None
             fields: dict[str, object] = {"source_document_id": doc.id, "error": ""}
+            new_model_id: uuid.UUID | None = None
             adopted = False
             if linked_model_id:
                 from app.modules.bim_hub.models import BIMModel
@@ -307,13 +349,20 @@ class DesignOptionsService:
                 except (ValueError, TypeError):
                     model = None
                 if model is not None and model.project_id == option.project_id:
+                    new_model_id = model.id
                     fields["bim_model_id"] = model.id
                     fields["status"] = "model_attached"
                     adopted = True
             if not adopted:
                 # Document recorded, no model yet: it must be converted by the
-                # BIM hub before the option can be priced.
+                # BIM hub before the option can be priced. Drop any model a
+                # previous attach left behind - mirroring how the model branch
+                # clears ``source_document_id`` - because ``generate`` only
+                # checks that ``bim_model_id`` is set and would otherwise price
+                # the superseded design while the option reads as converting.
+                fields["bim_model_id"] = None
                 fields["status"] = "converting"
+            fields.update(self._match_session_reset(option, new_model_id))
             await self.repo.update_option_fields(option.id, **fields)
             logger.info(
                 "Design option %s linked to document %s (model adopted=%s)",

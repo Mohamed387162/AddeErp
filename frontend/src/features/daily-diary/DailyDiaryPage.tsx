@@ -24,6 +24,7 @@ import {
   Trash2,
   Globe2,
   FileDown,
+  Send,
   Upload,
   Users,
   Package,
@@ -59,8 +60,9 @@ import { RequiresProject } from '@/shared/auth/RequiresProject';
 import { DateDisplay } from '@/shared/ui/DateDisplay';
 import { PageHeader } from '@/shared/ui/PageHeader';
 import { useToastStore } from '@/stores/useToastStore';
-import { useProjectContextStore } from '@/stores/useProjectContextStore';
-import { apiGet, getErrorMessage } from '@/shared/lib/api';
+import { useActiveProjectId } from '@/shared/hooks/useActiveProjectId';
+import { apiGet, getErrorMessage, type Page } from '@/shared/lib/api';
+import { TruncationNotice } from '@/shared/ui/TruncationNotice';
 import { todayLocalISO, isoDateFromLocal, nowLocalISO } from '@/shared/lib/dates';
 import { projectsApi } from '@/features/projects/api';
 import {
@@ -120,6 +122,9 @@ import {
   type PhotoItem as SitePhoto,
   type DocumentItem,
 } from '@/features/documents/api';
+import { PublishRecordModal } from '@/features/record-publishing/PublishRecordModal';
+import { InsightsPanel, InsightsToggleButton, useModuleInsights } from '@/features/insights';
+import { buildDailyDiaryInsights } from './dailyDiaryInsights';
 
 type Tab = 'diaries' | 'today' | 'archive';
 
@@ -234,7 +239,7 @@ export function DailyDiaryPage() {
   const { t, i18n } = useTranslation();
   const navigate = useNavigate();
   const [tab, setTab] = useState<Tab>('diaries');
-  const activeProjectId = useProjectContextStore((s) => s.activeProjectId);
+  const activeProjectId = useActiveProjectId();
   const [projectId, setProjectId] = useState<string>('');
   const today = new Date();
   const [year, setYear] = useState(today.getFullYear());
@@ -315,7 +320,7 @@ export function DailyDiaryPage() {
 
   const activeDiary: DailyDiary | undefined = activeDiaryId
     ? selectedDiaryQ.data
-    : todayDiariesQ.data?.[0];
+    : todayDiariesQ.data?.items[0];
   const activeLoading = activeDiaryId
     ? selectedDiaryQ.isLoading
     : todayDiariesQ.isLoading;
@@ -333,6 +338,18 @@ export function DailyDiaryPage() {
       }),
     enabled: !!projectId && tab === 'archive',
   });
+
+  // Module Insights - the toggleable visualization panel for this module. Its
+  // charts are built client-side from the diaries the calendar already loaded;
+  // when the project has none the panel draws nothing rather than inventing
+  // rows to fill it. Open state and any user-built charts persist per module
+  // via useModuleInsights. Declared among the top-level hooks (this component
+  // has no early return) so the hook order stays stable.
+  const insights = useModuleInsights('daily-diary', { defaultOpen: true });
+  const { datasets: insightDatasets, builtins: insightBuiltins } = useMemo(
+    () => buildDailyDiaryInsights(diariesQ.data?.items ?? [], '', t),
+    [diariesQ.data, t],
+  );
 
   return (
     <div className="space-y-5">
@@ -361,6 +378,9 @@ export function DailyDiaryPage() {
         })}
         actions={
           <>
+            {/* Insights toggle - shows or hides this module's visualization
+                panel. Leads the cluster so charts are one obvious click away. */}
+            <InsightsToggleButton open={insights.open} onClick={insights.toggle} />
             <ModuleGuideButton content={dailyDiaryGuide} />
             <Button
               variant="secondary"
@@ -397,6 +417,20 @@ export function DailyDiaryPage() {
             </Button>
           </>
         }
+      />
+
+      {/* Module Insights panel - toggled by the header button. Placed high so
+          its charts are visible the moment the diary register opens. */}
+      <InsightsPanel
+        open={insights.open}
+        title={t('daily_diary.insights.title', { defaultValue: 'Site diary insights' })}
+        datasets={insightDatasets}
+        builtins={insightBuiltins}
+        custom={insights.custom}
+        onAdd={insights.addCustom}
+        onUpdate={insights.updateCustom}
+        onRemove={insights.removeCustom}
+        onCollapse={() => insights.setOpen(false)}
       />
 
       <DismissibleInfo
@@ -508,7 +542,7 @@ export function DailyDiaryPage() {
           </Card>
         ) : (
           <DiariesCalendar
-            diaries={diariesQ.data ?? []}
+            diaries={diariesQ.data?.items ?? []}
             loading={diariesQ.isLoading}
             year={year}
             month={month}
@@ -571,10 +605,13 @@ export function DailyDiaryPage() {
           />
         </Card>
       ) : (
-        <ArchiveTab
-          diaries={archiveQ.data ?? []}
-          loading={archiveQ.isLoading}
-        />
+        <>
+          <ArchiveTab
+            diaries={archiveQ.data?.items ?? []}
+            loading={archiveQ.isLoading}
+          />
+          {archiveQ.data && <TruncationNotice page={archiveQ.data} className="mt-3" />}
+        </>
       )}
 
       {createOpen && projectId && (
@@ -931,6 +968,7 @@ function TodayTab({
   const [realityOpen, setRealityOpen] = useState(false);
   const [sclOpen, setSclOpen] = useState(false);
   const [editOpen, setEditOpen] = useState(false);
+  const [publishOpen, setPublishOpen] = useState(false);
 
   // All asset panels are scoped to the diary's OWN date - not todayIso().
   // A diary opened from the calendar can be any past day; previously the
@@ -1227,6 +1265,24 @@ function TodayTab({
             {t('daily_diary.export_pdf', { defaultValue: 'Export PDF' })}
           </Button>
           <Button
+            variant="secondary"
+            size="sm"
+            icon={<Send size={14} />}
+            onClick={() => setPublishOpen(true)}
+            data-testid="daily-diary-publish"
+            aria-label={t('record_publishing.publish_action', {
+              defaultValue: 'Publish and distribute',
+            })}
+            title={t('daily_diary.publish_hint', {
+              defaultValue:
+                'Publish this diary as a signed PDF and send it to named recipients who acknowledge receipt, in one step.',
+            })}
+          >
+            {t('record_publishing.publish_action', {
+              defaultValue: 'Publish and distribute',
+            })}
+          </Button>
+          <Button
             variant="ghost"
             size="sm"
             icon={<Package size={14} />}
@@ -1437,11 +1493,12 @@ function TodayTab({
       <EntriesTimeline projectId={projectId} diaryId={diary.id} sealed={sealed} />
 
       <PhotoGrid
-        photos={photosQ.data ?? []}
+        photos={photosQ.data?.items ?? []}
         loading={photosQ.isLoading}
         sealed={sealed}
         onUpload={() => setPhotoOpen(true)}
       />
+      {photosQ.data && <TruncationNotice page={photosQ.data} className="-mt-2" />}
 
       <div className="grid grid-cols-1 gap-4 xl:grid-cols-2">
         <DroneSection
@@ -1496,6 +1553,21 @@ function TodayTab({
       )}
       {editOpen && (
         <EditDiaryModal diary={diary} onClose={() => setEditOpen(false)} />
+      )}
+      {publishOpen && diaryId && (
+        <PublishRecordModal
+          sourceKind="daily_diary"
+          sourceId={diaryId}
+          projectId={projectId}
+          subjectHint={`${t('daily_diary.title', { defaultValue: 'Daily Site Diary' })} ${diary.diary_date}`}
+          onClose={() => setPublishOpen(false)}
+          onPublished={() => {
+            // Publishing stamps the diary's pdf_export_ref with the new
+            // transmittal id, turning the previously dead export soft-link
+            // live, so refresh the diary views.
+            qc.invalidateQueries({ queryKey: ['daily-diary'] });
+          }}
+        />
       )}
     </div>
   );
@@ -1826,10 +1898,10 @@ function EntriesTimeline({
   const inspectionsQ = useQuery({
     queryKey: ['daily-diary', 'src-inspections', projectId],
     queryFn: async () => {
-      const rows = await apiGet<Record<string, unknown>[]>(
+      const page = await apiGet<Page<Record<string, unknown>>>(
         `/v1/inspections/?project_id=${encodeURIComponent(projectId)}`,
       );
-      return rows.map((r) => ({
+      return page.items.map((r) => ({
         id: String(r.id),
         label: [r.inspection_number, r.title]
           .filter(Boolean)
@@ -1904,7 +1976,7 @@ function EntriesTimeline({
     onError: (err) => addToast({ type: 'error', title: getErrorMessage(err) }),
   });
 
-  const entries = entriesQ.data ?? [];
+  const entries = entriesQ.data?.items ?? [];
 
   return (
     <Card padding="md">
@@ -2101,6 +2173,7 @@ function EntriesTimeline({
           ))}
         </ul>
       )}
+      {entriesQ.data && <TruncationNotice page={entriesQ.data} className="mt-2" />}
     </Card>
   );
 }

@@ -32,27 +32,65 @@ import {
   Plus, Wrench, Palette, Loader2, Download, RotateCcw,
 } from 'lucide-react';
 import { APP_VERSION } from '@/shared/lib/version';
-import { apiPost, ApiError } from '@/shared/lib/api';
+import { apiGet, apiPost, ApiError } from '@/shared/lib/api';
 import { copyToClipboard } from '@/shared/lib/browser';
+import { isTauri } from '@/shared/lib/desktop';
 
-/* ── One-click upgrade — runs `pip install --upgrade` server-side ──── */
+/* ── One-click upgrade — starts `pip install --upgrade` server-side ───
+ *
+ *  The server starts a job and answers straight away; we poll it. It used to
+ *  do the whole install inside the request, which no browser waits for: on a
+ *  slow link the client gave up at 45s and told the user the upgrade had
+ *  failed, over an upgrade that was still running and went on to succeed
+ *  (issue #430).
+ */
 
-interface UpgradeResult {
-  ok: boolean;
-  exit_code: number;
-  command: string;
-  stdout: string;
-  stderr: string;
-  installed_version: string;
-  running_version: string;
-  restart_required: boolean;
-  restart_hint: string;
+interface UpgradeJob {
+  job_id: string | null;
+  /** ``idle`` means this server process has not run one, which is also what
+   *  it says after the restart a finished upgrade asks for. */
+  status: 'idle' | 'running' | 'succeeded' | 'failed';
+  ok?: boolean;
+  command?: string;
+  exit_code?: number | null;
+  stdout?: string;
+  stderr?: string;
+  error?: string;
+  installed_version?: string;
+  running_version?: string;
+  restart_required?: boolean;
+  restart_hint?: string;
 }
 
-async function runRuntimeUpgrade(version?: string): Promise<UpgradeResult> {
+const UPGRADE_POLL_MS = 2_000;
+/** Stop polling eventually. The server stops pip itself at 600s, so this only
+ *  has to outlast that. Reaching it leaves the dialog saying "running", which
+ *  is the truthful thing to say about an upgrade that is still running. */
+const UPGRADE_POLL_CEILING_MS = 15 * 60 * 1000;
+/** Consecutive failed polls tolerated. An install replaces files under a
+ *  process a watchdog may restart, so one quiet moment is not a failure. */
+const UPGRADE_POLL_RETRIES = 5;
+
+async function startRuntimeUpgrade(version?: string): Promise<UpgradeJob> {
   const qs = version ? `?version=${encodeURIComponent(version)}` : '';
-  return apiPost<UpgradeResult>(`/system/upgrade${qs}`, {});
+  try {
+    return await apiPost<UpgradeJob>(`/system/upgrade${qs}`, {});
+  } catch (err) {
+    // 409 carries the job already running. Pressing the button twice, or
+    // pressing it again after the browser gave up waiting, is the ordinary
+    // way that happens, so attach to it instead of reporting an error.
+    if (err instanceof ApiError && err.status === 409 && err.body && typeof err.body === 'object') {
+      return err.body as UpgradeJob;
+    }
+    throw err;
+  }
 }
+
+async function readUpgradeStatus(): Promise<UpgradeJob> {
+  return apiGet<UpgradeJob>('/system/upgrade/status');
+}
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 const CURRENT_VERSION = APP_VERSION;
 const CHECK_INTERVAL_MS = 60 * 60 * 1000;       // 1 hour between polls
@@ -66,6 +104,17 @@ const DISMISS_KEY = 'oe_update_dismissed_version_session';
 const GITHUB_RELEASES_API =
   'https://api.github.com/repos/datadrivenconstruction/OpenConstructionERP/releases/latest';
 
+/**
+ * Skip the release check entirely.
+ *
+ * An install with no outbound internet - an on-premise deployment behind a
+ * proxy, an air-gapped site, a machine being recorded - cannot reach
+ * api.github.com, and there is no answer we would show it anyway. Without
+ * this it asks once an hour, per tab, forever, and the browser logs the
+ * failed request every time.
+ */
+const UPDATE_CHECK_DISABLED = Boolean(import.meta.env.VITE_DISABLE_UPDATE_CHECK);
+
 interface ReleaseInfo {
   version: string;
   notes: string;
@@ -75,7 +124,15 @@ interface ReleaseInfo {
 
 interface CachedRelease {
   fetched_at: number;
-  data: ReleaseInfo;
+  /**
+   * ``null`` records a check that ran and produced nothing to show: GitHub
+   * answered 403 because the anonymous rate limit is per IP and an office
+   * shares one, or the network refused the call. Without this the failure was
+   * not cached at all, so every mount in every tab asked again and the console
+   * collected one failed request after another. A negative entry expires on
+   * the same TTL as a positive one.
+   */
+  data: ReleaseInfo | null;
 }
 
 interface GroupedHighlights {
@@ -193,7 +250,9 @@ function readCache(): CachedRelease | null {
     const raw = localStorage.getItem(CACHE_KEY);
     if (!raw) return null;
     const cached = JSON.parse(raw) as CachedRelease;
-    if (!cached?.fetched_at || !cached?.data) return null;
+    // `data` may be null on purpose — that is the negative entry. Only its
+    // absence means the payload is from some other writer and unusable.
+    if (!cached?.fetched_at || cached.data === undefined) return null;
     if (Date.now() - cached.fetched_at > CACHE_TTL_MS) return null;
     return cached;
   } catch {
@@ -201,7 +260,7 @@ function readCache(): CachedRelease | null {
   }
 }
 
-function writeCache(data: ReleaseInfo): void {
+function writeCache(data: ReleaseInfo | null): void {
   try {
     const payload: CachedRelease = { fetched_at: Date.now(), data };
     localStorage.setItem(CACHE_KEY, JSON.stringify(payload));
@@ -224,17 +283,30 @@ export function useUpdateCheck(): ReleaseInfo | null {
   useEffect(() => {
     let cancelled = false;
     const run = async () => {
+      if (UPDATE_CHECK_DISABLED) return;
+      // A fresh cache entry answers the question whether or not it names a
+      // newer release. Returning only on the newer case sent every up to date
+      // install - which is most of them, most of the time - straight back to
+      // GitHub on every mount, so the cache guarded nothing.
       const cached = readCache();
-      if (cached && isNewer(cached.data.version, CURRENT_VERSION)) {
-        if (!cancelled) setRelease(cached.data);
+      if (cached) {
+        if (!cancelled && cached.data && isNewer(cached.data.version, CURRENT_VERSION)) {
+          setRelease(cached.data);
+        }
         return;
       }
       try {
         const resp = await fetch(GITHUB_RELEASES_API);
-        if (!resp.ok) return;
+        if (!resp.ok) {
+          writeCache(null);
+          return;
+        }
         const data = await resp.json();
         const latest = (data.tag_name ?? '').replace(/^v/, '');
-        if (!latest) return;
+        if (!latest) {
+          writeCache(null);
+          return;
+        }
         const info: ReleaseInfo = {
           version: latest,
           notes: data.body ?? '',
@@ -246,7 +318,9 @@ export function useUpdateCheck(): ReleaseInfo | null {
         writeCache(info);
         if (!cancelled && isNewer(latest, CURRENT_VERSION)) setRelease(info);
       } catch {
-        /* network error — silent */
+        /* Network error. Cached as a failure so the next mount does not
+           repeat it inside the TTL. */
+        writeCache(null);
       }
     };
     run();
@@ -273,11 +347,17 @@ export function UpdateNotification({ forceShow = false, hideDismiss = false }: U
   const [showFullModal, setShowFullModal] = useState(false);
 
   const checkForUpdate = useCallback(async () => {
+    if (UPDATE_CHECK_DISABLED) return;
+
     // 1. Try cache first — avoids hitting GitHub API when multiple tabs are open.
     const cached = readCache();
     if (cached) {
       const dismissedVersion = sessionStorage.getItem(DISMISS_KEY);
-      if (dismissedVersion !== cached.data.version && isNewer(cached.data.version, CURRENT_VERSION)) {
+      if (
+        cached.data &&
+        dismissedVersion !== cached.data.version &&
+        isNewer(cached.data.version, CURRENT_VERSION)
+      ) {
         setRelease(cached.data);
       }
       return;
@@ -286,10 +366,16 @@ export function UpdateNotification({ forceShow = false, hideDismiss = false }: U
     // 2. Cache miss → fetch from GitHub.
     try {
       const resp = await fetch(GITHUB_RELEASES_API);
-      if (!resp.ok) return;
+      if (!resp.ok) {
+        writeCache(null);
+        return;
+      }
       const data = await resp.json();
       const latest = (data.tag_name ?? '').replace(/^v/, '');
-      if (!latest) return;
+      if (!latest) {
+        writeCache(null);
+        return;
+      }
 
       const info: ReleaseInfo = {
         version: latest,
@@ -308,7 +394,9 @@ export function UpdateNotification({ forceShow = false, hideDismiss = false }: U
 
       setRelease(info);
     } catch {
-      /* Network error — silent. The next polling tick will retry. */
+      /* Network error. Recorded as a failure so the next mount does not
+         repeat it inside the TTL; the polling tick still retries after it. */
+      writeCache(null);
     }
   }, []);
 
@@ -505,18 +593,40 @@ function UpdateFullModal({
    *  copy-paste path while localhost / Windows installer users get the
    *  one-click button working out of the box. */
   const [upgradeStatus, setUpgradeStatus] = useState<'idle' | 'running' | 'done' | 'error'>('idle');
-  const [upgradeResult, setUpgradeResult] = useState<UpgradeResult | null>(null);
+  const [upgradeResult, setUpgradeResult] = useState<UpgradeJob | null>(null);
   const [upgradeError, setUpgradeError] = useState<string | null>(null);
 
   const handleApplyUpgrade = useCallback(async () => {
     setUpgradeStatus('running');
     setUpgradeError(null);
     try {
-      const res = await runRuntimeUpgrade(release.version);
-      setUpgradeResult(res);
-      setUpgradeStatus(res.ok ? 'done' : 'error');
-      if (!res.ok) {
-        setUpgradeError(res.stderr || res.stdout || `pip exited ${res.exit_code}`);
+      let job = await startRuntimeUpgrade(release.version);
+      setUpgradeResult(job);
+
+      const ceiling = Date.now() + UPGRADE_POLL_CEILING_MS;
+      let failures = 0;
+      while (job.status === 'running' && Date.now() < ceiling) {
+        await sleep(UPGRADE_POLL_MS);
+        try {
+          job = await readUpgradeStatus();
+          setUpgradeResult(job);
+          failures = 0;
+        } catch (pollErr) {
+          if (++failures >= UPGRADE_POLL_RETRIES) throw pollErr;
+        }
+      }
+
+      if (job.status === 'failed') {
+        setUpgradeStatus('error');
+        setUpgradeError(job.error || job.stderr || job.stdout || `pip exited ${job.exit_code}`);
+      } else if (job.status === 'running') {
+        // Still going when we stopped watching. Leaving the dialog on
+        // "running" says exactly that, and reopening it attaches again.
+        setUpgradeStatus('running');
+      } else {
+        // succeeded, or idle because the server restarted under us, which is
+        // the thing a finished upgrade asks the user to do.
+        setUpgradeStatus('done');
       }
     } catch (err) {
       if (err instanceof ApiError) {
@@ -691,7 +801,12 @@ function UpdateFullModal({
 
           {/* One-click upgrade — server-side ``pip install --upgrade`` in the
               same venv as the running uvicorn. The 403 fallback below shows
-              when ALLOW_RUNTIME_UPGRADE is off (managed installs). */}
+              when ALLOW_RUNTIME_UPGRADE is off (managed installs).
+
+              Deliberately still shown in the desktop build even though the
+              route refuses there (frozen sidecar, no pip - issue #403): the
+              409 carries the instruction the user needs, and hiding the
+              button would hide the instruction with it. */}
           <section>
             <h3 className="text-xs font-semibold uppercase tracking-wider text-content-tertiary mb-3">
               {t('update.apply_now', { defaultValue: 'Apply update' })}
@@ -778,7 +893,9 @@ function UpdateFullModal({
             </div>
           </section>
 
-          {/* Install commands */}
+          {/* Install commands — hidden in the desktop build, where there is no
+              venv and no pip to run them in (issue #403). */}
+          {!isTauri && (
           <section>
             <h3 className="text-xs font-semibold uppercase tracking-wider text-content-tertiary mb-3">
               {t('update.how_to_update', { defaultValue: 'How to update' })}
@@ -819,6 +936,7 @@ function UpdateFullModal({
               ))}
             </div>
           </section>
+          )}
         </div>
 
         {/* Footer — release link + primary dismiss */}

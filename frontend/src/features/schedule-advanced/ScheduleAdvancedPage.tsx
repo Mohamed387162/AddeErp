@@ -47,13 +47,14 @@ import {
   ConfirmDialog,
   InfoHint,
   ModuleGuideButton,
+  CollapsibleSection,
 } from '@/shared/ui';
 import { PageHeader } from '@/shared/ui/PageHeader';
 import { RequiresProject } from '@/shared/auth/RequiresProject';
 import { PlanningCrossLinks } from '@/features/schedule/PlanningCrossLinks';
 import { DateDisplay } from '@/shared/ui/DateDisplay';
 import { useToastStore } from '@/stores/useToastStore';
-import { useProjectContextStore } from '@/stores/useProjectContextStore';
+import { useActiveProjectId } from '@/shared/hooks/useActiveProjectId';
 import { getErrorMessage } from '@/shared/lib/api';
 import { projectsApi } from '@/features/projects/api';
 import {
@@ -120,6 +121,7 @@ import {
   baselineStatusLabel,
   taskStatusLabel,
 } from './labels';
+import { fmtPercent } from '@/shared/lib/formatters';
 
 const SCHEDULE_TAB_IDS = [
   'master',
@@ -435,12 +437,12 @@ function HowScheduleAdvancedWorks() {
   ];
 
   return (
-    <Card padding="md">
-      <h2 className="flex items-center gap-1.5 text-sm font-semibold text-content-primary">
-        <Network size={15} className="text-oe-blue" />
-        {t('schedule_advanced.flow_title', { defaultValue: 'How Last Planner fits together' })}
-      </h2>
-      <p className="mt-1 text-xs text-content-tertiary">
+    <CollapsibleSection
+      storageKey="schedule_advanced.how"
+      icon={<Network size={15} className="text-oe-blue" />}
+      title={t('schedule_advanced.flow_title', { defaultValue: 'How Last Planner fits together' })}
+    >
+      <p className="text-xs text-content-tertiary">
         {t('schedule_advanced.flow_intro', {
           defaultValue:
             'Last Planner makes the master schedule reliable at the work face: plan in phases, clear what blocks the work, and hold weekly commitments the trades can actually keep.',
@@ -500,7 +502,7 @@ function HowScheduleAdvancedWorks() {
           </ModLink>
         </span>
       </div>
-    </Card>
+    </CollapsibleSection>
   );
 }
 
@@ -515,7 +517,7 @@ export function ScheduleAdvancedPage() {
     onChange: setTab,
     orientation: 'horizontal',
   });
-  const activeProjectId = useProjectContextStore((s) => s.activeProjectId);
+  const activeProjectId = useActiveProjectId();
   const [projectId, setProjectId] = useState<string>('');
   const [masterId, setMasterId] = useState<string>('');
   const [lookAheadId, setLookAheadId] = useState<string>('');
@@ -1008,7 +1010,7 @@ function ProjectLpsDashboard({ projectId }: { projectId: string }) {
       <dl className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
         <DashStat
           label={t('schedule_advanced.ppc', { defaultValue: 'PPC' })}
-          value={data.ppc_trend.length > 0 ? `${latestPpcPct.toFixed(0)}%` : '—'}
+          value={data.ppc_trend.length > 0 ? fmtPercent(latestPpcPct, 0) : '—'}
           hint={t('schedule_advanced.dashboard_latest_week', { defaultValue: 'Latest week' })}
           tone={
             data.ppc_trend.length === 0
@@ -2912,7 +2914,7 @@ function WeeklyTab({
                       </Badge>
                     </td>
                     <td className="px-4 py-2 text-right font-mono text-xs">
-                      {pctNumber(w.ppc_percent).toFixed(0)}%
+                      {fmtPercent(pctNumber(w.ppc_percent), 0)}
                     </td>
                     <td className="px-4 py-2 text-right">
                       {w.status === 'draft' && (
@@ -3085,7 +3087,7 @@ function WeeklyTab({
         </h3>
         <div className="flex flex-col items-center justify-center py-6">
           <div className="text-5xl font-bold text-oe-blue">
-            {ppc.toFixed(0)}%
+            {fmtPercent(ppc, 0)}
           </div>
           <div className="mt-3 h-2 w-full max-w-[200px] rounded-full bg-surface-secondary overflow-hidden">
             <div

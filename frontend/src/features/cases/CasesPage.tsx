@@ -19,6 +19,7 @@
 // this job".
 
 import {
+  useCallback,
   useEffect,
   useMemo,
   useRef,
@@ -42,17 +43,33 @@ import {
   FolderKanban,
   UserRound,
   Flag,
-  Info,
+  Loader2,
+  FilePlus2,
+  PenLine,
+  Shuffle,
+  Pencil,
+  X,
+  SlidersHorizontal,
+  ChevronDown,
   type LucideProps,
 } from "lucide-react";
-import { Badge, EmptyState } from "@/shared/ui";
+import { Badge, Button, CountryFlag, EmptyState } from "@/shared/ui";
 import { useNearViewport } from "@/shared/hooks/useNearViewport";
+import { useActiveProjectId } from "@/shared/hooks/useActiveProjectId";
+import { useProjectContextStore } from "@/stores/useProjectContextStore";
 import { projectsApi } from "@/features/projects/api";
 import { PLAYBOOKS, getPlaybook } from "./playbooks";
+import { caseIdFromPlaybookId } from "./api";
+import { useAuthoredCases } from "./useCustomCases";
 import { PlaybookRunner } from "./PlaybookRunner";
 import { useCasesStore } from "./useCasesStore";
 import { completedCount } from "./progress";
-import { CATEGORY_META, tintFor, NEUTRAL_TINT } from "./categories";
+import {
+  CATEGORY_META,
+  CATEGORY_BY_ID,
+  tintFor,
+  NEUTRAL_TINT,
+} from "./categories";
 import {
   COMPANY_TYPE_META,
   COMPANY_TYPE_BY_ID,
@@ -62,7 +79,12 @@ import { ROLE_META, ROLE_BY_ID, rolesForPlaybook, tintForRole } from "./roles";
 import { RoleAvatar } from "./RoleAvatar";
 import { RoleArt } from "./RoleArt";
 import { CaseArt } from "./CaseArt";
+
+/** The honeycomb cell the marketing site cuts its portraits to. Kept identical
+ *  so a case card and the page it came from show the same shape. */
+const HEX_CELL = "polygon(50% 2%, 100% 26%, 100% 74%, 50% 98%, 0% 74%, 0% 26%)";
 import { CompanyArt } from "./CompanyArt";
+import { dealCaseFaces } from "./caseFaces";
 import {
   STAGE_META,
   STAGE_BY_ID,
@@ -82,21 +104,53 @@ const CARD_BATCH_SIZE = 12;
 import { iconFor } from "./icons";
 import type {
   Playbook,
-  CaseCategory,
   CompanyType,
   ProfessionalRole,
   LifecycleStage,
 } from "./types";
 
+import { regionDisplayName } from "./regions";
+
 export function CasesPage() {
   const { playbookId } = useParams<{ playbookId?: string }>();
   const { t } = useTranslation();
   const navigate = useNavigate();
+  // Authored cases are rows on the server, so the runner can only resolve one
+  // once they have arrived. Fetched here, above the detail branch, because a
+  // hook cannot sit below a return.
+  const { playbooks: authoredPlaybooks, isLoading: authoredLoading } =
+    useAuthoredCases();
 
   // Detail mode: a specific case is open in the runner.
   if (playbookId) {
-    const playbook = getPlaybook(playbookId);
+    // `getPlaybook` only knows the shipped files, and an authored id
+    // (`custom-<uuid>`) is not one of them, so the authored list answers first
+    // and the bundle answers for everything else.
+    const playbook =
+      authoredPlaybooks.find((pb) => pb.id === playbookId) ??
+      getPlaybook(playbookId);
     if (!playbook) {
+      // An id is only genuinely unknown once the authored list has loaded, so
+      // "not found" never flashes over a case that is still on its way. Only an
+      // authored-looking id waits: a file slug the bundle does not carry is
+      // already answered, and making it wait for a fetch would be a regression.
+      if (authoredLoading && caseIdFromPlaybookId(playbookId) !== null) {
+        return (
+          <div
+            className="flex items-center justify-center py-16 animate-fade-in"
+            role="status"
+          >
+            <Loader2
+              size={22}
+              className="animate-spin text-content-tertiary"
+              aria-hidden="true"
+            />
+            <span className="sr-only">
+              {t("cases.loading_case", { defaultValue: "Loading case..." })}
+            </span>
+          </div>
+        );
+      }
       return (
         <div className="py-8 animate-fade-in">
           <EmptyState
@@ -124,22 +178,43 @@ export function CasesPage() {
 }
 
 function CasesList() {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
   const navigate = useNavigate();
   const runs = useCasesStore((s) => s.runs);
-  const companyType = useCasesStore((s) => s.companyType);
-  const setCompanyType = useCasesStore((s) => s.setCompanyType);
-  const role = useCasesStore((s) => s.role);
-  const setRole = useCasesStore((s) => s.setRole);
-  const pinProjectId = useCasesStore((s) => s.pinProjectId);
-  const setPinProjectId = useCasesStore((s) => s.setPinProjectId);
+  // Each of the three "who/what" filters holds a list, not one id: a user can
+  // be a contractor and a consultant, or run both estimating and planning
+  // cases, and the hub has to show all of it. OR inside a filter, AND between
+  // filters - the ordinary faceted-search rule, so adding a role never widens
+  // the result.
+  const companyTypes = useCasesStore((s) => s.companyTypes);
+  const toggleCompanyType = useCasesStore((s) => s.toggleCompanyType);
+  const roles = useCasesStore((s) => s.roles);
+  const toggleRole = useCasesStore((s) => s.toggleRole);
+  const activeCategories = useCasesStore((s) => s.categories);
+  const toggleCategory = useCasesStore((s) => s.toggleCategory);
+  const setCompanyTypes = useCasesStore((s) => s.setCompanyTypes);
+  const setRoles = useCasesStore((s) => s.setRoles);
+  const setCategories = useCasesStore((s) => s.setCategories);
+  const clearFilters = useCasesStore((s) => s.clearFilters);
+  const finderOpen = useCasesStore((s) => s.finderOpen);
+  const setFinderOpen = useCasesStore((s) => s.setFinderOpen);
+  // The project this hub pins cases to is the app-wide active project - the
+  // one the top-bar switcher writes. The hub used to keep its own copy in
+  // `useCasesStore.pinProjectId` (localStorage `oe_cases_pin_project`), which
+  // nothing else ever wrote, so picking a project in the top bar left this
+  // picker reading "No project selected" (issue #413). Reading the shared
+  // context here removes the second source of truth rather than syncing it.
+  const pinProjectId = useActiveProjectId();
+  const setActiveProject = useProjectContextStore((s) => s.setActiveProject);
+  const clearActiveProject = useProjectContextStore((s) => s.clearProject);
   const pins = useCasesStore((s) => s.pins);
   const togglePin = useCasesStore((s) => s.togglePin);
   const [query, setQuery] = useState("");
-  const [activeCategory, setActiveCategory] = useState<CaseCategory | "all">(
-    "all",
-  );
   const [activeStage, setActiveStage] = useState<LifecycleStage | "all">("all");
+  // Market filter: narrows to the cases authored for one market's standards
+  // (Playbook.region). Local state like the stage - it describes this visit,
+  // not the user.
+  const [activeRegion, setActiveRegion] = useState<string | "all">("all");
   const [showOnlyPinned, setShowOnlyPinned] = useState(false);
 
   const { data: projects } = useQuery({
@@ -156,6 +231,27 @@ function CasesList() {
     () => (pinProjectId ? (pins[pinProjectId] ?? []) : []),
     [pinProjectId, pins],
   );
+
+  // Authored cases stand beside the shipped ones from here on. `allPlaybooks`
+  // is the catalogue every filter, count, number and card below reads, so a
+  // case somebody wrote is narrowed, counted and drawn exactly like one we
+  // ship - one list rather than a concatenation repeated at each use. When the
+  // fetch fails the shipped list is what is left, which is a shorter list, not
+  // a broken screen (see `useAuthoredCases`).
+  const { playbooks: authoredPlaybooks } = useAuthoredCases();
+  const allPlaybooks = useMemo(
+    () =>
+      authoredPlaybooks.length > 0
+        ? [...PLAYBOOKS, ...authoredPlaybooks]
+        : PLAYBOOKS,
+    [authoredPlaybooks],
+  );
+
+  // The person on each card, dealt over the WHOLE catalogue rather than over
+  // the narrowed or windowed list: a case wears its face because of where it
+  // sits among the cases for its company type, and clicking a filter must not
+  // re-cast the cards that survive it.
+  const facesByPlaybook = useMemo(() => dealCaseFaces(allPlaybooks), [allPlaybooks]);
 
   // Best progress for a card = the furthest a user got on this case across any
   // run (unscoped or scoped to a sample project).
@@ -175,9 +271,9 @@ function CasesList() {
   // role filter and the per-role counts are cheap.
   const rolesByPlaybook = useMemo(() => {
     const m = new Map<string, ProfessionalRole[]>();
-    for (const pb of PLAYBOOKS) m.set(pb.id, rolesForPlaybook(pb));
+    for (const pb of allPlaybooks) m.set(pb.id, rolesForPlaybook(pb));
     return m;
-  }, []);
+  }, [allPlaybooks]);
   const caseHasRole = useMemo(
     () => (pb: Playbook, r: ProfessionalRole) =>
       rolesByPlaybook.get(pb.id)?.includes(r) ?? false,
@@ -188,10 +284,13 @@ function CasesList() {
   // end) for every case, so the timeline and the numbered cards read in order.
   const stageByPlaybook = useMemo(() => {
     const m = new Map<string, LifecycleStage>();
-    for (const pb of PLAYBOOKS) m.set(pb.id, stageForPlaybook(pb));
+    for (const pb of allPlaybooks) m.set(pb.id, stageForPlaybook(pb));
     return m;
-  }, []);
-  const caseNumbers = useMemo(() => buildCaseNumbers(PLAYBOOKS), []);
+  }, [allPlaybooks]);
+  const caseNumbers = useMemo(
+    () => buildCaseNumbers(allPlaybooks),
+    [allPlaybooks],
+  );
   const inStage = useMemo(
     () => (pb: Playbook) =>
       activeStage === "all" || stageByPlaybook.get(pb.id) === activeStage,
@@ -199,65 +298,145 @@ function CasesList() {
   );
 
   // Three filters narrow the same list: company type, professional role and
-  // discipline. Only surface a selector option that actually has a matching
-  // case, and scope each option's availability + count by the OTHER two active
-  // filters, so a count always describes what clicking it would really show.
+  // discipline. Each one is a list of picks and an empty list means "no filter",
+  // so a case matches when it satisfies ANY pick in a list (union) and EVERY
+  // list that has picks (intersection).
+  const inCompany = useCallback(
+    (p: Playbook) =>
+      companyTypes.length === 0 ||
+      p.companyTypes.some((c) => companyTypes.includes(c)),
+    [companyTypes],
+  );
+  const inRole = useCallback(
+    (p: Playbook) => roles.length === 0 || roles.some((r) => caseHasRole(p, r)),
+    [roles, caseHasRole],
+  );
+  const inCategory = useCallback(
+    (p: Playbook) =>
+      activeCategories.length === 0 || activeCategories.includes(p.category),
+    [activeCategories],
+  );
+  // The market row only exists when at least one case carries a region, so a
+  // catalogue without market-specific cases keeps exactly the layout it had.
+  const regions = useMemo(
+    () =>
+      [
+        ...new Set(
+          allPlaybooks
+            .map((p) => p.region)
+            .filter((r): r is string => Boolean(r)),
+        ),
+      ].sort(),
+    [allPlaybooks],
+  );
+  const inRegion = useCallback(
+    (p: Playbook) => activeRegion === "all" || p.region === activeRegion,
+    [activeRegion],
+  );
+
+  // Only surface a selector option that actually has a matching case, and scope
+  // each option's availability + count by the OTHER two active filters, so a
+  // count always describes what clicking it would really show.
   const byCategoryRole = useMemo(
     () =>
-      PLAYBOOKS.filter(
-        (p) =>
-          (activeCategory === "all" || p.category === activeCategory) &&
-          (!role || caseHasRole(p, role)) &&
-          inStage(p),
+      allPlaybooks.filter(
+        (p) => inCategory(p) && inRole(p) && inStage(p) && inRegion(p),
       ),
-    [activeCategory, role, caseHasRole, inStage],
+    [allPlaybooks, inCategory, inRole, inStage, inRegion],
   );
   const byCompanyRole = useMemo(
     () =>
-      PLAYBOOKS.filter(
-        (p) =>
-          (!companyType || p.companyTypes.includes(companyType)) &&
-          (!role || caseHasRole(p, role)) &&
-          inStage(p),
+      allPlaybooks.filter(
+        (p) => inCompany(p) && inRole(p) && inStage(p) && inRegion(p),
       ),
-    [companyType, role, caseHasRole, inStage],
+    [allPlaybooks, inCompany, inRole, inStage, inRegion],
   );
   const byCompanyCategory = useMemo(
     () =>
-      PLAYBOOKS.filter(
-        (p) =>
-          (!companyType || p.companyTypes.includes(companyType)) &&
-          (activeCategory === "all" || p.category === activeCategory) &&
-          inStage(p),
+      allPlaybooks.filter(
+        (p) => inCompany(p) && inCategory(p) && inStage(p) && inRegion(p),
       ),
-    [companyType, activeCategory, inStage],
+    [allPlaybooks, inCompany, inCategory, inStage, inRegion],
   );
   // Stage availability + counts are scoped by the who/discipline filters but
   // NOT by the active stage itself (so every reachable stage stays clickable).
   const byCompanyRoleCategory = useMemo(
     () =>
-      PLAYBOOKS.filter(
-        (p) =>
-          (!companyType || p.companyTypes.includes(companyType)) &&
-          (!role || caseHasRole(p, role)) &&
-          (activeCategory === "all" || p.category === activeCategory),
+      allPlaybooks.filter(
+        (p) => inCompany(p) && inRole(p) && inCategory(p) && inRegion(p),
       ),
-    [companyType, role, caseHasRole, activeCategory],
+    [allPlaybooks, inCompany, inRole, inCategory, inRegion],
   );
+  // Market counts mirror the stage rule: scoped by every other filter, never
+  // by the market itself, so a picked market can always be unpicked.
+  const byAllButRegion = useMemo(
+    () =>
+      allPlaybooks.filter(
+        (p) => inCompany(p) && inRole(p) && inCategory(p) && inStage(p),
+      ),
+    [allPlaybooks, inCompany, inRole, inCategory, inStage],
+  );
+  // An option the user has picked stays in its own row even when the other
+  // filters leave it with no matching case. Dropping it would take away the
+  // only control that undoes the empty result the user is looking at.
   const availableCompanyTypes = useMemo(() => {
     const present = new Set(byCategoryRole.flatMap((p) => p.companyTypes));
-    return COMPANY_TYPE_META.filter((c) => present.has(c.id));
-  }, [byCategoryRole]);
+    return COMPANY_TYPE_META.filter(
+      (c) => present.has(c.id) || companyTypes.includes(c.id),
+    );
+  }, [byCategoryRole, companyTypes]);
   const availableCategories = useMemo(() => {
     const present = new Set(byCompanyRole.map((p) => p.category));
-    return CATEGORY_META.filter((c) => present.has(c.id));
-  }, [byCompanyRole]);
+    return CATEGORY_META.filter(
+      (c) => present.has(c.id) || activeCategories.includes(c.id),
+    );
+  }, [byCompanyRole, activeCategories]);
   const availableRoles = useMemo(() => {
     const present = new Set(
       byCompanyCategory.flatMap((p) => rolesByPlaybook.get(p.id) ?? []),
     );
-    return ROLE_META.filter((r) => present.has(r.id));
-  }, [byCompanyCategory, rolesByPlaybook]);
+    return ROLE_META.filter((r) => present.has(r.id) || roles.includes(r.id));
+  }, [byCompanyCategory, rolesByPlaybook, roles]);
+  // One entry per active pick, ordered the way the selector rows are ordered
+  // on screen, each carrying the control that takes itself off.
+  const activeFilterChips = useMemo(
+    () => [
+      ...companyTypes.map((id) => ({
+        kind: "company" as const,
+        id: id as string,
+        label: t(COMPANY_TYPE_BY_ID[id]?.labelKey ?? "", {
+          defaultValue: COMPANY_TYPE_BY_ID[id]?.labelDefault ?? "",
+        }),
+        remove: () => toggleCompanyType(id),
+      })),
+      ...roles.map((id) => ({
+        kind: "role" as const,
+        id: id as string,
+        label: t(ROLE_BY_ID[id]?.labelKey ?? "", {
+          defaultValue: ROLE_BY_ID[id]?.labelDefault ?? "",
+        }),
+        remove: () => toggleRole(id),
+      })),
+      ...activeCategories.map((id) => ({
+        kind: "category" as const,
+        id: id as string,
+        label: t(CATEGORY_BY_ID[id]?.labelKey ?? "", {
+          defaultValue: CATEGORY_BY_ID[id]?.labelDefault ?? "",
+        }),
+        remove: () => toggleCategory(id),
+      })),
+    ],
+    [
+      companyTypes,
+      roles,
+      activeCategories,
+      toggleCompanyType,
+      toggleRole,
+      toggleCategory,
+      t,
+    ],
+  );
+
   const availableStages = useMemo(() => {
     const present = new Set(
       byCompanyRoleCategory.map((p) => stageByPlaybook.get(p.id)),
@@ -269,13 +448,13 @@ function CasesList() {
   // shortlist and a plain title/description text search. All narrow the list.
   const visible = useMemo(() => {
     const q = query.trim().toLowerCase();
-    return PLAYBOOKS.filter((pb) => {
-      if (companyType && !pb.companyTypes.includes(companyType)) return false;
-      if (role && !caseHasRole(pb, role)) return false;
+    return allPlaybooks.filter((pb) => {
+      if (!inCompany(pb)) return false;
+      if (!inRole(pb)) return false;
       if (activeStage !== "all" && stageByPlaybook.get(pb.id) !== activeStage)
         return false;
-      if (activeCategory !== "all" && pb.category !== activeCategory)
-        return false;
+      if (!inCategory(pb)) return false;
+      if (!inRegion(pb)) return false;
       if (showOnlyPinned && !pinnedIds.includes(pb.id)) return false;
       if (!q) return true;
       const haystack =
@@ -287,13 +466,14 @@ function CasesList() {
       (a, b) => (caseNumbers.get(a.id) ?? 0) - (caseNumbers.get(b.id) ?? 0),
     );
   }, [
+    allPlaybooks,
     query,
-    activeCategory,
     activeStage,
     stageByPlaybook,
-    companyType,
-    role,
-    caseHasRole,
+    inCompany,
+    inRole,
+    inCategory,
+    inRegion,
     showOnlyPinned,
     pinnedIds,
     caseNumbers,
@@ -346,14 +526,24 @@ function CasesList() {
   }, [cardLimit, visible.length]);
 
   const handlePickCompany = (id: CompanyType) => {
-    setCompanyType(companyType === id ? null : id);
+    toggleCompanyType(id);
   };
   const handlePickRole = (id: ProfessionalRole) => {
-    setRole(role === id ? null : id);
+    toggleRole(id);
   };
   const handlePickStage = (id: LifecycleStage) => {
     setActiveStage(activeStage === id ? "all" : id);
   };
+
+  // A hub of this many cases is easy to bounce off: none of them is wrong, so none of
+  // them is obviously the one to open. This opens one at random from whatever
+  // the filters currently leave on screen, so it stays inside the discipline
+  // and role the reader already chose rather than throwing them anywhere.
+  const openRandomCase = useCallback(() => {
+    const pool = visible.length > 0 ? visible : allPlaybooks;
+    const pick = pool[Math.floor(Math.random() * pool.length)];
+    if (pick) navigate(`/cases/${pick.id}`);
+  }, [visible, allPlaybooks, navigate]);
 
   return (
     <div className="space-y-6 animate-fade-in">
@@ -372,11 +562,11 @@ function CasesList() {
               <h1 className="text-xl font-semibold tracking-tight text-content-primary">
                 {t("cases.page_title", { defaultValue: "Cases" })}
               </h1>
-              {PLAYBOOKS.length > 0 && (
+              {allPlaybooks.length > 0 && (
                 <span className="inline-flex items-center rounded-full bg-oe-blue/10 px-2 py-0.5 text-2xs font-semibold text-oe-blue ring-1 ring-inset ring-oe-blue/20">
                   {t("cases.header.count", {
                     defaultValue: "{{count}} guided cases",
-                    count: PLAYBOOKS.length,
+                    count: allPlaybooks.length,
                   })}
                 </span>
               )}
@@ -388,54 +578,144 @@ function CasesList() {
               })}
             </p>
           </div>
+          {/* The catalogue is not only ours: a user writes their own case the
+              way their firm actually works, and it then lives in this same hub
+              beside the shipped ones. That route used to be a small button in
+              the corner, which reads as a footnote rather than as half of what
+              this page is for.
+
+              Three actions, because they are one decision asked three ways:
+              write one starting from ours, write one from nothing, or just
+              show me a case. The third exists because a hub of 144 equally
+              good things is easy to bounce off. */}
+          <div className="flex w-full shrink-0 flex-col gap-2 sm:w-auto">
+            <Button
+              variant="primary"
+              size="lg"
+              icon={<PenLine size={16} />}
+              onClick={() => navigate("/cases/new")}
+              className="w-full justify-center sm:w-auto"
+            >
+              {t("cases.write_own", { defaultValue: "Write your own case" })}
+            </Button>
+            <div className="flex gap-2">
+              <Button
+                variant="secondary"
+                size="sm"
+                icon={<FilePlus2 size={13} />}
+                onClick={() => navigate("/cases/new?blank=1")}
+                className="flex-1 justify-center"
+              >
+                {t("cases.write_blank", { defaultValue: "From blank" })}
+              </Button>
+              <Button
+                variant="ghost"
+                size="sm"
+                icon={<Shuffle size={13} />}
+                onClick={openRandomCase}
+                className="flex-1 justify-center"
+              >
+                {t("cases.show_me_one", { defaultValue: "Show me one" })}
+              </Button>
+            </div>
+          </div>
         </div>
       </div>
 
-      {PLAYBOOKS.length > 0 && (
+      {allPlaybooks.length > 0 && (
         <>
-          {/* ── How-to helper: how to use the hub in one line ─────────────── */}
-          <div className="flex items-start gap-2 rounded-xl border border-dashed border-border-light bg-surface-secondary/30 p-3">
-            <Info
-              size={15}
-              className="mt-px shrink-0 text-content-tertiary"
-              aria-hidden="true"
-            />
-            <p className="text-2xs leading-relaxed text-content-tertiary">
-              {t("cases.hub_howto", {
-                defaultValue:
-                  "New here? Pick where you are in the project, the kind of company you work for, and your role, and the list narrows to the cases that matter to you.",
-              })}
-            </p>
-          </div>
+          {/* ── Find your case ───────────────────────────────────────────────
+              The three "where am I / who am I" selectors used to be three
+              full-width blocks stacked one under another, each with its own
+              heading and its own gap, and together they pushed the catalogue
+              off the first screen. They are one question asked three ways, so
+              they are one panel: the lifecycle across the top because it is
+              the ordered map, then company and role side by side because they
+              are both "who is asking".
 
-          {/* ── Project lifecycle: cases from start to finish, as stage cards ─ */}
-          <div>
-            <div className="mb-2.5 flex items-center gap-2">
-              <Flag
-                size={14}
-                className="text-content-tertiary"
+              The panel folds. Someone arriving needs to see that the filters
+              exist; someone who has already answered wants the cases. So it
+              opens on a first visit, starts folded once anything is picked,
+              and the toggle overrides both and is remembered. The summary
+              strip below the panel keeps naming every active pick either way,
+              so folding never hides what the list is filtered to. */}
+          <section className="rounded-2xl border border-border-light bg-surface-primary">
+            <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5 px-3.5 py-2.5">
+              <SlidersHorizontal
+                size={15}
+                className="shrink-0 text-content-tertiary"
                 aria-hidden="true"
               />
               <h2 className="text-xs font-semibold uppercase tracking-wide text-content-secondary">
-                {t("cases.stage_selector.heading", {
-                  defaultValue: "Project lifecycle",
-                })}
+                {t("cases.finder.heading", { defaultValue: "Find your case" })}
               </h2>
-              <span className="text-2xs text-content-tertiary">
-                {t("cases.stage_selector.subtitle", {
+              <p className="min-w-0 flex-1 text-2xs leading-relaxed text-content-tertiary">
+                {t("cases.hub_howto", {
                   defaultValue:
-                    "Cases laid out in the order a project runs, start to finish.",
+                    "New here? Pick where you are in the project, the kind of company you work for, and your role, and the list narrows to the cases that matter to you.",
                 })}
-              </span>
+              </p>
+              {activeFilterChips.length > 0 && (
+                <button
+                  type="button"
+                  onClick={clearFilters}
+                  className="shrink-0 text-2xs font-medium text-oe-blue hover:underline"
+                >
+                  {t("cases.finder.reset", { defaultValue: "Reset filters" })}
+                </button>
+              )}
+              <button
+                type="button"
+                onClick={() => setFinderOpen(!finderOpen)}
+                aria-expanded={finderOpen}
+                aria-controls="cases-finder-body"
+                className="inline-flex shrink-0 items-center gap-1 rounded-full border border-border-light px-2.5 py-1 text-2xs font-medium text-content-secondary transition-colors hover:border-oe-blue/30 hover:text-content-primary focus:outline-none focus-visible:ring-2 focus-visible:ring-oe-blue/40"
+              >
+                <ChevronDown
+                  size={12}
+                  aria-hidden="true"
+                  className={clsx(
+                    "transition-transform motion-reduce:transition-none",
+                    finderOpen && "rotate-180",
+                  )}
+                />
+                {finderOpen
+                  ? t("cases.finder.hide", { defaultValue: "Hide" })
+                  : t("cases.finder.show", { defaultValue: "Change" })}
+              </button>
             </div>
-            {/* Eight stage cards in lifecycle order. Compact horizontal cards in
-                the "My company" card language, but wrapped in a lifted panel and
-                each led by a numbered tile, so this row reads as the higher-level
-                project map (the ordered journey, start to finish) that sits above
-                the who/role filters below. */}
-            <div className="rounded-2xl border border-border-light bg-surface-secondary/40 p-2.5 dark:bg-white/[0.03]">
+
+            {finderOpen && (
               <div
-                className="grid grid-cols-1 gap-2 sm:grid-cols-2 lg:grid-cols-4"
+                id="cases-finder-body"
+                className="space-y-3 border-t border-border-light p-3"
+              >
+                {/* ── Project lifecycle: cases from start to finish ───────── */}
+                <div>
+                  <div className="mb-2 flex flex-wrap items-center gap-x-2 gap-y-0.5">
+                    <Flag
+                      size={13}
+                      className="text-content-tertiary"
+                      aria-hidden="true"
+                    />
+                    <h3 className="text-2xs font-semibold uppercase tracking-wide text-content-secondary">
+                      {t("cases.stage_selector.heading", {
+                        defaultValue: "Project lifecycle",
+                      })}
+                    </h3>
+                    <span className="text-2xs text-content-tertiary">
+                      {t("cases.stage_selector.subtitle", {
+                        defaultValue:
+                          "Cases laid out in the order a project runs, start to finish.",
+                      })}
+                    </span>
+                  </div>
+                  {/* Eight stage cards in lifecycle order, each led by a
+                      numbered tile so the row reads as the ordered journey
+                      rather than as one more set of chips. */}
+                  <div className="rounded-xl border border-border-light bg-surface-secondary/40 p-2 dark:bg-white/[0.03]">
+              <div
+                className="grid grid-cols-2 gap-1.5 sm:grid-cols-4 md:grid-cols-6 lg:grid-cols-8"
                 role="group"
                 aria-label={t("cases.stage_selector.heading", {
                   defaultValue: "Project lifecycle",
@@ -458,7 +738,7 @@ function CasesList() {
                       disabled={disabled}
                       title={t(s.descKey, { defaultValue: s.descDefault })}
                       className={clsx(
-                        "group flex items-center gap-2.5 rounded-xl border p-2 text-left transition focus:outline-none focus-visible:ring-2 focus-visible:ring-oe-blue/40 motion-reduce:transition-none",
+                        "group flex items-center gap-2 rounded-xl border p-1.5 text-left transition focus:outline-none focus-visible:ring-2 focus-visible:ring-oe-blue/40 motion-reduce:transition-none",
                         active
                           ? clsx(s.tint.chip, "shadow-sm")
                           : "border-border-light bg-surface-primary text-content-primary hover:border-oe-blue/30",
@@ -469,11 +749,11 @@ function CasesList() {
                           ordered journey (this is the top-level lifecycle map). */}
                       <span
                         className={clsx(
-                          "relative flex h-12 w-12 shrink-0 items-center justify-center rounded-xl ring-1 ring-inset",
+                          "relative flex h-9 w-9 shrink-0 items-center justify-center rounded-lg ring-1 ring-inset",
                           s.tint.tile,
                         )}
                       >
-                        <Icon size={18} strokeWidth={1.8} aria-hidden="true" />
+                        <Icon size={15} strokeWidth={1.8} aria-hidden="true" />
                         <span
                           className={clsx(
                             "absolute -right-1 -top-1 flex h-4 w-4 items-center justify-center rounded-full text-[9px] font-bold tabular-nums shadow-sm",
@@ -488,7 +768,7 @@ function CasesList() {
                       <span className="min-w-0 flex-1">
                         <span
                           className={clsx(
-                            "block truncate text-xs font-semibold leading-tight",
+                            "block text-xs font-semibold leading-tight",
                             !active && "text-content-primary",
                           )}
                         >
@@ -511,38 +791,98 @@ function CasesList() {
                 })}
               </div>
             </div>
-            {activeStage !== "all" && (
-              <button
-                type="button"
-                onClick={() => setActiveStage("all")}
-                className="mt-2 text-2xs font-medium text-oe-blue hover:underline"
-              >
-                {t("cases.stage_selector.all", { defaultValue: "All stages" })}
-              </button>
-            )}
-          </div>
+                  {activeStage !== "all" && (
+                    <button
+                      type="button"
+                      onClick={() => setActiveStage("all")}
+                      className="mt-1.5 text-2xs font-medium text-oe-blue hover:underline"
+                    >
+                      {t("cases.stage_selector.all", {
+                        defaultValue: "All stages",
+                      })}
+                    </button>
+                  )}
+                </div>
 
-          {/* ── Primary filter: "I work as..." company-type selector ─────── */}
-          <div>
-            <div className="mb-2.5 flex items-center gap-2">
-              <Briefcase
-                size={14}
-                className="text-content-tertiary"
-                aria-hidden="true"
-              />
-              <h2 className="text-xs font-semibold uppercase tracking-wide text-content-secondary">
-                {t("cases.company_selector.heading", {
-                  defaultValue: "My company",
-                })}
-              </h2>
-              <span className="text-2xs text-content-tertiary">
-                {t("cases.company_selector.subtitle", {
-                  defaultValue: "Pick the kind of firm you work for.",
-                })}
-              </span>
-            </div>
+                {/* ── Market standards: cases written for one market's rules ── */}
+                {regions.length > 0 && (
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    <h3 className="text-2xs font-semibold uppercase tracking-wide text-content-secondary">
+                      {t("cases.region_selector.heading", {
+                        defaultValue: "Market",
+                      })}
+                    </h3>
+                    {regions.map((r) => {
+                      const active = activeRegion === r;
+                      const count = byAllButRegion.filter(
+                        (p) => p.region === r,
+                      ).length;
+                      return (
+                        <button
+                          key={r}
+                          type="button"
+                          onClick={() => setActiveRegion(active ? "all" : r)}
+                          aria-pressed={active}
+                          className={clsx(
+                            "inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-2xs font-medium transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-oe-blue/40",
+                            active
+                              ? "border-oe-blue bg-oe-blue/10 text-oe-blue"
+                              : "border-border-light bg-surface-primary text-content-secondary hover:border-oe-blue/30",
+                          )}
+                        >
+                          <CountryFlag
+                            code={r.toLowerCase()}
+                            size={18}
+                            className="ring-1 ring-inset ring-black/10"
+                          />
+                          {regionDisplayName(r, i18n.language)}
+                          <span className="tabular-nums text-content-tertiary">
+                            {count}
+                          </span>
+                        </button>
+                      );
+                    })}
+                    {activeRegion !== "all" && (
+                      <button
+                        type="button"
+                        onClick={() => setActiveRegion("all")}
+                        className="text-2xs font-medium text-oe-blue hover:underline"
+                      >
+                        {t("cases.region_selector.all", {
+                          defaultValue: "All markets",
+                        })}
+                      </button>
+                    )}
+                  </div>
+                )}
+
+                {/* Company and role side by side on a wide screen. They answer
+                    the same question, "who is asking", and stacking them cost a
+                    whole screen of height for no gain. Eight company cards in
+                    three columns and twelve role cards in four come out the
+                    same three rows deep, so the two columns end level. */}
+                <div className="grid gap-x-5 gap-y-3 xl:grid-cols-[2fr_3fr]">
+                  {/* ── "I work as..." company-type selector ─────────────── */}
+                  <div>
+                    <div className="mb-2 flex flex-wrap items-center gap-x-2 gap-y-0.5">
+                      <Briefcase
+                        size={13}
+                        className="text-content-tertiary"
+                        aria-hidden="true"
+                      />
+                      <h3 className="text-2xs font-semibold uppercase tracking-wide text-content-secondary">
+                        {t("cases.company_selector.heading", {
+                          defaultValue: "My company",
+                        })}
+                      </h3>
+                      <span className="text-2xs text-content-tertiary">
+                        {t("cases.company_selector.subtitle", {
+                          defaultValue: "Pick the kind of firm you work for.",
+                        })}
+                      </span>
+                    </div>
             <div
-              className="grid grid-cols-1 gap-2 sm:grid-cols-2 lg:grid-cols-4"
+              className="grid grid-cols-2 gap-1.5 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-3"
               role="group"
               aria-label={t("cases.company_selector.heading", {
                 defaultValue: "My company",
@@ -550,7 +890,7 @@ function CasesList() {
             >
               {COMPANY_TYPE_META.map((c) => {
                 const Icon = c.icon;
-                const active = companyType === c.id;
+                const active = companyTypes.includes(c.id);
                 const count = byCategoryRole.filter((p) =>
                   p.companyTypes.includes(c.id),
                 ).length;
@@ -564,7 +904,7 @@ function CasesList() {
                     aria-pressed={active}
                     disabled={disabled}
                     className={clsx(
-                      "flex items-center gap-2.5 rounded-xl border p-2 text-left transition focus:outline-none focus-visible:ring-2 focus-visible:ring-oe-blue/40 motion-reduce:transition-none",
+                      "flex items-center gap-2 rounded-xl border p-1.5 text-left transition focus:outline-none focus-visible:ring-2 focus-visible:ring-oe-blue/40 motion-reduce:transition-none",
                       active
                         ? clsx(c.tint.chip, "shadow-sm")
                         : "border-border-light bg-surface-primary text-content-primary hover:border-oe-blue/30",
@@ -575,11 +915,13 @@ function CasesList() {
                       id={c.id}
                       fallbackIcon={Icon}
                       fallbackClass={c.tint.text}
-                      className="h-14 w-14"
+                      tileClass={c.tint.tile}
+                      withKindBadge
+                      className="h-9 w-9 shrink-0"
                       title={t(c.labelKey, { defaultValue: c.labelDefault })}
                     />
                     <span className="min-w-0 flex-1">
-                      <span className="block truncate text-xs font-semibold leading-tight">
+                      <span className="block text-xs font-semibold leading-tight">
                         {t(c.labelKey, { defaultValue: c.labelDefault })}
                       </span>
                       <span className="mt-0.5 block text-2xs tabular-nums text-content-tertiary">
@@ -593,48 +935,48 @@ function CasesList() {
                 );
               })}
             </div>
-            {companyType && (
-              <button
-                type="button"
-                onClick={() => setCompanyType(null)}
-                className="mt-2 text-2xs font-medium text-oe-blue hover:underline"
-              >
-                {t("cases.company_selector.all", {
-                  defaultValue: "All company types",
-                })}
-              </button>
-            )}
-          </div>
+                    {companyTypes.length > 0 && (
+                      <button
+                        type="button"
+                        onClick={() => setCompanyTypes([])}
+                        className="mt-1.5 text-2xs font-medium text-oe-blue hover:underline"
+                      >
+                        {t("cases.company_selector.all", {
+                          defaultValue: "All company types",
+                        })}
+                      </button>
+                    )}
+                  </div>
 
-          {/* ── Secondary persona filter: "Your role" avatar selector ────── */}
-          <div>
-            <div className="mb-2.5 flex items-center gap-2">
-              <UserRound
-                size={14}
-                className="text-content-tertiary"
-                aria-hidden="true"
-              />
-              <h2 className="text-xs font-semibold uppercase tracking-wide text-content-secondary">
-                {t("cases.role_selector.heading", {
-                  defaultValue: "Your role",
-                })}
-              </h2>
-              <span className="text-2xs text-content-tertiary">
-                {t("cases.role_selector.subtitle", {
-                  defaultValue:
-                    "Pick what you do day to day for a tighter list.",
-                })}
-              </span>
-            </div>
+                  {/* ── "Your role" avatar selector ──────────────────────── */}
+                  <div>
+                    <div className="mb-2 flex flex-wrap items-center gap-x-2 gap-y-0.5">
+                      <UserRound
+                        size={13}
+                        className="text-content-tertiary"
+                        aria-hidden="true"
+                      />
+                      <h3 className="text-2xs font-semibold uppercase tracking-wide text-content-secondary">
+                        {t("cases.role_selector.heading", {
+                          defaultValue: "Your role",
+                        })}
+                      </h3>
+                      <span className="text-2xs text-content-tertiary">
+                        {t("cases.role_selector.subtitle", {
+                          defaultValue:
+                            "Pick what you do day to day for a tighter list.",
+                        })}
+                      </span>
+                    </div>
             <div
-              className="grid grid-cols-1 gap-2 sm:grid-cols-2 lg:grid-cols-4"
+              className="grid grid-cols-2 gap-1.5 sm:grid-cols-3 lg:grid-cols-4"
               role="group"
               aria-label={t("cases.role_selector.heading", {
                 defaultValue: "Your role",
               })}
             >
               {ROLE_META.map((r) => {
-                const active = role === r.id;
+                const active = roles.includes(r.id);
                 const count = byCompanyCategory.filter((p) =>
                   caseHasRole(p, r.id),
                 ).length;
@@ -648,7 +990,7 @@ function CasesList() {
                     aria-pressed={active}
                     disabled={disabled}
                     className={clsx(
-                      "flex items-center gap-2.5 rounded-xl border p-2 text-left transition focus:outline-none focus-visible:ring-2 focus-visible:ring-oe-blue/40 motion-reduce:transition-none",
+                      "flex items-center gap-2 rounded-xl border p-1.5 text-left transition focus:outline-none focus-visible:ring-2 focus-visible:ring-oe-blue/40 motion-reduce:transition-none",
                       active
                         ? clsx(r.tint.chip, "shadow-sm")
                         : "border-border-light bg-surface-primary text-content-primary hover:border-oe-blue/30",
@@ -657,11 +999,12 @@ function CasesList() {
                   >
                     <RoleArt
                       role={r.id}
-                      className="h-14 w-14 shrink-0"
+                      withKindBadge
+                      className="h-9 w-9 shrink-0"
                       title={t(r.labelKey, { defaultValue: r.labelDefault })}
                     />
                     <span className="min-w-0 flex-1">
-                      <span className="block truncate text-xs font-semibold leading-tight">
+                      <span className="block text-xs font-semibold leading-tight">
                         {t(r.labelKey, { defaultValue: r.labelDefault })}
                       </span>
                       <span className="mt-0.5 block text-2xs tabular-nums text-content-tertiary">
@@ -675,19 +1018,25 @@ function CasesList() {
                 );
               })}
             </div>
-            {role && (
-              <button
-                type="button"
-                onClick={() => setRole(null)}
-                className="mt-2 text-2xs font-medium text-oe-blue hover:underline"
-              >
-                {t("cases.role_selector.all", { defaultValue: "All roles" })}
-              </button>
+                    {roles.length > 0 && (
+                      <button
+                        type="button"
+                        onClick={() => setRoles([])}
+                        className="mt-1.5 text-2xs font-medium text-oe-blue hover:underline"
+                      >
+                        {t("cases.role_selector.all", {
+                          defaultValue: "All roles",
+                        })}
+                      </button>
+                    )}
+                  </div>
+                </div>
+              </div>
             )}
-          </div>
+          </section>
 
           {/* ── Project pin bar ───────────────────────────────────────────── */}
-          <div className="flex flex-wrap items-center gap-2 rounded-xl border border-dashed border-border-light bg-surface-secondary/40 p-3">
+          <div className="flex flex-wrap items-center gap-2 rounded-xl border border-dashed border-border-light bg-surface-secondary/40 px-3 py-2">
             <FolderKanban
               size={15}
               className="shrink-0 text-content-tertiary"
@@ -700,8 +1049,14 @@ function CasesList() {
               id="cases-pin-project"
               value={pinProjectId}
               onChange={(e) => {
-                setPinProjectId(e.target.value);
-                if (!e.target.value) setShowOnlyPinned(false);
+                const nextId = e.target.value;
+                const next = sortedProjects.find((p) => p.id === nextId);
+                // Same control, same store as the top-bar switcher: picking a
+                // project here moves the whole app onto it instead of holding
+                // a second, silently diverging selection.
+                if (nextId && next) setActiveProject(nextId, next.name);
+                else clearActiveProject();
+                if (!nextId) setShowOnlyPinned(false);
               }}
               className="h-8 rounded-lg border border-border-light bg-surface-primary px-2.5 text-xs text-content-primary focus:outline-none focus-visible:ring-2 focus-visible:ring-oe-blue/40"
             >
@@ -729,8 +1084,17 @@ function CasesList() {
               )}
             >
               <Pin size={12} aria-hidden="true" />
-              {t("cases.project_pin.show_pinned", {
-                defaultValue: "Cases for this project",
+              {/* The number beside this label is `pinnedIds.length` - the
+                  user's own pin list for this project, held in localStorage.
+                  It is not a count of cases the project has, so the old
+                  "Cases for this project" read as "this project has no
+                  cases" on every fresh project (issue #414). The label now
+                  names what the number is. New key rather than new text
+                  under the old one: 29 locales still carry the previous
+                  sentence, and changing only the English would leave them
+                  translating the claim we just removed. */}
+              {t("cases.project_pin.show_pinned_only", {
+                defaultValue: "Pinned to this project",
               })}
               {pinProjectId && (
                 <span className="tabular-nums opacity-70">
@@ -745,11 +1109,26 @@ function CasesList() {
                 })}
               </span>
             )}
+            {/* A project is chosen but nothing is pinned to it yet. The same
+                sentence the empty result already uses is shown here, before
+                the click rather than after it, so a zero on the button is
+                explained where it appears. */}
+            {pinProjectId && pinnedIds.length === 0 && (
+              <span className="text-2xs text-content-tertiary">
+                {t("cases.project_pin.empty_body", {
+                  defaultValue:
+                    "Pin a case to this project from its card, and it will show up here.",
+                })}
+              </span>
+            )}
           </div>
 
-          {/* ── Secondary filter: search + discipline chips ──────────────── */}
-          <div className="space-y-3">
-            <div className="relative max-w-md">
+          {/* ── Secondary filter: search + discipline chips ────────────────
+              One row, not two stacked blocks. Search never folds away with the
+              panel above: typing a word is the fastest route to a case and it
+              has to stay reachable whatever the filters are doing. */}
+          <div className="flex flex-wrap items-start gap-x-3 gap-y-2">
+            <div className="relative w-full shrink-0 sm:w-64">
               <Search
                 size={15}
                 className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-content-tertiary"
@@ -768,23 +1147,20 @@ function CasesList() {
                 className="w-full rounded-lg border border-border-light bg-surface-primary py-2 pl-9 pr-3 text-sm text-content-primary placeholder:text-content-tertiary focus:border-oe-blue/50 focus:outline-none focus:ring-2 focus:ring-oe-blue/20"
               />
             </div>
-            <div>
-              <div className="mb-2.5 flex items-center gap-2">
+            <div className="flex min-w-0 flex-1 flex-wrap items-center gap-1.5">
+              <span className="mr-0.5 inline-flex items-center gap-1.5 text-2xs font-semibold uppercase tracking-wide text-content-secondary">
                 <Layers
-                  size={14}
+                  size={13}
                   className="text-content-tertiary"
                   aria-hidden="true"
                 />
-                <h2 className="text-xs font-semibold uppercase tracking-wide text-content-secondary">
-                  {t("cases.filter.discipline_label", {
-                    defaultValue: "Discipline",
-                  })}
-                </h2>
-              </div>
-              <div className="flex flex-wrap gap-2">
+                {t("cases.filter.discipline_label", {
+                  defaultValue: "Discipline",
+                })}
+              </span>
                 <CategoryChip
-                  active={activeCategory === "all"}
-                  onClick={() => setActiveCategory("all")}
+                  active={activeCategories.length === 0}
+                  onClick={() => setCategories([])}
                   label={t("cases.cat.all", { defaultValue: "All" })}
                   count={byCompanyRole.length}
                   icon={Layers}
@@ -797,8 +1173,8 @@ function CasesList() {
                   return (
                     <CategoryChip
                       key={c.id}
-                      active={activeCategory === c.id}
-                      onClick={() => setActiveCategory(c.id)}
+                      active={activeCategories.includes(c.id)}
+                      onClick={() => toggleCategory(c.id)}
                       label={t(c.labelKey, { defaultValue: c.labelDefault })}
                       count={count}
                       icon={c.icon}
@@ -806,46 +1182,55 @@ function CasesList() {
                     />
                   );
                 })}
-              </div>
             </div>
           </div>
         </>
       )}
 
-      {/* ── Personalized summary strip: who the list is tuned to now ────── */}
-      {(role || companyType) && (
+      {/* ── Personalized summary strip: what the list is tuned to now ─────
+          Every pick gets its own removable chip. A sentence would have to name
+          one selection and hide the rest, and this strip is the only place
+          that answers "what is filtering my list right now" - so it lists all
+          of them, and each chip is the control that takes itself off. */}
+      {activeFilterChips.length > 0 && (
         <div
           className={clsx(
             "flex flex-wrap items-center gap-3 rounded-xl border p-3",
-            role
-              ? tintForRole(role).chip
-              : tintForCompany(companyType ?? undefined).chip,
+            roles[0]
+              ? tintForRole(roles[0]).chip
+              : companyTypes[0]
+                ? tintForCompany(companyTypes[0]).chip
+                : NEUTRAL_TINT.chip,
           )}
         >
-          {role ? (
-            <RoleArt
-              role={role}
-              className="h-14 w-14"
-              title={t(ROLE_BY_ID[role]?.labelKey ?? "", {
-                defaultValue: ROLE_BY_ID[role]?.labelDefault ?? "",
-              })}
-            />
-          ) : (
-            companyType && (
-              <CompanyArt
-                id={companyType}
-                fallbackIcon={
-                  COMPANY_TYPE_BY_ID[companyType]?.icon ?? Briefcase
-                }
-                fallbackClass={tintForCompany(companyType).text}
+          <div className="flex shrink-0 items-center gap-1">
+            {roles.slice(0, 3).map((r) => (
+              <RoleArt
+                key={r}
+                role={r}
+                withKindBadge
                 className="h-14 w-14"
-                title={t(COMPANY_TYPE_BY_ID[companyType]?.labelKey ?? "", {
-                  defaultValue:
-                    COMPANY_TYPE_BY_ID[companyType]?.labelDefault ?? "",
+                title={t(ROLE_BY_ID[r]?.labelKey ?? "", {
+                  defaultValue: ROLE_BY_ID[r]?.labelDefault ?? "",
                 })}
               />
-            )
-          )}
+            ))}
+            {roles.length === 0 &&
+              companyTypes.slice(0, 3).map((c) => (
+                <CompanyArt
+                  key={c}
+                  id={c}
+                  fallbackIcon={COMPANY_TYPE_BY_ID[c]?.icon ?? Briefcase}
+                  fallbackClass={tintForCompany(c).text}
+                  tileClass={tintForCompany(c).tile}
+                  withKindBadge
+                  className="h-14 w-14"
+                  title={t(COMPANY_TYPE_BY_ID[c]?.labelKey ?? "", {
+                    defaultValue: COMPANY_TYPE_BY_ID[c]?.labelDefault ?? "",
+                  })}
+                />
+              ))}
+          </div>
           <div className="min-w-0 flex-1">
             <p className="text-sm font-semibold">
               {t("cases.persona.count", {
@@ -853,37 +1238,27 @@ function CasesList() {
                 count: visible.length,
               })}
             </p>
-            <p className="text-xs opacity-80">
-              {role && companyType
-                ? t("cases.persona.role_and_company", {
-                    defaultValue: "{{role}} at a {{company}}",
-                    role: t(ROLE_BY_ID[role]?.labelKey ?? "", {
-                      defaultValue: ROLE_BY_ID[role]?.labelDefault ?? "",
-                    }),
-                    company: t(
-                      COMPANY_TYPE_BY_ID[companyType]?.labelKey ?? "",
-                      {
-                        defaultValue:
-                          COMPANY_TYPE_BY_ID[companyType]?.labelDefault ?? "",
-                      },
-                    ),
-                  })
-                : role
-                  ? t(ROLE_BY_ID[role]?.labelKey ?? "", {
-                      defaultValue: ROLE_BY_ID[role]?.labelDefault ?? "",
-                    })
-                  : t(COMPANY_TYPE_BY_ID[companyType!]?.labelKey ?? "", {
-                      defaultValue:
-                        COMPANY_TYPE_BY_ID[companyType!]?.labelDefault ?? "",
-                    })}
-            </p>
+            <div className="mt-1 flex flex-wrap gap-1.5">
+              {activeFilterChips.map((chip) => (
+                <button
+                  key={`${chip.kind}:${chip.id}`}
+                  type="button"
+                  onClick={chip.remove}
+                  aria-label={t("cases.persona.remove", {
+                    defaultValue: "Remove filter {{name}}",
+                    name: chip.label,
+                  })}
+                  className="inline-flex items-center gap-1 rounded-full border border-current/30 bg-white/40 px-2 py-0.5 text-2xs font-medium transition-colors hover:bg-white/70 dark:bg-black/10 dark:hover:bg-black/20"
+                >
+                  {chip.label}
+                  <X size={11} aria-hidden="true" />
+                </button>
+              ))}
+            </div>
           </div>
           <button
             type="button"
-            onClick={() => {
-              setRole(null);
-              setCompanyType(null);
-            }}
+            onClick={clearFilters}
             className="shrink-0 rounded-lg border border-current/30 px-2.5 py-1 text-2xs font-semibold transition-colors hover:bg-white/30 dark:hover:bg-black/10"
           >
             {t("cases.persona.clear", { defaultValue: "Clear" })}
@@ -892,7 +1267,7 @@ function CasesList() {
       )}
 
       {/* ── Cards ───────────────────────────────────────────────────────── */}
-      {PLAYBOOKS.length === 0 ? (
+      {allPlaybooks.length === 0 ? (
         <EmptyState
           icon={<Route size={28} />}
           title={t("cases.empty_title", { defaultValue: "No cases yet" })}
@@ -924,22 +1299,32 @@ function CasesList() {
         />
       ) : (
         <>
-          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5">
+          <div className="grid grid-cols-2 gap-2.5 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6 xl:grid-cols-8">
             {windowed.map((pb) => {
               const stageId = stageByPlaybook.get(pb.id);
+              // A shipped case is a source file with nothing an editor could
+              // open; only an authored one is a row somebody may rewrite.
+              const authored = caseIdFromPlaybookId(pb.id) !== null;
               return (
                 <CaseCard
                   key={pb.id}
                   pb={pb}
+                  authored={authored}
                   num={caseNumbers.get(pb.id)}
                   totalCases={caseNumbers.size}
                   stage={stageId ? STAGE_BY_ID[stageId] : undefined}
                   roles={rolesByPlaybook.get(pb.id) ?? []}
+                  face={facesByPlaybook.get(pb.id) ?? null}
                   done={bestDoneFor(pb)}
                   pinProjectId={pinProjectId}
                   pinned={pinProjectId ? pinnedIds.includes(pb.id) : false}
                   onOpen={() => navigate(`/cases/${pb.id}`)}
                   onTogglePin={() => togglePin(pinProjectId, pb.id)}
+                  onEdit={
+                    authored
+                      ? () => navigate(`/cases/${pb.id}/edit`)
+                      : undefined
+                  }
                 />
               );
             })}
@@ -980,6 +1365,9 @@ function CasesList() {
 
 interface CaseCardProps {
   pb: Playbook;
+  /** Whether this case was written by a user rather than shipped with the
+   *  product. Only marks the card; what may be DONE with it is `onEdit`. */
+  authored: boolean;
   /** 1-based lifecycle number, or undefined if this case has none. */
   num: number | undefined;
   /** Total number of numbered cases, for the "Case X of N" tooltip. */
@@ -988,6 +1376,10 @@ interface CaseCardProps {
   stage: StageMeta | undefined;
   /** Professional roles that run this case (already resolved). */
   roles: ProfessionalRole[];
+  /** Photograph of the person this case is written for, dealt by `dealCaseFaces`
+   *  over the whole catalogue, or null for a case whose company types have no
+   *  cast - those cards keep the illustration alone. */
+  face: string | null;
   /** Furthest step reached across any run of this case. */
   done: number;
   /** The project the pin picker is scoped to ('' = none, hides the pin). */
@@ -996,6 +1388,9 @@ interface CaseCardProps {
   pinned: boolean;
   onOpen: () => void;
   onTogglePin: () => void;
+  /** Opens this case in the editor. Passed only when it can be rewritten, so
+   *  a shipped case never offers an edit it cannot honour. */
+  onEdit?: () => void;
 }
 
 /**
@@ -1007,17 +1402,20 @@ interface CaseCardProps {
  */
 function CaseCard({
   pb,
+  authored,
   num,
   totalCases,
   stage,
   roles,
+  face,
   done,
   pinProjectId,
   pinned,
   onOpen,
   onTogglePin,
+  onEdit,
 }: CaseCardProps) {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
   const { ref, near } = useNearViewport<HTMLDivElement>("400px");
   const Icon = iconFor(pb.icon);
   const tint = tintFor(pb.category);
@@ -1067,27 +1465,93 @@ function CaseCard({
           tint.accent,
         )}
       />
-      {/* Line-art illustration banner: the picture carries the card, on an
-          always-light tile so the slate linework reads in both themes. The tile
-          keeps its 16/9 size whether the art or a placeholder sits inside, so
-          gating the art on `near` never shifts the layout. */}
+      {/* Illustration banner: the picture carries the card, on an always-light
+          tile so the slate linework reads in both themes. The tile keeps its
+          16/9 size whether the art or a placeholder sits inside, so gating the
+          art on `near` never shifts the layout.
+
+          A case that has a face keeps the whole diagram and wears the person
+          as a hex over one corner of it. Banding the two side by side cost the
+          diagram nearly 40% of its width, and the diagram is what says what the
+          case does; the hex is the same cell the marketing site uses on the
+          cards these cases came from, so the person still arrives first without
+          taking the meaning with them. The photograph is decorative (alt="");
+          the role it stands for is named in the card text below, so nothing is
+          said only in a picture. Both layers are absolutely positioned inside
+          the tile the layout has already reserved, so neither can shift
+          anything, and both mount on `near` so a card off screen costs
+          nothing. */}
       <div className="relative aspect-[16/9] w-full shrink-0 overflow-hidden border-b border-border-light bg-gradient-to-b from-white to-slate-50 ring-1 ring-inset ring-slate-900/[0.04]">
-        {near ? (
-          <CaseArt id={pb.id} fallbackIcon={Icon} fallbackClass={tint.text} />
-        ) : (
+        {!near ? (
           <div className="h-full w-full" aria-hidden="true" />
+        ) : (
+          <>
+            <CaseArt id={pb.id} category={pb.category} fallbackIcon={Icon} fallbackClass={tint.text} />
+            {face && (
+              <div className="pointer-events-none absolute bottom-2 start-2 w-[34%] max-w-[6.5rem]">
+                {/* The rim is the wrapper's own background showing through a
+                    3px inset, because a border cannot survive a clip-path. */}
+                <div
+                  className="aspect-[7/8] bg-white/90 p-[3px] shadow-md shadow-slate-900/15"
+                  style={{ clipPath: HEX_CELL }}
+                >
+                  <img
+                    src={face}
+                    alt=""
+                    loading="lazy"
+                    decoding="async"
+                    width={340}
+                    height={480}
+                    draggable={false}
+                    className="h-full w-full object-cover object-[50%_18%]"
+                    style={{ clipPath: HEX_CELL }}
+                  />
+                </div>
+              </div>
+            )}
+          </>
         )}
-        {num != null && (
-          <span
-            className="absolute left-3 top-3 inline-flex h-6 min-w-[1.5rem] items-center justify-center rounded-md bg-slate-900/85 px-1.5 text-2xs font-bold tabular-nums text-white shadow-sm ring-1 ring-inset ring-white/15"
-            title={t("cases.card.number", {
-              defaultValue: "Case {{num}} of {{total}}",
-              num,
-              total: totalCases,
-            })}
-          >
-            {num}
-          </span>
+        {(num != null || authored || pb.region) && (
+          <div className="absolute left-3 top-3 flex items-center gap-1.5">
+            {num != null && (
+              <span
+                className="inline-flex h-6 min-w-[1.5rem] items-center justify-center rounded-md bg-slate-900/85 px-1.5 text-2xs font-bold tabular-nums text-white shadow-sm ring-1 ring-inset ring-white/15"
+                title={t("cases.card.number", {
+                  defaultValue: "Case {{num}} of {{total}}",
+                  num,
+                  total: totalCases,
+                })}
+              >
+                {num}
+              </span>
+            )}
+            {/* Says at a glance that this case was written in the user's own
+                organisation rather than shipped with the product. Not "yours":
+                the hub also lists cases a colleague shared, and those are as
+                little the reader's own work as the shipped ones. */}
+            {authored && (
+              <Badge variant="blue" size="sm">
+                {t("cases.card.custom_badge", { defaultValue: "Custom" })}
+              </Badge>
+            )}
+            {/* Market flag: says at rest that this case is written for one
+                market's standards. The full market name is the tooltip and
+                the accessible name; the picture alone never carries it. */}
+            {pb.region && (
+              <span
+                className="inline-flex h-6 items-center gap-1 rounded-md bg-white/90 px-1.5 text-2xs font-semibold text-slate-900 shadow-sm ring-1 ring-inset ring-slate-900/10"
+                title={regionDisplayName(pb.region, i18n.language)}
+                aria-label={regionDisplayName(pb.region, i18n.language)}
+              >
+                <CountryFlag
+                  code={pb.region.toLowerCase()}
+                  size={18}
+                  className="ring-1 ring-inset ring-black/10"
+                />
+                {pb.region}
+              </span>
+            )}
+          </div>
         )}
         <div className="absolute right-3 top-3 flex items-center gap-1.5">
           {complete ? (
@@ -1105,6 +1569,43 @@ function CaseCard({
               })}
             />
           ) : null}
+          {/* Rewrite this case. Sits beside the pin and borrows its treatment,
+              including the z-20 that keeps it above the hover panel: a user
+              reads that panel to decide the case needs changing, so the
+              control they then reach for cannot be the one it just covered. */}
+          {onEdit && (
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation();
+                onEdit();
+              }}
+              title={t("cases.card.edit", { defaultValue: "Edit this case" })}
+              aria-label={t("cases.card.edit", {
+                defaultValue: "Edit this case",
+              })}
+              className={clsx(
+                "relative z-20 flex h-7 w-7 shrink-0 items-center justify-center rounded-lg border transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-oe-blue/40",
+                "border-border-light bg-surface-primary/90 text-content-tertiary",
+                "group-hover:border-white/35 group-hover:bg-white/15 group-hover:text-white",
+                "group-focus-visible:border-white/35 group-focus-visible:bg-white/15 group-focus-visible:text-white",
+                "hover:border-white/60 hover:bg-white/30 hover:text-white",
+              )}
+            >
+              <Pencil size={13} />
+            </button>
+          )}
+          {/* Pin this case to the active project. It has to stay legible while
+              the card is hovered: the hover panel below covers the whole card
+              at z-10, and a user reads that panel to decide whether this case
+              belongs on their job, so the control they then reach for cannot
+              be the one the panel just swallowed. It sat under the panel and
+              stayed clickable (the panel takes no pointer events), which is
+              worse than missing - an invisible target you have to know is
+              there. z-20 keeps it on top, and the unpinned chip borrows the
+              panel's light-on-dark treatment for as long as the panel is up.
+              Never opacity-gated on hover, so touch and keyboard reach it the
+              same way the mouse does. */}
           {pinProjectId && (
             <button
               type="button"
@@ -1132,10 +1633,23 @@ function CaseCard({
                     })
               }
               className={clsx(
-                "flex h-7 w-7 shrink-0 items-center justify-center rounded-lg border transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-oe-blue/40",
+                "relative z-20 flex h-7 w-7 shrink-0 items-center justify-center rounded-lg border transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-oe-blue/40",
                 pinned
-                  ? "border-oe-blue/40 bg-oe-blue/10 text-oe-blue"
-                  : "border-border-light bg-surface-primary/90 text-content-tertiary hover:border-oe-blue/30 hover:text-content-primary",
+                  ? // Solid, not a 10% tint: the same chip has to read on the
+                    // light banner at rest and on the near-black hover panel,
+                    // and a tint that faint survives neither.
+                    "border-oe-blue bg-oe-blue text-white shadow-sm"
+                  : clsx(
+                      "border-border-light bg-surface-primary/90 text-content-tertiary",
+                      // Same hover/focus pair that raises the panel, so the
+                      // chip and the panel can never disagree about which one
+                      // is showing.
+                      "group-hover:border-white/35 group-hover:bg-white/15 group-hover:text-white",
+                      "group-focus-visible:border-white/35 group-focus-visible:bg-white/15 group-focus-visible:text-white",
+                      // Pointing at the pin always means pointing at the card,
+                      // so this only ever brightens the treatment above.
+                      "hover:border-white/60 hover:bg-white/30 hover:text-white",
+                    ),
               )}
             >
               {pinned ? <Pin size={13} /> : <PinOff size={13} />}
@@ -1144,68 +1658,12 @@ function CaseCard({
         </div>
       </div>
 
-      {/* Card content */}
-      <div className="flex flex-1 flex-col p-3.5 pl-4">
-        <h3 className="text-sm font-semibold leading-snug text-content-primary">
+      {/* Resting content: illustration + a tight title keep the grid dense; the
+          fuller story surfaces in the hover overlay below. */}
+      <div className="flex flex-1 flex-col gap-1.5 p-2.5">
+        <h3 className="line-clamp-2 text-xs font-semibold leading-snug text-content-primary">
           {t(pb.titleKey, { defaultValue: pb.titleDefault })}
         </h3>
-        <p className="mt-1.5 line-clamp-3 text-xs leading-relaxed text-content-secondary">
-          {t(pb.descKey, { defaultValue: pb.descDefault })}
-        </p>
-
-        {/* Lifecycle stage: where in the project this case happens. */}
-        {stage && StageIcon && (
-          <div className="mt-3">
-            <span className="inline-flex items-center gap-1 rounded-full border border-border-light bg-surface-secondary px-2 py-0.5 text-2xs font-medium text-content-secondary">
-              <StageIcon size={10} strokeWidth={2} aria-hidden="true" />
-              {t("cases.card.stage", {
-                defaultValue: "Stage {{num}}: {{label}}",
-                num: stage.num,
-                label: t(stage.shortKey, { defaultValue: stage.shortDefault }),
-              })}
-            </span>
-          </div>
-        )}
-
-        {/* Who this case is for: the professional roles that run it, shown as
-            their persona avatars. The avatars are inline SVG, so they gate on
-            `near` too, with same-sized placeholder discs to avoid any shift. */}
-        {roles.length > 0 && (
-          <div
-            className="mt-3 flex items-center -space-x-1.5"
-            aria-label={roles
-              .map((id) =>
-                t(ROLE_BY_ID[id]?.labelKey ?? "", {
-                  defaultValue: ROLE_BY_ID[id]?.labelDefault ?? id,
-                }),
-              )
-              .join(", ")}
-          >
-            {shownRoles.map((id) =>
-              near ? (
-                <RoleAvatar
-                  key={id}
-                  role={id}
-                  className="h-6 w-6 rounded-full ring-2 ring-surface-primary"
-                  title={t(ROLE_BY_ID[id]?.labelKey ?? "", {
-                    defaultValue: ROLE_BY_ID[id]?.labelDefault ?? id,
-                  })}
-                />
-              ) : (
-                <span
-                  key={id}
-                  className="h-6 w-6 rounded-full bg-surface-secondary ring-2 ring-surface-primary"
-                  aria-hidden="true"
-                />
-              ),
-            )}
-            {roles.length > 3 && (
-              <span className="ml-2 text-2xs font-medium text-content-tertiary">
-                +{roles.length - 3}
-              </span>
-            )}
-          </div>
-        )}
 
         {/* Progress bar (only once started) */}
         {started && (
@@ -1233,33 +1691,99 @@ function CaseCard({
           </div>
         )}
 
-        {/* Footer meta + CTA */}
-        <div className="mt-auto flex items-center justify-between gap-2 border-t border-border-light pt-3">
-          <div className="flex items-center gap-3 text-2xs text-content-tertiary">
+        {/* Resting meta: steps and time (or live progress) on one tight line. */}
+        <div className="mt-auto flex items-center justify-between gap-1 text-2xs text-content-tertiary">
+          <span className="inline-flex items-center gap-1">
+            <ListChecks size={11} aria-hidden="true" />
+            {t("cases.card.steps", {
+              defaultValue: "{{count}} steps",
+              count: total,
+            })}
+          </span>
+          {started ? (
+            <span className="font-semibold tabular-nums text-oe-blue">{pct}%</span>
+          ) : (
             <span className="inline-flex items-center gap-1">
-              <ListChecks size={12} aria-hidden="true" />
-              {t("cases.card.steps", {
-                defaultValue: "{{count}} steps",
-                count: total,
-              })}
-            </span>
-            <span className="inline-flex items-center gap-1">
-              <Clock size={12} aria-hidden="true" />
-              {t("cases.card.minutes", {
-                defaultValue: "about {{count}} min",
+              <Clock size={11} aria-hidden="true" />
+              {t("cases.card.minutes_short", {
+                defaultValue: "{{count}} min",
                 count: pb.estMinutes,
               })}
             </span>
+          )}
+        </div>
+      </div>
+
+      {/* Hover / focus reveal: the fuller story surfaces over the whole card so
+          the dense resting grid still explains itself at a glance. The panel is
+          pointer-events-none so the card stays a single click target. */}
+      <div className="pointer-events-none absolute inset-0 z-10 flex flex-col gap-2 bg-gradient-to-t from-slate-950/95 via-slate-950/90 to-slate-950/80 p-3 opacity-0 backdrop-blur-[1px] transition-opacity duration-200 group-hover:opacity-100 group-focus-visible:opacity-100 motion-reduce:transition-none">
+        <h4 className="line-clamp-2 text-xs font-semibold leading-snug text-white">
+          {t(pb.titleKey, { defaultValue: pb.titleDefault })}
+        </h4>
+        <p className="line-clamp-4 text-2xs leading-relaxed text-white/80">
+          {t(pb.descKey, { defaultValue: pb.descDefault })}
+        </p>
+        <div className="mt-auto flex flex-col gap-1.5">
+          <div className="flex flex-wrap items-center gap-1.5">
+            {stage && StageIcon && (
+              <span className="inline-flex items-center gap-1 rounded-full bg-white/15 px-2 py-0.5 text-[10px] font-medium text-white ring-1 ring-inset ring-white/20">
+                <StageIcon size={10} strokeWidth={2} aria-hidden="true" />
+                {t(stage.shortKey, { defaultValue: stage.shortDefault })}
+              </span>
+            )}
+            <span className="inline-flex items-center gap-1 rounded-full bg-white/15 px-2 py-0.5 text-[10px] font-medium text-white ring-1 ring-inset ring-white/20">
+              <Clock size={10} aria-hidden="true" />
+              {t("cases.card.minutes_short", {
+                defaultValue: "{{count}} min",
+                count: pb.estMinutes,
+              })}
+            </span>
+            {pb.region && (
+              <span className="inline-flex items-center gap-1 rounded-full bg-white/15 px-2 py-0.5 text-[10px] font-medium text-white ring-1 ring-inset ring-white/20">
+                <CountryFlag
+                  code={pb.region.toLowerCase()}
+                  size={15}
+                />
+                {regionDisplayName(pb.region, i18n.language)}
+              </span>
+            )}
           </div>
-          <span className="inline-flex items-center gap-1 text-xs font-semibold text-oe-blue">
+          {roles.length > 0 && (
+            <div
+              className="flex items-center -space-x-1.5"
+              aria-label={roles
+                .map((id) =>
+                  t(ROLE_BY_ID[id]?.labelKey ?? "", {
+                    defaultValue: ROLE_BY_ID[id]?.labelDefault ?? id,
+                  }),
+                )
+                .join(", ")}
+            >
+              {shownRoles.map((id) =>
+                near ? (
+                  <RoleAvatar
+                    key={id}
+                    role={id}
+                    className="h-5 w-5 rounded-full ring-2 ring-slate-950"
+                    title={t(ROLE_BY_ID[id]?.labelKey ?? "", {
+                      defaultValue: ROLE_BY_ID[id]?.labelDefault ?? id,
+                    })}
+                  />
+                ) : null,
+              )}
+              {roles.length > 3 && (
+                <span className="ml-2 text-[10px] font-medium text-white/70">
+                  +{roles.length - 3}
+                </span>
+              )}
+            </div>
+          )}
+          <span className="inline-flex items-center gap-1 text-2xs font-semibold text-white">
             {started
               ? t("cases.card.continue", { defaultValue: "Continue" })
               : t("cases.card.open", { defaultValue: "Open" })}
-            <ArrowRight
-              size={13}
-              className="transition-transform group-hover:translate-x-0.5"
-              aria-hidden="true"
-            />
+            <ArrowRight size={12} aria-hidden="true" />
           </span>
         </div>
       </div>

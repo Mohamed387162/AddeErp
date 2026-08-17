@@ -60,6 +60,9 @@ import {
   AlertTriangle,
   Search,
   Boxes,
+  ArrowUpToLine,
+  ArrowDownToLine,
+  GripVertical,
 } from 'lucide-react';
 import clsx from 'clsx';
 import { useToastStore } from '../../stores/useToastStore';
@@ -68,12 +71,18 @@ import { useAuthStore } from '../../stores/useAuthStore';
 import { usePreferencesStore } from '../../stores/usePreferencesStore';
 import { useQueryClient } from '@tanstack/react-query';
 import { boqApi, type CreatePositionData, type Position } from '../../features/boq/api';
-import { takeoffApi } from '../../features/takeoff/api';
+import { takeoffApi, type MeasurementResponse } from '../../features/takeoff/api';
 import {
   measurementDimension,
   unitDimension,
   type MeasureDimension,
 } from '../../features/takeoff/lib/units';
+import {
+  confidenceBand,
+  countConfidenceBands,
+  type ConfidenceBand,
+  type ConfidenceThresholds,
+} from '../../features/takeoff/lib/confidenceBand';
 import { apiGet, apiPost } from '../../shared/lib/api';
 import { formatFileSize } from '../../shared/lib/formatters';
 import { convertBetween } from '../../shared/lib/unitConversion';
@@ -146,9 +155,38 @@ import {
   type TextMatch,
 } from '../../features/takeoff/lib/takeoff-textsearch';
 import {
+  ANNOTATION_TYPES,
   computeGroupSummaries,
   formatGroupTotal,
 } from '../../features/takeoff/lib/takeoff-groups';
+import {
+  formatCountQuantity,
+  formatFixedDigits,
+  formatMaxDigits,
+} from '../../features/takeoff/lib/measurement-format';
+import { localizedUnitCode } from '@/shared/lib/unitLabels';
+import {
+  groupColorCommit,
+  groupColorIdentity,
+  hydrateGroupColors,
+  resolveMeasurementColor,
+  retargetGroupColor,
+  stampGroupColors,
+} from '../../features/takeoff/lib/takeoff-colors';
+import {
+  sortByPaintOrder,
+  groupBands,
+  groupBandCommit,
+  groupOf,
+  reorderGroups,
+  freezeGroupBands,
+  hydrateGroupBands,
+  stampGroupBands,
+  orderKeyForEdge,
+  planMeasurementDrop,
+} from '../../features/takeoff/lib/takeoff-order';
+import { seedAnnotationCounters } from '../../features/takeoff/lib/takeoff-labels';
+import { displayGroupName } from '../../features/takeoff/lib/group-labels';
 import {
   effectiveQuantity,
   hasQuantityFactor,
@@ -174,6 +212,12 @@ import {
   displayUnitFor,
   measurementLabel,
 } from '../../features/takeoff/lib/takeoff-display-units';
+import { ElementCostMatchPanel } from '@/features/match';
+import { openLink } from '@/shared/lib/desktop';
+// Type-only: the scale-source vocabulary is a closed set owned by the backend
+// contract, so the viewer reuses it instead of restating it as a bare string.
+import type { ScaleSource } from '@/features/takeoff/api';
+import { fmtPercent } from '@/shared/lib/formatters';
 
 // Configure PDF.js worker — bundled locally (no CDN dependency)
 pdfjsLib.GlobalWorkerOptions.workerSrc = new URL(
@@ -234,6 +278,29 @@ const boqQuantity = (value: number): number => {
   return Math.round(value * 1e4) / 1e4;
 };
 
+/** Map a takeoff measurement to a canonical quantities dict for cost
+ *  matching: area measurements feed area_m2, volumes feed volume_m3,
+ *  lines/polylines feed length_m, counts feed count. */
+function pdfMeasurementQuantities(m: {
+  type: string;
+  value: number;
+}): Record<string, number> {
+  if (!Number.isFinite(m.value)) return {};
+  switch (m.type) {
+    case 'area':
+      return { area_m2: m.value };
+    case 'volume':
+      return { volume_m3: m.value };
+    case 'count':
+      return { count: m.value };
+    case 'distance':
+    case 'polyline':
+      return { length_m: m.value };
+    default:
+      return {};
+  }
+}
+
 /** i18n descriptors for a measure dimension, used by the dimension-guard
  *  toast (mirrors the backend ``push_quantity`` guard, which refuses the
  *  push silently - the UI surfaces the mismatch instead). */
@@ -245,6 +312,60 @@ const DIMENSION_LABELS: Readonly<Record<MeasureDimension, { key: string; fallbac
   count: { key: 'takeoff.dim_count', fallback: 'count' },
   lsum: { key: 'takeoff.dim_lsum', fallback: 'lump sum' },
   time: { key: 'takeoff.dim_time', fallback: 'time' },
+};
+
+/** Badge colours per confidence band.
+ *
+ *  Green / amber / red is the platform's agreed reading for an AI result, so
+ *  the band is legible before the number is read. ``unknown`` keeps the violet
+ *  "this came from a detector" tone rather than borrowing red: the offline
+ *  Recognize path proposes geometry without scoring it, and painting that as
+ *  low confidence would invent a judgement nothing made. */
+const CONFIDENCE_BAND_CLASSES: Record<ConfidenceBand, string> = {
+  high: 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-300',
+  medium: 'bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-300',
+  low: 'bg-rose-100 text-rose-700 dark:bg-rose-900/40 dark:text-rose-300',
+  unknown: 'bg-violet-100 text-violet-700 dark:bg-violet-900/40 dark:text-violet-300',
+};
+
+/** Plain wording for each band, used in the badge tooltip and the review bar. */
+const CONFIDENCE_BAND_TEXT: Record<ConfidenceBand, { key: string; fallback: string }> = {
+  high: { key: 'takeoff_viewer.confidence_high', fallback: 'High confidence' },
+  medium: { key: 'takeoff_viewer.confidence_medium', fallback: 'Medium confidence' },
+  low: { key: 'takeoff_viewer.confidence_low', fallback: 'Low confidence' },
+  unknown: { key: 'takeoff_viewer.confidence_unknown', fallback: 'Not scored' },
+};
+
+/** How each stored scale provenance reads to an estimator. A value absent from
+ *  this map (including a source added server-side ahead of this client) falls
+ *  back to "Unknown", which is also what a row with no source at all shows -
+ *  the honest answer, and the one that matters when a sheet turns out to have
+ *  been measured at the wrong ratio. */
+// Keyed by the closed union rather than by `string`, so adding a source to the
+// backend vocabulary without giving it a label here is a build error instead of
+// a row that silently renders as "Unknown".
+const SCALE_SOURCE_TEXT: Record<ScaleSource, { key: string; fallback: string }> = {
+  manual_calibration: {
+    key: 'takeoff_viewer.scale_source_manual_calibration',
+    fallback: 'Calibrated on this sheet',
+  },
+  preset: { key: 'takeoff_viewer.scale_source_preset', fallback: 'Document scale' },
+  inherited: {
+    key: 'takeoff_viewer.scale_source_inherited',
+    fallback: "Inherited from the sheet's scale",
+  },
+  page_text: {
+    key: 'takeoff_viewer.scale_source_page_text',
+    fallback: 'Read from the drawing text',
+  },
+  recovered_text: {
+    key: 'takeoff_viewer.scale_source_recovered_text',
+    fallback: 'Recovered from the sheet by OCR',
+  },
+  vision_read: {
+    key: 'takeoff_viewer.scale_source_vision_read',
+    fallback: 'Read from the drawing by the model',
+  },
 };
 
 interface Point {
@@ -263,6 +384,8 @@ interface Measurement {
   annotation: string; // User-provided text label (e.g. "Living room wall")
   page: number;
   group: string; // Measurement group (e.g. "General", "Structural")
+  /** Mirrored copy of the group's band (issue #393); see takeoff-types.ts. */
+  groupBand?: number;
   depth?: number; // Depth in real units, only for volume type
   area?: number; // Area in real units, only for volume type
   text?: string; // Text content for text annotations
@@ -292,6 +415,13 @@ interface Measurement {
    *  metadata blob (like fillAlpha/strokeWidth) instead of being localStorage-
    *  only. Distinct from `color`, which is a per-measurement override. */
   groupColor?: string;
+  /** Explicit paint (z) order key (issue #379). Higher = painted later = on
+   *  top; drives the canvas paint pass, the click hit-test precedence and the
+   *  PDF export. Undefined on a measurement the user never reordered: it then
+   *  falls back to its position in the measurements array (creation order,
+   *  #375), so existing measurements are unchanged. Round-trips via the metadata
+   *  blob like the other per-measurement overrides. */
+  order?: number;
   /** Free-form notes entered via the properties panel. */
   notes?: string;
   /** Opening deduction: an `area` measurement that represents a void
@@ -309,12 +439,28 @@ interface Measurement {
   linkedBoqId?: string;
   /** Human label of the linked position (description), for tooltip. */
   linkedPositionLabel?: string;
-  /** AI-suggested but not yet confirmed by the user (issue #194 Recognize).
-   *  Suggested measurements render dashed/translucent and are NEVER persisted
-   *  until the user accepts them (which clears this flag). */
+  /** Proposed by a detector and not yet reviewed by a human (issue #194).
+   *  Renders dashed/translucent and stays out of the totals until someone
+   *  accepts it. It IS stored server-side as a `proposed` row - the flag
+   *  mirrors that state rather than meaning "unsaved", so a rejection is a
+   *  decision the next reload respects instead of an undo waiting to happen. */
   suggested?: boolean;
   /** Recognition confidence 0..1, present only on AI-sourced measurements. */
   confidence?: number;
+  /** Where the scale used to compute this measurement came from, or undefined
+   *  when it was never recorded. This is CAPTURE provenance: it is written
+   *  together with the ratio it describes and never on its own, so the two
+   *  always refer to the same moment. Rendered as "Unknown" when missing,
+   *  because on a mis-scaled sheet "we do not know" is the useful answer.
+   *  Mirrors the field of the same name on the shared `Measurement` in
+   *  `features/takeoff/lib/takeoff-types.ts`. */
+  scaleSource?: ScaleSource;
+}
+
+/** Narrow to a measurement the server already holds, so a review decision can
+ *  be addressed to a real row without an assertion at the call site. */
+function isPersisted(m: Measurement): m is Measurement & { serverId: string } {
+  return Boolean(m.serverId);
 }
 
 /* ── Annotation Colors ───────────────────────────────────────────── */
@@ -376,7 +522,56 @@ type UndoOperation =
   // In-canvas geometry edit (#194 Feature 1). Both kinds snapshot the
   // pre-edit measurement so undo restores the exact prior geometry +
   // derived value; redo replays the post-edit snapshot.
-  | { kind: 'edit_geometry'; measurementId: string; previousMeasurement: Measurement; nextMeasurement: Measurement };
+  | { kind: 'edit_geometry'; measurementId: string; previousMeasurement: Measurement; nextMeasurement: Measurement }
+  // Paint-order change (issue #379: bring-to-front / send-to-back). Stores the
+  // previous and next `order` keys (undefined = "no explicit order") so undo
+  // restores the persisted key rather than a remembered list index, keeping the
+  // stack correct under concurrent edits.
+  // ``regrouped`` marks a drop that also moved the row between groups (issue
+  // #393), and is the only thing undo and redo may branch on. A group name is
+  // legitimately the empty string, so testing the names for truthiness would
+  // read a real move out of an unnamed group as no move at all and undo would
+  // leave the row where the redo put it. The two names cannot collapse into one
+  // field either, since undoing needs the name to go back to and that is gone
+  // once the move has been applied.
+  | {
+      kind: 'reorder_measurement';
+      measurementId: string;
+      previousOrder: number | undefined;
+      nextOrder: number;
+      regrouped?: boolean;
+      previousGroup?: string;
+      nextGroup?: string;
+    }
+  // A drop that had to renumber a whole group because the gap it was released
+  // into could no longer hold a distinct key (issue #405). It is a separate kind
+  // rather than optional extra fields on the frame above, because that frame has
+  // three producers: bring-to-front, send-to-back and the ordinary drop, all of
+  // which move exactly one row. Widening it would have left every one of them
+  // carrying a shape they never fill, and undo branching on which shape it got.
+  // ``regrouped`` and the group names mean what they mean above, and apply to
+  // ``measurementId``, the one row the user actually dragged; the rest of
+  // ``rows`` only changed key. ``previousOrder`` is undefined for a row that had
+  // never been reordered, which undo has to write back as undefined rather than
+  // skip, or the row keeps a key the renumber invented.
+  | {
+      kind: 'renumber_measurement_order';
+      rows: { id: string; previousOrder: number | undefined; nextOrder: number }[];
+      measurementId: string;
+      regrouped?: boolean;
+      previousGroup?: string;
+      nextGroup?: string;
+    }
+  // Dragging a group block to a new slot (issue #400). Unlike a measurement
+  // reorder this rewrites the band of EVERY group in one step, so the frame
+  // carries whole maps rather than one key. The previous map is frequently
+  // empty, which is a real state and not a missing value: it means no group had
+  // ever been pinned and every band was derived.
+  | {
+      kind: 'reorder_groups';
+      previousBands: Record<string, number>;
+      nextBands: Record<string, number>;
+    };
 
 /* ── Component ─────────────────────────────────────────────────────── */
 
@@ -397,14 +592,26 @@ interface TakeoffViewerModuleProps {
   /** Optional filename to associate with the pre-loaded PDF (display only). */
   initialPdfName?: string;
   /** Stable document UUID for this PDF (issue #238). Measurement identity is
-   *  ``projectId`` + this id, never the filename. Openers that know the id
-   *  (Project Files, filmstrip, deep-link) pass it explicitly; when omitted
-   *  it is recovered from ``initialPdfUrl``. The explicit prop wins. */
+   *  ``projectId`` + this id, never the filename. Every opener that has a
+   *  server document passes it explicitly; omitting it means "this PDF has no
+   *  server document", which is exactly the state a fresh local drop is in.
+   *  The id is never recovered by parsing ``initialPdfUrl``: that URL can point
+   *  at either namespace (``/takeoff/documents/{id}/`` or Project Files
+   *  ``/documents/{id}/``) and the two ids are not interchangeable, so a parsed
+   *  id was liable to be sent to the endpoints of the wrong namespace. */
   initialDocumentId?: string | null;
   /** Optional measurement id to auto-select + scroll-to once the measurement
    *  list lands (used by the /markups → /takeoff deep-link). Matches either
    *  the frontend id or the server-side UUID. */
   initialMeasurementId?: string | null;
+  /** Optional 1-based page to restore once a server-loaded document finishes
+   *  loading (issue #386 - reopening a document should land on the page it
+   *  was left on, not always page 1). Clamped to the loaded document's page
+   *  count. Ignored for local file uploads, which always start on page 1. */
+  initialPage?: number;
+  /** Called with the 1-based page whenever it changes on a loaded document,
+   *  so the parent can mirror it into the URL for bookmarking/sharing. */
+  onPageChange?: (page: number) => void;
   /** Previously-uploaded documents for the active project, shown on the
    *  landing page as a "Recent drawings" quick-open list. */
   recentDocuments?: RecentTakeoffDocument[];
@@ -422,10 +629,12 @@ export default function TakeoffViewerModule({
   initialPdfName,
   initialDocumentId,
   initialMeasurementId,
+  initialPage,
+  onPageChange,
   recentDocuments,
   onOpenRecentDocument,
 }: TakeoffViewerModuleProps = {}) {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
 
   // PDF state
   const [pdfDoc, setPdfDoc] = useState<pdfjsLib.PDFDocumentProxy | null>(null);
@@ -518,6 +727,34 @@ export default function TakeoffViewerModule({
   // Measurement state
   const [activeTool, setActiveTool] = useState<MeasureTool>('select');
   const [measurements, setMeasurements] = useState<Measurement[]>([]);
+  // Single ordered projection (issue #379): every paint-order consumer - the
+  // canvas paint pass, the click hit-test, the sidebar list and the PDF export
+  // - reads measurements through this so they always agree on which shape is on
+  // top. A measurement with an explicit `order` sorts by it; one without falls
+  // back to its array position (creation order, the stable #375 baseline), so
+  // rows the user never reordered paint exactly as before.
+  // Groups the user has pinned to a position (issues #393/#400). Authoritative:
+  // the copy mirrored onto each measurement is a cache of this, and is read back
+  // only when rehydrating a document. Empty until something pins, so an
+  // untouched document stores nothing and every client derives the same bands.
+  const [explicitGroupBands, setExplicitGroupBands] = useState<Record<string, number>>({});
+
+  // Where each group's block sits relative to the other groups (issue #394).
+  // A group used to have no position of its own: it rendered wherever its
+  // earliest member happened to land in the flat paint order, so restacking one
+  // measurement dragged its whole group with it. Bands give the group its own
+  // slot; a pinned group keeps the band it was pinned at, and everything else
+  // falls back to first appearance in the array (creation order), which no
+  // per-measurement reorder can touch. Derived over the WHOLE document, not the
+  // current page, because the band map is per document.
+  const groupBandMap = useMemo(
+    () => groupBands(measurements, explicitGroupBands),
+    [measurements, explicitGroupBands],
+  );
+  const orderedMeasurements = useMemo(
+    () => sortByPaintOrder(measurements, groupBandMap),
+    [measurements, groupBandMap],
+  );
   const [activePoints, setActivePoints] = useState<Point[]>([]);
   const [countLabel, setCountLabel] = useState(t('takeoff_viewer.default_count_label', { defaultValue: 'Element' }));
   // Focused/selected by Enter while the Count tool is armed, so the user can
@@ -890,6 +1127,12 @@ export default function TakeoffViewerModule({
   // not applicable (e.g. a freshly dropped local file).
   const [noTextLayer, setNoTextLayer] = useState<{ count: number; pages: number[] } | null>(null);
   const [noTextBannerDismissed, setNoTextBannerDismissed] = useState(false);
+  // The server document's own project (from the metadata fetch below). Fallback
+  // identity for measurement persistence when no project is active in the app
+  // header: without it a document opened from /markups or the documents tab on
+  // a clean profile never fetches its measurements - the screen does not ask,
+  // it just renders an empty ledger. The header project, when set, still wins.
+  const [docProjectId, setDocProjectId] = useState<string | null>(null);
   const activeProjectId = useProjectContextStore((s) => s.activeProjectId);
   const activeProjectName = useProjectContextStore((s) => s.activeProjectName);
 
@@ -919,8 +1162,30 @@ export default function TakeoffViewerModule({
     // (scale_pixels_per_unit) so the server-side B8 recompute uses the same
     // ratio the row was drawn at.
     scale,
-    projectId: activeProjectId,
+    // The header project wins; the document's own project fills in when no
+    // project is active so a server document still loads its measurements.
+    projectId: activeProjectId || docProjectId,
   });
+
+  /* ── Seed default-label counters from hydrated measurements (issue #384) ─
+   * The per-type counters (annotationCounterRef) reset to 0 on every load path
+   * and were never re-seeded from the measurements that hydrate afterwards, so a
+   * reopened document recounted from 1 and produced a duplicate "Distance 1"
+   * next to the one already on the sheet (labels feed the BOQ export, where a
+   * duplicate is ambiguous). Raise each per-type counter to the highest trailing
+   * number already present so the next auto label resumes above the numbers in
+   * use. Monotonic (never lowered): deleting the highest-numbered measurement
+   * does not free its number for reuse, and the brief window during an in-place
+   * re-upload can only over-count (skip a number), never duplicate. */
+  useEffect(() => {
+    if (measurements.length === 0) return;
+    const seeded = seedAnnotationCounters(measurements);
+    const counters = annotationCounterRef.current;
+    for (const type of Object.keys(seeded)) {
+      const n = seeded[type]!;
+      if (n > (counters[type] ?? 0)) counters[type] = n;
+    }
+  }, [measurements]);
 
   /* ── Deep-link: auto-select measurement from /markups ─────────────────
    * The /markups hub deep-links here with ``?measurementId=<uuid>``. After
@@ -933,6 +1198,11 @@ export default function TakeoffViewerModule({
    * Guarded by a ref so we only consume the param once per mount — the
    * user is free to click around afterwards without us yanking them back. */
   const deepLinkConsumedRef = useRef<string | null>(null);
+  /** Guards the ``initialPage`` restore (issue #386) so it is applied once
+   *  per mount, mirroring ``deepLinkConsumedRef`` above. The viewer is keyed
+   *  by document id and remounts on document switch, so a fresh mount always
+   *  gets a fresh ref. */
+  const initialPageConsumedRef = useRef(false);
   useEffect(() => {
     if (!initialMeasurementId) return;
     if (deepLinkConsumedRef.current === initialMeasurementId) return;
@@ -1006,12 +1276,28 @@ export default function TakeoffViewerModule({
     setSettingScale(false);
     setCalibrationMode(false);
     setScalePoints([]);
+    // Clear the live draw/calibration preview so no rubber-band or snap ring
+    // carries over to the new page (#367).
+    setLiveCursor(null);
+    setSnapPoint(null);
     // Abandon any in-flight in-canvas edit drag so it cannot bleed onto the
     // new page (#194).
     dragRef.current = null;
     activeVertexRef.current = null;
     setDragPreview(null);
   }, [currentPage]);
+
+  /* ── Mirror the current page back to the parent (issue #386) ──────────
+   * Guarded on `pdfDoc` being loaded: before the document finishes loading,
+   * `currentPage` still holds its mount-time default (1), and emitting that
+   * here would overwrite a deep-linked `?page=` in the URL before the
+   * restore above has had a chance to apply it. Once `pdfDoc` is set, the
+   * restore has already run in the same update (both are set together in
+   * the load effect), so `currentPage` is always the resolved value here. */
+  useEffect(() => {
+    if (!pdfDoc) return;
+    onPageChange?.(currentPage);
+  }, [currentPage, pdfDoc, onPageChange]);
 
   /* Deselect a measurement that lives on a different page than the one
    * being viewed — keeps Properties panel coherent with the canvas. */
@@ -1052,7 +1338,17 @@ export default function TakeoffViewerModule({
         if (cancelled) return;
         setPdfDoc(doc);
         setTotalPages(doc.numPages);
-        setCurrentPage(1);
+        // Restore the page the document was left on (issue #386) rather than
+        // always landing on page 1, so reopening a takeoff document (or
+        // sharing/bookmarking a `?page=` link) returns to the same sheet.
+        // Consumed once per mount; a fresh mount (new document, new key) gets
+        // a fresh ref, so switching documents never leaks the old page.
+        if (initialPage && !initialPageConsumedRef.current) {
+          initialPageConsumedRef.current = true;
+          setCurrentPage(Math.max(1, Math.min(initialPage, doc.numPages)));
+        } else {
+          setCurrentPage(1);
+        }
         setFileName(initialPdfName || 'Document.pdf');
         setActivePoints([]);
         undoStackRef.current = [];
@@ -1083,19 +1379,16 @@ export default function TakeoffViewerModule({
   }, [initialPdfUrl, initialPdfName]);
 
   /* ── Fetch server-side document metadata (text-layer audit) ───────── */
-  // When a PDF is opened from the server (filmstrip / deep link) the URL is
-  // ``/v1/takeoff/documents/{id}/download/``. We pull the document metadata so
-  // the viewer can flag pages that came back with no text layer (likely
-  // scanned drawings that need OCR). Best-effort: any failure leaves the
-  // banner hidden rather than blocking the drawing.
+  // When a PDF is opened from the server (filmstrip / deep link) we pull the
+  // document metadata so the viewer can flag pages that came back with no text
+  // layer (likely scanned drawings that need OCR). Keyed off ``documentId`` so
+  // that dropping a local file takes the banner down with it instead of
+  // leaving the previous drawing's OCR verdict on screen. Best-effort: any
+  // failure leaves the banner hidden rather than blocking the drawing.
   useEffect(() => {
     setNoTextLayer(null);
-    if (!initialPdfUrl) {
-      setNoTextBannerDismissed(false);
-      return;
-    }
-    const match = initialPdfUrl.match(/\/documents\/([^/?#]+)/);
-    const docId = match?.[1];
+    setDocProjectId(null);
+    const docId = documentId;
     if (!docId) {
       setNoTextBannerDismissed(false);
       return;
@@ -1106,8 +1399,7 @@ export default function TakeoffViewerModule({
     // following the takeoff.groupColors.<id> idiom used in this component.
     let dismissed = false;
     try {
-      dismissed =
-        localStorage.getItem(`takeoff.ocrBannerDismissed.${decodeURIComponent(docId)}`) === 'true';
+      dismissed = localStorage.getItem(`takeoff.ocrBannerDismissed.${docId}`) === 'true';
     } catch {
       /* ignore private-mode / quota read failures */
     }
@@ -1115,8 +1407,9 @@ export default function TakeoffViewerModule({
     let cancelled = false;
     (async () => {
       try {
-        const meta = await takeoffApi.getDocument(decodeURIComponent(docId));
+        const meta = await takeoffApi.getDocument(docId);
         if (cancelled || !meta) return;
+        setDocProjectId(meta.project_id ?? null);
         const count = meta.pages_without_text ?? 0;
         if (count > 0) {
           setNoTextLayer({ count, pages: meta.pages_without_text_list ?? [] });
@@ -1126,31 +1419,21 @@ export default function TakeoffViewerModule({
       }
     })();
     return () => { cancelled = true; };
-  }, [initialPdfUrl]);
+  }, [documentId]);
 
-  /* ── Resolve the stable document UUID (issue #238) ────────────────────
-   * Measurement identity is projectId + this id, never the filename. The
-   * explicit ``initialDocumentId`` prop wins (the opener knows it); when
-   * absent we recover the id from the download URL. Both the takeoff
-   * (``/takeoff/documents/{id}/``) and Project Files (``/documents/{id}/``)
-   * URLs carry it in the same capture group. A fresh local drop has neither
-   * a prop nor a server URL, so documentId stays null and the persistence
-   * hook keeps that file local-only until an upload yields a real id. */
+  /* ── Track the stable document UUID (issue #238) ──────────────────────
+   * Measurement identity is projectId + this id, never the filename. The id
+   * comes from the opener and from nowhere else. It is deliberately NOT
+   * recovered from ``initialPdfUrl``: that URL may belong to either document
+   * namespace, and a Project Files id sent to a takeoff endpoint 404s.
+   *
+   * This effect only mirrors the prop. ``documentId`` is the live truth and
+   * can diverge from it: dropping a local file clears the id while the prop
+   * and the URL still describe the previously opened server document. Server
+   * calls must therefore read ``documentId``, never the prop. */
   useEffect(() => {
-    if (initialDocumentId) {
-      setDocumentId(initialDocumentId);
-      return;
-    }
-    if (initialPdfUrl) {
-      const m = initialPdfUrl.match(/\/documents\/([^/?#]+)/);
-      if (m?.[1]) {
-        setDocumentId(decodeURIComponent(m[1]));
-        return;
-      }
-    }
-    // No explicit id and no server URL to recover one from.
-    setDocumentId(null);
-  }, [initialDocumentId, initialPdfUrl]);
+    setDocumentId(initialDocumentId ?? null);
+  }, [initialDocumentId]);
 
   /* Custom group colours (issue #313) persist per document so a colour scheme
    * survives a reload. A still-local file (documentId null) keeps them for the
@@ -1176,45 +1459,61 @@ export default function TakeoffViewerModule({
     }
   }, [documentId, customGroupColors]);
 
-  /* Server-side group-colour persistence (issue #313). localStorage alone left
-   * a re-coloured group blue for a second user / another machine. The metadata
-   * blob on each measurement DOES round-trip to the server (like the #311/#312
-   * per-measurement styles), so mirror each group's custom colour onto its
-   * measurements' `groupColor`: that stamps the sync-signature, PATCHes the
-   * rows, and comes back through `fromApiFormat` -> the reconstruction effect
-   * below. Guarded so it only re-renders when a colour actually drifts (no
-   * migration, no new schema). */
+  /* Server-side group-colour persistence (issues #313/#398). localStorage alone
+   * left a re-coloured group blue for a second user / another machine. The
+   * metadata blob on each measurement DOES round-trip to the server (like the
+   * #311/#312 per-measurement styles), so each group's custom colour is
+   * mirrored onto its measurements' `groupColor`: that stamps the
+   * sync-signature, PATCHes the rows, and comes back through `fromApiFormat`.
+   *
+   * `customGroupColors` is the authority and the mirror is its cache, so this
+   * runs in ONE direction. It used to be two standing effects writing at each
+   * other, each reading a snapshot the other had already invalidated; once the
+   * two copies disagreed neither could win, so the pair alternated forever,
+   * kept the affected rows permanently dirty (which re-armed the debounced save
+   * before it could ever fire) and persisted the inconsistent map, so a reload
+   * resumed the loop rather than ending it.
+   *
+   * The one moment the mirror feeds the map is hydration, which is how a colour
+   * chosen elsewhere arrives at all. {@link groupColorCommit} owns that gate;
+   * hydration runs once per document and does not also stamp, so exactly one
+   * copy is written per commit. Both writes go through functional updaters so
+   * they compose with anything an earlier effect queued in the same batch. */
+  const colorIdentity = groupColorIdentity(activeProjectId, documentId, fileName);
+  const [groupColorsHydratedFor, setGroupColorsHydratedFor] = useState<string | null>(null);
   useEffect(() => {
-    setMeasurements((prev) => {
-      let changed = false;
-      const next = prev.map((m) => {
-        const gc = customGroupColors[m.group];
-        if (gc === undefined || m.groupColor === gc) return m;
-        changed = true;
-        return { ...m, groupColor: gc };
-      });
-      return changed ? next : prev;
-    });
-  }, [customGroupColors, measurements]);
+    const action = groupColorCommit(
+      { colors: customGroupColors, measurements, hydratedFor: groupColorsHydratedFor },
+      colorIdentity,
+    );
+    if (action.colors) {
+      setCustomGroupColors((prev) => hydrateGroupColors(prev, measurements));
+      setGroupColorsHydratedFor(action.hydratedFor);
+    }
+    if (action.measurements) {
+      setMeasurements((prev) => stampGroupColors(prev, customGroupColors));
+    }
+  }, [customGroupColors, measurements, groupColorsHydratedFor, colorIdentity]);
 
-  /* Rebuild the group-colour map from measurements loaded off the server
-   * (issue #313): a colour set on another machine arrives in each measurement's
-   * `groupColor`, so fold it back into `customGroupColors` where the canvas,
-   * legend and colour picker read it. Guarded to avoid a render loop with the
-   * stamping effect above (they converge to the same value). */
+  /* Group bands ride the same one-way pair as the colours above (issue #393):
+   * the map is authoritative, the copy on each measurement is a cache of it,
+   * and the copy is read back only while rehydrating a document. Keyed on the
+   * same document identity, so opening a second file cannot fold the first
+   * file's group order into it. */
+  const [groupBandsHydratedFor, setGroupBandsHydratedFor] = useState<string | null>(null);
   useEffect(() => {
-    setCustomGroupColors((prev) => {
-      let changed = false;
-      const next = { ...prev };
-      for (const m of measurements) {
-        if (m.groupColor && next[m.group] !== m.groupColor) {
-          next[m.group] = m.groupColor;
-          changed = true;
-        }
-      }
-      return changed ? next : prev;
-    });
-  }, [measurements]);
+    const action = groupBandCommit(
+      { bands: explicitGroupBands, items: measurements, hydratedFor: groupBandsHydratedFor },
+      colorIdentity,
+    );
+    if (action.bands) {
+      setExplicitGroupBands((prev) => hydrateGroupBands(prev, measurements));
+      setGroupBandsHydratedFor(action.hydratedFor);
+    }
+    if (action.items) {
+      setMeasurements((prev) => stampGroupBands(prev, explicitGroupBands));
+    }
+  }, [explicitGroupBands, measurements, groupBandsHydratedFor, colorIdentity]);
 
   /* ── Reset per-document caches when the open PDF changes ──────────────
    * Thumbnails and extracted text layers are keyed by page number, so they
@@ -1575,15 +1874,17 @@ export default function TakeoffViewerModule({
       };
     })();
 
-    // Draw completed measurements on current page (respecting group visibility)
-    for (const rawM of measurements.filter((m) => m.page === currentPage && !hiddenGroups.has(m.group) && !hiddenMeasurements.has(m.id) && !(isAnnotationType(m.type) && hiddenGroups.has('__annotations__')))) {
+    // Draw completed measurements on current page (respecting group visibility).
+    // Iterate the ordered projection (issue #379) so an explicit z-order drives
+    // which shape paints on top; un-ordered rows keep creation order (#375).
+    for (const rawM of orderedMeasurements.filter((m) => m.page === currentPage && !hiddenGroups.has(m.group) && !hiddenMeasurements.has(m.id) && !(isAnnotationType(m.type) && hiddenGroups.has('__annotations__')))) {
       // Repoint the dragged measurement to its live geometry (#357); the rest of
       // the loop then draws the band / labels / dots from the cursor position.
       const m = previewMeasurement && previewMeasurement.id === rawM.id ? previewMeasurement : rawM;
       // A per-measurement colour (set via the properties swatch) wins over the
       // group default so a recoloured measurement paints in its chosen colour
       // (issue #299); annotation markups already resolve `m.color` below.
-      const color = m.color || groupColorMap[m.group] || '#3B82F6';
+      const color = resolveMeasurementColor(m, groupColorMap);
       ctx.strokeStyle = color;
       ctx.fillStyle = color;
       // Optional per-measurement stroke width (issues #312/#339). A real-world
@@ -1992,6 +2293,7 @@ export default function TakeoffViewerModule({
     // closing edge back to the first vertex hints the area a polygon will
     // enclose. Skipped while panning (the cursor is not placing points).
     if (
+      !settingScale &&
       liveCursor &&
       !panning &&
       activePoints.length > 0 &&
@@ -2023,7 +2325,7 @@ export default function TakeoffViewerModule({
     }
 
     // In-progress rectangle/highlight drag preview
-    if (rectStartPoint && isDraggingRect && activePoints.length === 1) {
+    if (!settingScale && rectStartPoint && isDraggingRect && activePoints.length === 1) {
       const p0 = rectStartPoint;
       const p1 = activePoints[0]!;
       const rx = Math.min(p0.x, p1.x) * dpr * zoom;
@@ -2232,8 +2534,9 @@ export default function TakeoffViewerModule({
 
     // Snap-to-vertex cue (issue #303): a ring at the existing vertex the
     // in-progress point will lock onto, so the connection is visible before the
-    // click lands. Drawn last so it sits above everything.
-    if (snapPoint) {
+    // click lands. Drawn last so it sits above everything. Suppressed while a
+    // scale calibration is armed so a stale draw-snap ring cannot linger (#367).
+    if (snapPoint && !settingScale) {
       ctx.save();
       ctx.setLineDash([]);
       ctx.globalAlpha = 1;
@@ -2244,7 +2547,7 @@ export default function TakeoffViewerModule({
       ctx.stroke();
       ctx.restore();
     }
-  }, [measurements, activePoints, currentPage, zoom, settingScale, scalePoints, activeTool, hiddenGroups, hiddenMeasurements, scale, pageScales, annotationColor, rectStartPoint, isDraggingRect, selectedMeasurementId, dragPreview, liveCursor, panning, searchMatches, activeMatchIdx, measurementSystem, snapPoint, showLabels, showDimensions, renderNonce, groupColorMap]);
+  }, [measurements, orderedMeasurements, activePoints, currentPage, zoom, settingScale, scalePoints, activeTool, hiddenGroups, hiddenMeasurements, scale, pageScales, annotationColor, rectStartPoint, isDraggingRect, selectedMeasurementId, dragPreview, liveCursor, panning, searchMatches, activeMatchIdx, measurementSystem, snapPoint, showLabels, showDimensions, renderNonce, groupColorMap]);
 
   /* ── Canvas click handler ────────────────────────────────────────── */
 
@@ -2508,6 +2811,10 @@ export default function TakeoffViewerModule({
           const np1 = newPoints[1]!;
           const dist = pixelDistance(np0.x, np0.y, np1.x, np1.y);
           setSettingScale(false);
+          // The pick is done: clear the live preview so no rubber-band / snap
+          // ring is left frozen behind the calibration dialog (#367).
+          setLiveCursor(null);
+          setSnapPoint(null);
           if (calibrationMode) {
             // Route to the new multi-unit calibration dialog.
             setCalibrationPixels(dist);
@@ -2915,6 +3222,12 @@ export default function TakeoffViewerModule({
   currentPageRef.current = currentPage;
   const hiddenGroupsRef = useRef(hiddenGroups);
   hiddenGroupsRef.current = hiddenGroups;
+  // Read by the group drag (issue #400), which must see the pinned map as it
+  // stands at the moment of the drop rather than as it stood when the handler
+  // was created, or two drags in a row would compute the second from a stale
+  // map and undo the first.
+  const explicitGroupBandsRef = useRef(explicitGroupBands);
+  explicitGroupBandsRef.current = explicitGroupBands;
   const hiddenMeasurementsRef = useRef(hiddenMeasurements);
   hiddenMeasurementsRef.current = hiddenMeasurements;
   const selectedMeasurementIdRef = useRef(selectedMeasurementId);
@@ -2938,7 +3251,15 @@ export default function TakeoffViewerModule({
     const page = currentPageRef.current;
     const hidden = hiddenGroupsRef.current;
     const hiddenM = hiddenMeasurementsRef.current;
-    return measurementsRef.current.filter(
+    // Return in paint (z) order (issue #379) so the caller's reverse scan
+    // ("top-to-bottom") selects the measurement drawn on top when shapes
+    // overlap, matching the canvas paint pass. Banded by group like the paint
+    // pass (issue #394): derived here from the ref rather than read from the
+    // memo above so this stays a zero-dependency callback, and the derivation
+    // is a pure function of the same array the memo uses, so the two cannot
+    // disagree about which shape is on top.
+    const all = measurementsRef.current;
+    return sortByPaintOrder(all, groupBands(all)).filter(
       (m) =>
         m.page === page &&
         !m.suggested &&
@@ -3400,6 +3721,10 @@ export default function TakeoffViewerModule({
     setCalibrationMode(true);
     setSettingScale(true);
     setScalePoints([]);
+    // Drop any draw-tool live preview so no rubber-band / snap ring from an
+    // in-progress measurement tracks the calibration cursor or lingers (#367).
+    setLiveCursor(null);
+    setSnapPoint(null);
   }, []);
 
   /** User confirmed the calibration dialog — persist the new scale.
@@ -3421,12 +3746,14 @@ export default function TakeoffViewerModule({
       // Prefer the user's own entry/unit; fall back to derived metres.
       const badge = entry ?? { realLength: meters, unit: 'm' as const };
       setLastCalibrationByPage((prev) => ({ ...prev, [page]: badge }));
+      // Locale-aware digits (K-15): the raw JS number printed "2.74" into
+      // German text, where a dot reads as a thousands separator.
       const metricSuffix =
-        badge.unit === 'm' ? '' : ` (${meters.toFixed(2)} m)`;
+        badge.unit === 'm' ? '' : ` (${formatFixedDigits(meters, 2)} m)`;
       addToast({
         type: 'success',
         title: t('takeoff_viewer.calibrated', { defaultValue: 'Scale calibrated' }),
-        message: `${formatScaleRatio(nextScale)} · ${badge.realLength} ${badge.unit}${metricSuffix} · ${t('takeoff_viewer.calibrated_page', { defaultValue: 'page {{page}}', page })}`,
+        message: `${formatScaleRatio(nextScale)} · ${formatMaxDigits(badge.realLength, 3)} ${badge.unit}${metricSuffix} · ${t('takeoff_viewer.calibrated_page', { defaultValue: 'page {{page}}', page })}`,
       });
     },
     [addToast, t, calibrationPixels, currentPage, setScale],
@@ -3435,6 +3762,8 @@ export default function TakeoffViewerModule({
   const handleCalibrationCancel = useCallback(() => {
     setShowCalibrationDialog(false);
     setScalePoints([]);
+    setLiveCursor(null);
+    setSnapPoint(null);
   }, []);
 
   /* ── Recalculate measurements when a PAGE'S scale changes ─────────────
@@ -3728,13 +4057,14 @@ export default function TakeoffViewerModule({
    *  such tool is drawing so the HUD hides. */
   const drawReadout: DrawReadout | null = useMemo(() => {
     if (
+      settingScale ||
       !liveCursor ||
       !(activeTool === 'distance' || activeTool === 'polyline' || activeTool === 'area' || activeTool === 'volume')
     ) {
       return null;
     }
     return computeDrawReadout(activePoints, liveCursor, scale);
-  }, [liveCursor, activeTool, activePoints, scale]);
+  }, [settingScale, liveCursor, activeTool, activePoints, scale]);
 
   /** The measurement currently hovered in select mode (for the tooltip). */
   const hoverMeasurement = useMemo(
@@ -3802,8 +4132,10 @@ export default function TakeoffViewerModule({
   /* ── Measurement summary ─────────────────────────────────────────── */
 
   const pageMeasurements = useMemo(
-    () => measurements.filter((m) => m.page === currentPage),
-    [measurements, currentPage],
+    // Derive from the ordered projection (issue #379) so the sidebar list and
+    // the group blocks list measurements in the same z-order they paint in.
+    () => orderedMeasurements.filter((m) => m.page === currentPage),
+    [orderedMeasurements, currentPage],
   );
 
   /** Measurement count per 1-indexed page, for the thumbnail badge and the
@@ -3813,13 +4145,23 @@ export default function TakeoffViewerModule({
     [measurements],
   );
 
-  /** Group page measurements by their group name */
+  /** Group page measurements by their group name.
+   *
+   *  A Map, not a plain object, because the iteration order IS the group order
+   *  the sidebar renders (issue #394): bucketing the band-major projection in
+   *  order puts each group where its band says it belongs. An object would not
+   *  preserve that. Integer-like string keys are enumerated numerically ahead of
+   *  every other key, so groups named for levels or zones ("1", "2", "10") would
+   *  sort themselves to the top in numeric order regardless of their band, which
+   *  is exactly the naming a construction takeoff uses. A Map keeps insertion
+   *  order for every key shape. */
   const groupedPageMeasurements = useMemo(() => {
-    const groups: Record<string, Measurement[]> = {};
+    const groups = new Map<string, Measurement[]>();
     for (const m of pageMeasurements) {
       const g = m.group || 'General';
-      if (!groups[g]) groups[g] = [];
-      groups[g]!.push(m);
+      const list = groups.get(g);
+      if (list) list.push(m);
+      else groups.set(g, [m]);
     }
     return groups;
   }, [pageMeasurements]);
@@ -3951,15 +4293,28 @@ export default function TakeoffViewerModule({
     return Array.from(names);
   }, [measurements]);
 
-  /** Patch an arbitrary set of fields on the currently-selected measurement. */
+  /** Patch an arbitrary set of fields on the currently-selected measurement.
+   *
+   *  A patch that reassigns `group` re-points the row's mirrored group colour at
+   *  the DESTINATION group in the same step (issue #397). Left alone, the row
+   *  arrives in its new group still carrying the colour of the one it left, and
+   *  that stale mirror is what a later hydration publishes to the whole
+   *  destination group - so one property edit silently rewrote a group-level
+   *  setting. The retarget happens BEFORE the rest of the patch is applied, so
+   *  an explicit `groupColor` in the same patch still wins. */
   const updateSelectedMeasurement = useCallback(
     (patch: Partial<Measurement>) => {
       if (!selectedMeasurementId) return;
       setMeasurements((prev) =>
-        prev.map((m) => (m.id === selectedMeasurementId ? { ...m, ...patch } : m)),
+        prev.map((m) => {
+          if (m.id !== selectedMeasurementId) return m;
+          return patch.group === undefined
+            ? { ...m, ...patch }
+            : { ...retargetGroupColor(m, patch.group, customGroupColors), ...patch };
+        }),
       );
     },
-    [selectedMeasurementId],
+    [selectedMeasurementId, customGroupColors],
   );
 
   // Latest selected measurement in a ref so the width-seed effect can read it
@@ -4152,6 +4507,185 @@ export default function TakeoffViewerModule({
     if (!wasHidden) setSelectedMeasurementId((cur) => (cur === id ? null : cur));
   }, []);
 
+  /** Bring a measurement to the front / send it to the back of the paint stack
+   *  (issue #379). Sets only the moved row's `order` key (max+1 for front,
+   *  min-1 for back among the page's measurements), so a reorder is a single
+   *  one-row edit that re-PATCHes through the persistence signature and drives
+   *  the canvas paint, hit-test, sidebar and export via the shared ordered
+   *  projection. Undoable; the key round-trips via metadata so it survives a
+   *  reload. */
+  const reorderMeasurement = useCallback((id: string, edge: 'front' | 'back') => {
+    const all = measurementsRef.current;
+    const target = all.find((m) => m.id === id);
+    if (!target) return;
+    // Compute the edge key over the WHOLE array (not just this page): the
+    // shared ordered projection uses full-array indices for un-ordered rows as
+    // the fallback, so the new key must be derived on the same basis to land
+    // strictly at the top / bottom. A global max/min still sits at the page's
+    // edge, so bring-to-front / send-to-back reads correctly on the page too.
+    const nextOrder = orderKeyForEdge(all, edge);
+    if (nextOrder === null || nextOrder === target.order) return;
+    pushUndo({
+      kind: 'reorder_measurement',
+      measurementId: id,
+      previousOrder: target.order,
+      nextOrder,
+    });
+    setMeasurements((prev) =>
+      prev.map((m) => (m.id === id ? { ...m, order: nextOrder } : m)),
+    );
+  }, [pushUndo]);
+
+  // Drag-to-reorder state for the sidebar Measurements list (issue #379). Holds
+  // the id of the row currently being dragged (via its grip handle) and the row
+  // it is hovering over, so the list can show a drop indicator. Kept in state
+  // (not a ref) because the drop indicator is a visual affordance that must
+  // re-render; cleared on drop / drag-end.
+  const [draggingMeasurementId, setDraggingMeasurementId] = useState<string | null>(null);
+  // Hovered row AND which of its two halves the pointer is in (issue #392).
+  // Held as one object so moving across the midpoint is a single render and the
+  // indicator cannot be drawn for a row with a stale half.
+  const [dragOverTarget, setDragOverTarget] = useState<
+    { id: string; place: 'before' | 'after' } | null
+  >(null);
+
+  /** Drop a dragged measurement next to another row in the sidebar list,
+   *  reordering the paint (z) stack accordingly (issue #379). Computes a single
+   *  fractional ``order`` key that lands the dragged row next to the target in
+   *  the shared paint-order projection, so canvas paint, hit-test, sidebar list
+   *  and PDF export stay in agreement. One-row edit, undoable, and persisted via
+   *  metadata like bring-to-front / send-to-back.
+   *
+   *  A drop onto a row of another group moves the measurement into that group
+   *  (issue #393). Before, the list drew a drop indicator over the foreign row
+   *  and then wrote only an order key, which the banded projection confines to
+   *  the dragged row's own group, so the gesture looked accepted and did
+   *  nothing. Regrouping by dragging is also the obvious way to ask for it. */
+  const reorderMeasurementByDrag = useCallback((
+    draggedId: string,
+    targetId: string,
+    place: 'before' | 'after',
+  ) => {
+    const all = measurementsRef.current;
+    const dragged = all.find((m) => m.id === draggedId);
+    const target = all.find((m) => m.id === targetId);
+    if (!dragged || !target) return;
+    // The sidebar lists rows in ascending paint order, so "before" puts the
+    // dragged shape just beneath the hovered row and "after" just above it.
+    // Which one is decided by the half of the row the pointer was in when it
+    // was released (issue #392), not fixed: with "before" as the only option
+    // the slot after the last row of a group had no gesture that reached it.
+    // Usually one fractional key. When the gap between the two neighbours has
+    // been halved until float64 has nothing left between them, the plan comes
+    // back as a renumber of the whole group instead (issue #405), because a
+    // midpoint that rounds onto its own bound puts the row on the wrong side of
+    // the row it was dropped against, and every export reads that same wrong
+    // projection.
+    const plan = planMeasurementDrop(all, draggedId, targetId, place);
+    if (plan === null) return;
+    // Compare through the same normalisation the projection buckets with, so a
+    // row whose group is the empty string is not "moved" into General, which
+    // is where it already renders. Recorded only when it really changes.
+    const previousGroup = dragged.group;
+    const changesGroup = groupOf(dragged) !== groupOf(target);
+    const nextGroup = changesGroup ? target.group : undefined;
+    // Pin every group where it is on screen BEFORE the move. Bands otherwise
+    // default to first appearance in the array, so moving the first-appearing
+    // member of a group out of it re-derives that group from its next member,
+    // and two group blocks trade places because the user dragged one row. Only
+    // a regrouping drop needs this; a restack cannot change any group's first
+    // appearance, and pinning on every drag would make the derived default dead
+    // code in every document.
+    if (changesGroup) {
+      setExplicitGroupBands((prev) => freezeGroupBands(all, prev));
+    }
+    const regroup = changesGroup ? { regrouped: true, previousGroup, nextGroup } : {};
+    if (plan.kind === 'single') {
+      pushUndo({
+        kind: 'reorder_measurement',
+        measurementId: draggedId,
+        previousOrder: dragged.order,
+        nextOrder: plan.order,
+        ...regroup,
+      });
+      setMeasurements((prev) =>
+        prev.map((m) =>
+          m.id === draggedId
+            ? { ...m, order: plan.order, ...(changesGroup ? { group: target.group } : {}) }
+            : m,
+        ),
+      );
+      return;
+    }
+    // Renumbered group. The keys are read off the array the plan was computed
+    // from, so the frame records what each row held before this drop rather than
+    // what it holds by the time the state update runs.
+    const rows = [...plan.orders].map(([id, nextOrder]) => ({
+      id,
+      previousOrder: all.find((m) => m.id === id)?.order,
+      nextOrder,
+    }));
+    pushUndo({
+      kind: 'renumber_measurement_order',
+      rows,
+      measurementId: draggedId,
+      ...regroup,
+    });
+    setMeasurements((prev) =>
+      prev.map((m) => {
+        const next = plan.orders.get(m.id);
+        if (next === undefined) return m;
+        return {
+          ...m,
+          order: next,
+          ...(changesGroup && m.id === draggedId ? { group: target.group } : {}),
+        };
+      }),
+    );
+  }, [pushUndo]);
+
+  // Group-block drag state (issue #400), the group-level twin of the row drag
+  // above. Separate from it so a half-finished row drag can never be read as a
+  // group drag: the two gestures start on different handles and drop on
+  // different targets, and sharing one slot would let a stray dragOver on a
+  // group header pick up a row id.
+  const [draggingGroup, setDraggingGroup] = useState<string | null>(null);
+  const [dragOverGroup, setDragOverGroup] = useState<
+    { name: string; place: 'before' | 'after' } | null
+  >(null);
+
+  /** Move a whole group block to a new slot in the sidebar (issue #400).
+   *
+   *  Until now a group had no gesture of its own: the only way to get one block
+   *  above another was to move its measurements one at a time, and after #394
+   *  that stopped working entirely, correctly, since a measurement can no longer
+   *  drag its group anywhere.
+   *
+   *  Renumbers every group in the document rather than handing the dragged one a
+   *  fractional band. Bands with no explicit entry are derived AFTER the highest
+   *  explicit one, so pinning the dragged group alone would push every untouched
+   *  group above it and land the drop nowhere near where it was made. */
+  const reorderGroupByDrag = useCallback((
+    draggedGroup: string,
+    targetGroup: string,
+    place: 'before' | 'after',
+  ) => {
+    const all = measurementsRef.current;
+    // EVERY group in the document in its current on-screen order, not the groups
+    // on this page. The band map is per document, so renumbering only the
+    // visible subset would drop the band of every group living on another sheet
+    // and reshuffle pages the user was not even looking at.
+    const currentBands = groupBands(all, explicitGroupBandsRef.current);
+    const displayed = [...new Set(all.map(groupOf))].sort(
+      (a, b) => (currentBands[a] ?? 0) - (currentBands[b] ?? 0),
+    );
+    const nextBands = reorderGroups(displayed, draggedGroup, targetGroup, place);
+    if (nextBands === null) return;
+    const previousBands = explicitGroupBandsRef.current;
+    pushUndo({ kind: 'reorder_groups', previousBands, nextBands });
+    setExplicitGroupBands(nextBands);
+  }, [pushUndo]);
+
   /** Toggle collapse of a measurement group in sidebar */
   const toggleGroupCollapse = useCallback((groupName: string) => {
     setCollapsedGroups((prev) => {
@@ -4169,9 +4703,13 @@ export default function TakeoffViewerModule({
   const handleExportCSV = useCallback(() => {
     if (measurements.length === 0) return;
     const rows: string[] = ['Group,Type,Annotation,Value,Unit,Page'];
-    // Group measurements by group name for subtotals
+    // Bucket by group for subtotals, walking the SCREEN order rather than the
+    // raw array: `orderedMeasurements` is what the canvas and the list paint,
+    // so a user who reordered rows gets a CSV in the order they are looking at.
+    // Bucketing preserves the walk order within each group, which is why the
+    // sort has to happen here rather than per bucket.
     const byGroup: Record<string, Measurement[]> = {};
-    for (const m of measurements) {
+    for (const m of orderedMeasurements) {
       const g = m.group || 'General';
       if (!byGroup[g]) byGroup[g] = [];
       byGroup[g]!.push(m);
@@ -4241,7 +4779,10 @@ export default function TakeoffViewerModule({
     link.click();
     URL.revokeObjectURL(url);
     addToast({ type: 'success', title: t('takeoff.csv_exported', { defaultValue: 'Measurements exported to CSV' }) });
-  }, [measurements, addToast, t, measurementSystem]);
+    // `measurements` stays in the deps alongside `orderedMeasurements`: the
+    // early return still reads its length, so dropping it would staleness-trap
+    // the empty check.
+  }, [measurements, orderedMeasurements, addToast, t, measurementSystem]);
 
   /**
    * Resolve the human-friendly project name for export filenames.
@@ -4478,19 +5019,40 @@ export default function TakeoffViewerModule({
   const [armCountSimilar, setArmCountSimilar] = useState(false);
   const [countSimilarBusy, setCountSimilarBusy] = useState(false);
 
+  /** The server's own confidence cut points, so a suggestion is described in
+   *  the viewer exactly as the server counts it. Null until /plan-read/meta
+   *  resolves (see the probe effect below, which fills both this and vision
+   *  availability from one call); the band helper falls back meanwhile. */
+  const [confidenceThresholds, setConfidenceThresholds] = useState<ConfidenceThresholds | null>(null);
+
   /** Number of unconfirmed AI suggestions currently on the canvas. */
   const suggestionCount = useMemo(
     () => measurements.filter((m) => m.suggested).length,
     [measurements],
   );
 
+  /** How the pending suggestions split across the confidence bands.
+   *
+   *  "Accept all" over forty high-confidence proposals and "Accept all" over
+   *  forty the detector is unsure about are different decisions, and the bar
+   *  could not tell them apart while the score lived only inside each row. */
+  const suggestionBands = useMemo(
+    () =>
+      countConfidenceBands(
+        measurements.filter((m) => m.suggested).map((m) => m.confidence),
+        confidenceThresholds,
+      ),
+    [measurements, confidenceThresholds],
+  );
+
   /** Scan the current page's vector layer and drop suggested measurements.
    *  Suggestions are flagged (never persisted) until the user accepts them. */
   const handleRecognize = useCallback(async () => {
     if (recognizeBusy) return;
-    // The server reads the stored PDF off disk, so it needs the document's
-    // id, which the deep-link download URL carries.
-    const docId = initialPdfUrl?.match(/\/documents\/([^/?#]+)\/(?:download|recognize)/)?.[1];
+    // The server reads the stored PDF off disk, so it needs the takeoff
+    // document's id. Null means the on-screen PDF has no server document
+    // (a local drop), and recognition cannot run against it.
+    const docId = documentId;
     if (!docId) {
       addToast({
         type: 'info',
@@ -4528,6 +5090,10 @@ export default function TakeoffViewerModule({
               : t('takeoff_viewer.recognize_uncalibrated', { defaultValue: 'calibrate for value' });
         return {
           id: `sug_${Date.now()}_${i}`,
+          // The detector stored this candidate as a `proposed` row before
+          // answering, so carry its id: accepting or rejecting is a server
+          // decision that outlives the reload, not a local flag.
+          serverId: c.measurement_id ?? undefined,
           type: mType,
           points: c.points.map((p) => ({ x: p.x, y: p.y })),
           value,
@@ -4555,7 +5121,7 @@ export default function TakeoffViewerModule({
     } finally {
       setRecognizeBusy(false);
     }
-  }, [recognizeBusy, initialPdfUrl, currentPage, scale, activeGroup, nextAnnotation, addToast, t]);
+  }, [recognizeBusy, documentId, currentPage, scale, activeGroup, nextAnnotation, addToast, t]);
 
   /* ── Count similar: seeded "count by example" (issue #194) ──────────────
    * The user arms the tool and clicks one symbol (a door, socket, column).
@@ -4567,7 +5133,7 @@ export default function TakeoffViewerModule({
    * through (identical to how handleRecognize consumes its candidate points). */
   const handleCountByExampleSeed = useCallback(
     async (seed: Point) => {
-      const docId = initialPdfUrl?.match(/\/documents\/([^/?#]+)\/(?:download|recognize)/)?.[1];
+      const docId = documentId;
       if (!docId) {
         addToast({
           type: 'info',
@@ -4607,9 +5173,15 @@ export default function TakeoffViewerModule({
           return;
         }
         const points = hits.map((h) => ({ x: h.x, y: h.y }));
-        const avgConfidence = hits.reduce((s, h) => s + (h.confidence ?? 0), 0) / hits.length;
+        // The weakest match in the set, matching what the server stores: the
+        // count is only as trustworthy as its worst hit, and an average lets
+        // one bad match hide behind several good ones.
+        const worstConfidence = hits.reduce((lo, h) => Math.min(lo, h.confidence ?? 0), 1);
         const suggestion: Measurement = {
           id: `sug_${Date.now()}_cnt`,
+          // The whole hit set is one stored `proposed` row; keeping its id
+          // means accepting or rejecting the count is a server decision.
+          serverId: result.measurement_id ?? undefined,
           type: 'count',
           points,
           value: points.length,
@@ -4619,7 +5191,7 @@ export default function TakeoffViewerModule({
           page: currentPage,
           group: activeGroup,
           suggested: true,
-          confidence: Math.round(avgConfidence * 100) / 100,
+          confidence: Math.round(worstConfidence * 100) / 100,
         };
         setMeasurements((prev) => [...prev, suggestion]);
         addToast({
@@ -4645,7 +5217,7 @@ export default function TakeoffViewerModule({
         armCountSimilarRef.current = false;
       }
     },
-    [initialPdfUrl, currentPage, activeGroup, nextAnnotation, addToast, t],
+    [documentId, currentPage, activeGroup, nextAnnotation, addToast, t],
   );
   // Keep the ref handleCanvasClick reads in sync with the latest closure.
   handleCountByExampleSeedRef.current = handleCountByExampleSeed;
@@ -4654,7 +5226,7 @@ export default function TakeoffViewerModule({
    *  half-drawn shape never swallows the seed click) and prompts the user to
    *  click a symbol; clicking the button again cancels. */
   const toggleCountSimilar = useCallback(() => {
-    const docId = initialPdfUrl?.match(/\/documents\/([^/?#]+)\/(?:download|recognize)/)?.[1];
+    const docId = documentId;
     if (!docId) {
       addToast({
         type: 'info',
@@ -4685,7 +5257,7 @@ export default function TakeoffViewerModule({
       }
       return next;
     });
-  }, [initialPdfUrl, addToast, t]);
+  }, [documentId, addToast, t]);
 
   /* ── Read plan with AI: vision-LLM plan reading (issue #194) ────────────
    * The opt-in, bring-your-own-key, cost-capped complement to the offline
@@ -4710,6 +5282,13 @@ export default function TakeoffViewerModule({
         const meta = await takeoffApi.planRead.meta();
         if (!cancelled && meta) {
           setPlanReadVision({ available: meta.vision_available, reason: meta.reason });
+          // Bands come from the same call. They are useful even when no vision
+          // key is configured: the offline Recognize path scores its proposals
+          // too, and those are banded against the same cut points.
+          setConfidenceThresholds({
+            high: meta.confidence_high_threshold,
+            medium: meta.confidence_medium_threshold,
+          });
         } else if (!cancelled) {
           setPlanReadVision({ available: false, reason: null });
         }
@@ -4727,7 +5306,7 @@ export default function TakeoffViewerModule({
    *  reviews and accepts (human-confirmed). Never auto-applies. */
   const handleReadWithAi = useCallback(async () => {
     if (planReadBusy) return;
-    const docId = initialPdfUrl?.match(/\/documents\/([^/?#]+)\/(?:download|recognize)/)?.[1];
+    const docId = documentId;
     const projectId = selectedProjectId || activeProjectId || '';
     if (!docId || !projectId) {
       addToast({
@@ -4772,6 +5351,23 @@ export default function TakeoffViewerModule({
         });
         return;
       }
+      // The server refuses a calibration whose ratio implies an impossible page
+      // span, because that ratio is squared into every area it derives. Rooms
+      // then come back with no quantity at all, so say why rather than letting
+      // it read as the detector having failed to measure anything.
+      const droppedItems = current.validation_report?.dropped_items;
+      if (Array.isArray(droppedItems) && droppedItems.includes('scale:implausible_calibration')) {
+        addToast({
+          type: 'warning',
+          title: t('takeoff_viewer.plan_read.scale_dropped_title', {
+            defaultValue: 'Page scale looks wrong',
+          }),
+          message: t('takeoff_viewer.plan_read.scale_dropped_msg', {
+            defaultValue:
+              'The current calibration implies an impossible page size, so the suggested rooms were left without areas. Calibrate the scale again and re-run the plan read.',
+          }),
+        });
+      }
       const proposals = await takeoffApi.planRead.proposals(run.id);
       if (proposals.length === 0) {
         addToast({
@@ -4798,6 +5394,10 @@ export default function TakeoffViewerModule({
               : t('takeoff_viewer.recognize_uncalibrated', { defaultValue: 'calibrate for value' });
         return {
           id: `ai_${run.id}_${i}`,
+          // A plan-read proposal is already a stored row; without its id the
+          // review decision stayed local and left the row sitting `proposed`
+          // in the database forever.
+          serverId: p.id,
           type: mType,
           points: p.points.map((pt) => ({ x: pt.x, y: pt.y })),
           value: Number(value) || 0,
@@ -4832,7 +5432,7 @@ export default function TakeoffViewerModule({
     }
   }, [
     planReadBusy,
-    initialPdfUrl,
+    documentId,
     selectedProjectId,
     activeProjectId,
     currentPage,
@@ -4843,26 +5443,215 @@ export default function TakeoffViewerModule({
     t,
   ]);
 
-  /** Accept one suggestion: clear the flag so it persists on the next sync. */
-  const acceptSuggestion = useCallback((id: string) => {
-    setMeasurements((prev) => prev.map((m) => (m.id === id ? { ...m, suggested: false } : m)));
-  }, []);
+  /* ── Reviewing a suggestion (issue #194) ─────────────────────────────────
+   * Every detector now stores what it proposes as a `proposed` row before it
+   * answers, so a review decision is a server call, not a local flag. That is
+   * the whole point: a rejection used to be a filter() the next reload undid,
+   * and a colleague opening the same sheet saw everything again.
+   *
+   * A confirmed row is what the totals, the export and the estimator count, so
+   * the accept path takes its value back FROM the server response rather than
+   * keeping the detector's claim. The server re-derives the quantity from the
+   * geometry it stored, and those two numbers genuinely differ when a detector
+   * over-claims; writing the local copy back would undo the correction on the
+   * next sync.
+   *
+   * Geometry is deliberately NOT sent on a plain accept. The server stamps
+   * `geometry_edited` whenever points arrive, and a truthful flag is what lets
+   * a later rule tell a real correction from a rubber stamp. */
 
-  /** Reject one suggestion: drop it (it was never persisted). */
-  const rejectSuggestion = useCallback((id: string) => {
-    setMeasurements((prev) => prev.filter((m) => m.id !== id));
-    setSelectedMeasurementId((cur) => (cur === id ? null : cur));
-  }, []);
+  /* A bulk decision is in flight. The ref is what the guard reads: two clicks
+   * inside one frame both see the old state value, and the second round would
+   * then collect a 409 per row from decisions the first round already made. */
+  const [reviewBusy, setReviewBusy] = useState(false);
+  const reviewBusyRef = useRef(false);
 
-  /** Accept every pending suggestion at once. */
-  const acceptAllSuggestions = useCallback(() => {
-    setMeasurements((prev) => prev.map((m) => (m.suggested ? { ...m, suggested: false } : m)));
-  }, []);
+  /** Push one review decision for a row the server already holds.
+   *
+   *  Takes the id rather than the measurement on purpose. A suggestion with no
+   *  `serverId` was never persisted, and letting this quietly resolve to null
+   *  for one would make "never sent" indistinguishable from "server agreed" at
+   *  every call site. Each of them decides what to do about that explicitly. */
+  const submitReview = useCallback(
+    (serverId: string, action: 'accept' | 'reject') =>
+      takeoffApi.reviewMeasurement(serverId, { action }),
+    [],
+  );
 
-  /** Dismiss every pending suggestion at once. */
-  const dismissAllSuggestions = useCallback(() => {
-    setMeasurements((prev) => prev.filter((m) => !m.suggested));
-  }, []);
+  /** Fold a confirmed row back into its local copy.
+   *
+   *  `row` is null for a suggestion that only ever existed locally: there is
+   *  nothing to adopt, and clearing the flag is enough for the normal sync to
+   *  create it, at which point the server derives the quantity anyway.
+   *
+   *  The label is only rewritten while it is showing the quantity. On a row
+   *  hydrated from the server `label` carries the user's annotation (see
+   *  fromApiFormat), so overwriting it with a number would wipe typed text on
+   *  exactly the reload path this round-trip exists to support. */
+  const applyAcceptedRow = useCallback(
+    (m: Measurement, row: MeasurementResponse | null): Measurement => {
+      const accepted = { ...m, suggested: false };
+      if (!row) return accepted;
+      // Server-authoritative quantity: it recomputed this from the points it
+      // holds, and that number genuinely differs from the detector's claim
+      // when the detector over-claims.
+      const raw = m.type === 'count' ? (row.count_value ?? m.value) : (row.measurement_value ?? m.value);
+      const value = Number(raw) || 0;
+      const labelShowsQuantity = m.label !== m.annotation;
+      return {
+        ...accepted,
+        serverId: row.id,
+        value,
+        label: labelShowsQuantity
+          ? (m.type === 'count' ? String(value) : formatMeasurement(value, m.unit))
+          : m.label,
+      };
+    },
+    [],
+  );
+
+  /** Toast a failed decision. The row keeps its flag and stays on the canvas,
+   *  so the message only has to say the decision did not land. */
+  const reportReviewFailure = useCallback(
+    (err: unknown, action: 'accept' | 'reject') => {
+      addToast({
+        type: 'error',
+        title:
+          action === 'accept'
+            ? t('takeoff_viewer.review.accept_failed', { defaultValue: 'Could not accept the suggestion' })
+            : t('takeoff_viewer.review.reject_failed', { defaultValue: 'Could not reject the suggestion' }),
+        message:
+          err instanceof Error
+            ? err.message
+            : t('takeoff_viewer.review.retry', { defaultValue: 'Still pending, try again.' }),
+      });
+    },
+    [addToast, t],
+  );
+
+  /** Accept one suggestion: confirm it server-side, then adopt the stored row. */
+  const acceptSuggestion = useCallback(
+    async (id: string) => {
+      const target = measurementsRef.current.find((m) => m.id === id);
+      if (!target) return;
+      let row: MeasurementResponse | null = null;
+      if (target.serverId) {
+        try {
+          row = await submitReview(target.serverId, 'accept');
+        } catch (err) {
+          reportReviewFailure(err, 'accept');
+          return;
+        }
+      }
+      setMeasurements((prev) => prev.map((m) => (m.id === id ? applyAcceptedRow(m, row) : m)));
+    },
+    [submitReview, applyAcceptedRow, reportReviewFailure],
+  );
+
+  /** Reject one suggestion: record the decision, then take it off the canvas.
+   *  The row stays in the database as `rejected` - the record of what a human
+   *  turned down is the point of the queue, and it stops the same suggestion
+   *  coming back on the next run. */
+  const rejectSuggestion = useCallback(
+    async (id: string) => {
+      const target = measurementsRef.current.find((m) => m.id === id);
+      if (!target) return;
+      // A suggestion that was never persisted has no decision to record: taking
+      // it off the canvas IS the whole rejection.
+      if (target.serverId) {
+        try {
+          await submitReview(target.serverId, 'reject');
+        } catch (err) {
+          reportReviewFailure(err, 'reject');
+          return;
+        }
+      }
+      setMeasurements((prev) => prev.filter((m) => m.id !== id));
+      setSelectedMeasurementId((cur) => (cur === id ? null : cur));
+    },
+    [submitReview, reportReviewFailure],
+  );
+
+  /** Accept every pending suggestion at once.
+   *
+   *  Decisions go out in parallel and each one is judged on its own: a single
+   *  409 from a colleague who got there first must not strand the rest. Rows
+   *  the server refused stay flagged so the bar still shows work to do. */
+  const acceptAllSuggestions = useCallback(async () => {
+    if (reviewBusyRef.current) return;
+    const pending = measurementsRef.current.filter((m) => m.suggested);
+    if (pending.length === 0) return;
+    reviewBusyRef.current = true;
+    setReviewBusy(true);
+    try {
+      // Local-only rows carry no decision to send; they still count as accepted.
+      const remote = pending.filter(isPersisted);
+      const results = await Promise.allSettled(
+        remote.map((m) => submitReview(m.serverId, 'accept')),
+      );
+      const confirmed = new Map<string, MeasurementResponse | null>();
+      pending.filter((m) => !m.serverId).forEach((m) => confirmed.set(m.id, null));
+      let failures = 0;
+      remote.forEach((m, i) => {
+        const res = results[i];
+        if (res?.status === 'fulfilled') confirmed.set(m.id, res.value);
+        else failures += 1;
+      });
+      setMeasurements((prev) =>
+        prev.map((m) => (confirmed.has(m.id) ? applyAcceptedRow(m, confirmed.get(m.id) ?? null) : m)),
+      );
+      if (failures > 0) {
+        addToast({
+          type: 'error',
+          title: t('takeoff_viewer.review.accept_all_partial', {
+            defaultValue: '{{n}} suggestions could not be accepted',
+            n: failures,
+          }),
+          message: t('takeoff_viewer.review.retry', { defaultValue: 'Still pending, try again.' }),
+        });
+      }
+    } finally {
+      reviewBusyRef.current = false;
+      setReviewBusy(false);
+    }
+  }, [submitReview, applyAcceptedRow, addToast, t]);
+
+  /** Reject every pending suggestion at once, on the same terms as accept-all. */
+  const dismissAllSuggestions = useCallback(async () => {
+    if (reviewBusyRef.current) return;
+    const pending = measurementsRef.current.filter((m) => m.suggested);
+    if (pending.length === 0) return;
+    reviewBusyRef.current = true;
+    setReviewBusy(true);
+    try {
+      const remote = pending.filter(isPersisted);
+      const results = await Promise.allSettled(
+        remote.map((m) => submitReview(m.serverId, 'reject')),
+      );
+      const rejected = new Set(pending.filter((m) => !m.serverId).map((m) => m.id));
+      let failures = 0;
+      remote.forEach((m, i) => {
+        const res = results[i];
+        if (res?.status === 'fulfilled') rejected.add(m.id);
+        else failures += 1;
+      });
+      setMeasurements((prev) => prev.filter((m) => !rejected.has(m.id)));
+      setSelectedMeasurementId((cur) => (cur && rejected.has(cur) ? null : cur));
+      if (failures > 0) {
+        addToast({
+          type: 'error',
+          title: t('takeoff_viewer.review.reject_all_partial', {
+            defaultValue: '{{n}} suggestions could not be rejected',
+            n: failures,
+          }),
+          message: t('takeoff_viewer.review.retry', { defaultValue: 'Still pending, try again.' }),
+        });
+      }
+    } finally {
+      reviewBusyRef.current = false;
+      setReviewBusy(false);
+    }
+  }, [submitReview, addToast, t]);
 
   /* ── Export measurements to BOQ ────────────────────────────────── */
 
@@ -4917,7 +5706,10 @@ export default function TakeoffViewerModule({
     setIsExporting(true);
     try {
       let ordinalCounter = 1;
-      const exportableMeasurements = measurements.filter((m) => !isAnnotationType(m.type));
+      // Screen order, not array order: `ordinalCounter` numbers the BOQ
+      // positions as it walks, so reading from the raw array would hand the
+      // bill an ordering the user never saw after they reordered rows.
+      const exportableMeasurements = orderedMeasurements.filter((m) => !isAnnotationType(m.type));
       for (const m of exportableMeasurements) {
         const unitMap: Record<string, string> = { m: 'm', 'm\u00B2': 'm2', 'm\u00B3': 'm3', pcs: 'pcs' };
         const posData: CreatePositionData = {
@@ -4941,7 +5733,8 @@ export default function TakeoffViewerModule({
     } finally {
       setIsExporting(false);
     }
-  }, [selectedBoqId, measurements, addToast, t]);
+    // As in the CSV handler, `measurements` stays for the length guard above.
+  }, [selectedBoqId, measurements, orderedMeasurements, addToast, t]);
 
   const clearAll = useCallback(() => {
     // Queue a server-side delete for every synced row before wiping state
@@ -5352,7 +6145,7 @@ export default function TakeoffViewerModule({
   const handleOpenLinkedPosition = useCallback((m: Measurement) => {
     if (!m.linkedBoqId || !m.linkedPositionId) return;
     // Absolute navigation; takeoff is embedded under /takeoff route.
-    window.open(`/boq/${m.linkedBoqId}?highlight=${m.linkedPositionId}`, '_blank', 'noopener');
+    openLink(`/boq/${m.linkedBoqId}?highlight=${m.linkedPositionId}`);
   }, []);
 
   /** Ledger row click → navigate to the measurement.  Switch to its page
@@ -5627,21 +6420,27 @@ export default function TakeoffViewerModule({
         break;
 
       case 'change_annotation': {
-        // Grab the current (about-to-be-overwritten) annotation so redo
-        // can replay the forward delta by swapping again.
-        setMeasurements((prev) => {
-          const target = prev.find((m) => m.id === op.measurementId);
-          if (target) {
-            forwardOp = {
-              kind: 'change_annotation',
-              measurementId: op.measurementId,
-              previousAnnotation: target.annotation,
-            };
-          }
-          return prev.map((m) =>
+        // Capture the CURRENT (about-to-be-overwritten) annotation for the redo
+        // frame SYNCHRONOUSLY from the live ref (issue #383). Reading it inside
+        // the setMeasurements updater and pushing forwardOp right after was a
+        // bug: the updater is deferred to render, so the push below saw
+        // forwardOp still holding the popped op (the pre-edit text) and redo
+        // restored the old text instead of the edited one. measurementsRef
+        // mirrors the current state on every render, so it holds the value the
+        // user last saw.
+        const current = measurementsRef.current.find((m) => m.id === op.measurementId);
+        if (current) {
+          forwardOp = {
+            kind: 'change_annotation',
+            measurementId: op.measurementId,
+            previousAnnotation: current.annotation,
+          };
+        }
+        setMeasurements((prev) =>
+          prev.map((m) =>
             m.id === op.measurementId ? { ...m, annotation: op.previousAnnotation } : m,
-          );
-        });
+          ),
+        );
         break;
       }
 
@@ -5656,6 +6455,53 @@ export default function TakeoffViewerModule({
               : m,
           ),
         );
+        break;
+
+      case 'reorder_measurement':
+        // Restore the previous paint-order key (issue #379), and the previous
+        // group when the drop crossed one (issue #393). A plain restack leaves
+        // ``regrouped`` unset and the group is then left untouched, which is not
+        // the same as writing undefined over it. forwardOp stays the same op, so
+        // a redo re-applies both.
+        setMeasurements((prev) =>
+          prev.map((m) =>
+            m.id === op.measurementId
+              ? {
+                  ...m,
+                  order: op.previousOrder,
+                  ...(op.regrouped ? { group: op.previousGroup } : {}),
+                }
+              : m,
+          ),
+        );
+        break;
+
+      case 'renumber_measurement_order': {
+        // Put every row the renumber touched back on the key it held (issue
+        // #405). ``has`` rather than a truthiness test on the value: 0 is a real
+        // key the renumber hands out, and so is undefined on the way back.
+        const restore = new Map(op.rows.map((r) => [r.id, r.previousOrder]));
+        setMeasurements((prev) =>
+          prev.map((m) =>
+            restore.has(m.id)
+              ? {
+                  ...m,
+                  order: restore.get(m.id),
+                  ...(op.regrouped && m.id === op.measurementId
+                    ? { group: op.previousGroup }
+                    : {}),
+                }
+              : m,
+          ),
+        );
+        break;
+      }
+
+      case 'reorder_groups':
+        // Restore the whole pinned map (issue #400). An empty previous map is a
+        // real state, the one where nothing had ever been pinned, so it is
+        // written back as-is rather than treated as nothing to do.
+        setExplicitGroupBands(op.previousBands);
         break;
     }
 
@@ -5730,21 +6576,22 @@ export default function TakeoffViewerModule({
         break;
 
       case 'change_annotation': {
-        // Swap annotations again — capture the current value so a
-        // subsequent undo can revert this redo.
-        setMeasurements((prev) => {
-          const target = prev.find((m) => m.id === op.measurementId);
-          if (target) {
-            reverseOp = {
-              kind: 'change_annotation',
-              measurementId: op.measurementId,
-              previousAnnotation: target.annotation,
-            };
-          }
-          return prev.map((m) =>
+        // Capture the current value SYNCHRONOUSLY (issue #383, mirror of the
+        // undo defect) so a subsequent undo reverts to the text shown before
+        // this redo, not the stale popped op captured inside a deferred updater.
+        const current = measurementsRef.current.find((m) => m.id === op.measurementId);
+        if (current) {
+          reverseOp = {
+            kind: 'change_annotation',
+            measurementId: op.measurementId,
+            previousAnnotation: current.annotation,
+          };
+        }
+        setMeasurements((prev) =>
+          prev.map((m) =>
             m.id === op.measurementId ? { ...m, annotation: op.previousAnnotation } : m,
-          );
-        });
+          ),
+        );
         break;
       }
 
@@ -5757,6 +6604,44 @@ export default function TakeoffViewerModule({
               : m,
           ),
         );
+        break;
+
+      case 'reorder_measurement':
+        // Re-apply the paint-order key (issue #379), and the group when the drop
+        // crossed one (issue #393).
+        setMeasurements((prev) =>
+          prev.map((m) =>
+            m.id === op.measurementId
+              ? {
+                  ...m,
+                  order: op.nextOrder,
+                  ...(op.regrouped ? { group: op.nextGroup } : {}),
+                }
+              : m,
+          ),
+        );
+        break;
+
+      case 'renumber_measurement_order': {
+        // Re-apply the renumbered keys (issue #405).
+        const reapply = new Map(op.rows.map((r) => [r.id, r.nextOrder]));
+        setMeasurements((prev) =>
+          prev.map((m) =>
+            reapply.has(m.id)
+              ? {
+                  ...m,
+                  order: reapply.get(m.id),
+                  ...(op.regrouped && m.id === op.measurementId ? { group: op.nextGroup } : {}),
+                }
+              : m,
+          ),
+        );
+        break;
+      }
+
+      case 'reorder_groups':
+        // Re-apply the pinned map (issue #400).
+        setExplicitGroupBands(op.nextBands);
         break;
     }
 
@@ -5797,6 +6682,10 @@ export default function TakeoffViewerModule({
     setSettingScale(false);
     setCalibrationMode(false);
     setScalePoints([]);
+    // Drop any calibration/draw live preview so no rubber-band or snap ring is
+    // left frozen when the tool changes (#367).
+    setLiveCursor(null);
+    setSnapPoint(null);
     if (isAnnotationTool(tool)) {
       setAnnotationColor(DEFAULT_ANNOTATION_COLORS[tool]);
     }
@@ -5858,6 +6747,9 @@ export default function TakeoffViewerModule({
           setCalibrationMode(false);
           setSettingScale(false);
           setScalePoints([]);
+          // Clear the live preview so nothing is left frozen on the canvas (#367).
+          setLiveCursor(null);
+          setSnapPoint(null);
           return;
         }
         // Leave sticky pan mode (#316), mirroring a second click on the toggle.
@@ -6431,7 +7323,7 @@ export default function TakeoffViewerModule({
                 document actions; row 2 = scale + drawing tools. Related
                 controls sit in soft "segmented" tracks instead of being
                 separated by hairline dividers. */}
-            <div className="flex shrink-0 flex-col gap-1.5 rounded-lg border border-border bg-surface-primary p-1.5 shadow-xs">
+            <div className="takeoff-toolbar flex shrink-0 flex-col gap-1.5 rounded-lg border border-border bg-surface-primary p-1.5 shadow-xs">
               <div className="flex items-center gap-1 flex-wrap">
               {/* Page nav - prev / jump / next in one segmented track. */}
               <div className={TB_GROUP}>
@@ -6496,7 +7388,7 @@ export default function TakeoffViewerModule({
                   data-testid="find-on-sheet-toggle"
                 >
                   <Search size={15} />
-                  <span className="hidden sm:inline">{t('takeoff_viewer.find', { defaultValue: 'Find' })}</span>
+                  <span className="takeoff-toolbar-label">{t('takeoff_viewer.find', { defaultValue: 'Find' })}</span>
                 </button>
                 {searchOpen && (
                   <div
@@ -6610,7 +7502,7 @@ export default function TakeoffViewerModule({
                 <button onClick={zoomOut} className={tbBtn(false)} title={t('takeoff_viewer.zoom_out', { defaultValue: 'Zoom out' })} aria-label={t('takeoff_viewer.zoom_out', { defaultValue: 'Zoom out' })}>
                   <ZoomOut size={16} />
                 </button>
-                <span className="inline-flex h-7 min-w-[2.75rem] items-center justify-center px-1 text-xs tabular-nums text-content-tertiary">{(zoom * 100).toFixed(0)}%</span>
+                <span className="inline-flex h-7 min-w-[2.75rem] items-center justify-center px-1 text-xs tabular-nums text-content-tertiary">{fmtPercent(zoom * 100, 0)}</span>
                 <button onClick={zoomIn} className={tbBtn(false)} title={t('takeoff_viewer.zoom_in', { defaultValue: 'Zoom in' })} aria-label={t('takeoff_viewer.zoom_in', { defaultValue: 'Zoom in' })}>
                   <ZoomIn size={16} />
                 </button>
@@ -6676,7 +7568,7 @@ export default function TakeoffViewerModule({
                       data-testid="thumbnails-toggle"
                     >
                       <Layers size={15} />
-                      <span className="hidden sm:inline">{t('takeoff_viewer.thumbnails', { defaultValue: 'Pages' })}</span>
+                      <span className="takeoff-toolbar-label">{t('takeoff_viewer.thumbnails', { defaultValue: 'Pages' })}</span>
                     </button>
                   )}
                   <button
@@ -6688,7 +7580,7 @@ export default function TakeoffViewerModule({
                     data-testid="legend-toggle"
                   >
                     <List size={15} />
-                    <span className="hidden sm:inline">{t('takeoff_viewer.legend', { defaultValue: 'Legend' })}</span>
+                    <span className="takeoff-toolbar-label">{t('takeoff_viewer.legend', { defaultValue: 'Legend' })}</span>
                   </button>
                   {/* Declutter toggles: hide the on-canvas name badges and the
                       dimension values independently; geometry stays visible and
@@ -6702,7 +7594,7 @@ export default function TakeoffViewerModule({
                     data-testid="names-toggle"
                   >
                     <Type size={15} />
-                    <span className="hidden sm:inline">{t('takeoff_viewer.names', { defaultValue: 'Names' })}</span>
+                    <span className="takeoff-toolbar-label">{t('takeoff_viewer.names', { defaultValue: 'Names' })}</span>
                   </button>
                   <button
                     onClick={() => setShowDimensions((v) => !v)}
@@ -6713,7 +7605,7 @@ export default function TakeoffViewerModule({
                     data-testid="values-toggle"
                   >
                     <Hash size={15} />
-                    <span className="hidden sm:inline">{t('takeoff_viewer.values', { defaultValue: 'Values' })}</span>
+                    <span className="takeoff-toolbar-label">{t('takeoff_viewer.values', { defaultValue: 'Values' })}</span>
                   </button>
                   {/* Collapse the right sidebar for a larger drawing viewport (#315). */}
                   <button
@@ -6725,7 +7617,7 @@ export default function TakeoffViewerModule({
                     data-testid="sidebar-toggle"
                   >
                     <PanelRight size={15} />
-                    <span className="hidden sm:inline">{t('takeoff_viewer.panel', { defaultValue: 'Panel' })}</span>
+                    <span className="takeoff-toolbar-label">{t('takeoff_viewer.panel', { defaultValue: 'Panel' })}</span>
                   </button>
                 </div>
 
@@ -6771,7 +7663,7 @@ export default function TakeoffViewerModule({
                   data-testid="toolbar-export-pdf-button"
                 >
                   {isExportingPdf ? <Loader2 size={14} className="animate-spin" /> : <Save size={14} />}
-                  <span className="hidden sm:inline">{t('takeoff_viewer.save_pdf', { defaultValue: 'Save PDF' })}</span>
+                  <span className="takeoff-toolbar-label">{t('takeoff_viewer.save_pdf', { defaultValue: 'Save PDF' })}</span>
                 </button>
 
                 {/* New file */}
@@ -6790,7 +7682,7 @@ export default function TakeoffViewerModule({
               <div className={TB_GROUP}>
                 {/* Scale */}
                 <button
-                  onClick={() => { setCalibrationMode(false); setSettingScale(true); setScalePoints([]); }}
+                  onClick={() => { setCalibrationMode(false); setSettingScale(true); setScalePoints([]); setLiveCursor(null); setSnapPoint(null); }}
                   className={tbBtn(settingScale && !calibrationMode, 'purple')}
                   title={t('takeoff_viewer.set_scale', { defaultValue: 'Set scale' })}
                   aria-label={t('takeoff_viewer.set_scale', { defaultValue: 'Set scale' })}
@@ -6809,7 +7701,7 @@ export default function TakeoffViewerModule({
                   data-testid="calibrate-button"
                 >
                   <Ruler size={15} />
-                  <span className="hidden sm:inline">{t('takeoff_viewer.calibrate', { defaultValue: 'Calibrate' })}</span>
+                  <span className="hidden sm:inline">{t('takeoff_viewer.calibrate_short', { defaultValue: 'Calibrate' })}</span>
                 </button>
               </div>
 
@@ -6963,9 +7855,13 @@ export default function TakeoffViewerModule({
                 directly below the toolbar so the two toolbar rows stay clean.
                 Only for server-side documents (it needs a document id to scan)
                 and hidden while actively setting or calibrating scale so it
-                never competes with those flows. Nothing auto-applies - the
-                user confirms via "Use this" (CLAUDE.md rule 7). */}
-            {documentId && !calibrationMode && !settingScale && (
+                never competes with those flows. Also hidden once the page is
+                calibrated (applied or manual) - the suggestion has nothing
+                left to offer once a scale already exists for this page, and
+                calibration is persisted per page so it stays hidden on reopen
+                (issue #387). Nothing auto-applies - the user confirms via
+                "Use this" (CLAUDE.md rule 7). */}
+            {documentId && !calibrationMode && !settingScale && !isCalibrated && (
               <ScaleAutoDetect
                 documentId={documentId}
                 pageNumber={currentPage}
@@ -7115,7 +8011,7 @@ export default function TakeoffViewerModule({
                     <span className="uppercase tracking-wide text-[10px]">
                       {t('takeoff_viewer.tooltip_group', { defaultValue: 'Group' })}
                     </span>
-                    <span>{hoverMeasurement.group || 'General'}</span>
+                    <span>{displayGroupName(hoverMeasurement.group || 'General')}</span>
                   </div>
                   <div className="mt-0.5 text-[10px]">
                     {hoverMeasurement.linkedPositionOrdinal ? (
@@ -7225,10 +8121,12 @@ export default function TakeoffViewerModule({
                         : t('takeoff_viewer.scale_click_second', { defaultValue: 'Click second point' }))}
                 </div>
               )}
-              {/* AI suggestions review bar (#194) — appears when Recognize has
-                  dropped unconfirmed proposals. Accept-all clears the flags so
-                  they persist; dismiss-all drops them. Per-item accept/reject
-                  lives in the measurement list below. */}
+              {/* AI suggestions review bar (#194) - appears when a detector has
+                  left unconfirmed proposals. Both decisions now go to the
+                  server: accept-all confirms the rows so they count towards the
+                  totals, dismiss-all records the rejection so the same
+                  suggestion does not come back on the next run. Per-item
+                  accept/reject lives in the measurement list below. */}
               {suggestionCount > 0 && (
                 <div
                   className="absolute top-2 left-1/2 -translate-x-1/2 z-10 flex items-center gap-2 rounded-full border border-violet-300/60 bg-white/95 dark:bg-gray-800/95 px-3 py-1.5 shadow-lg backdrop-blur"
@@ -7238,16 +8136,37 @@ export default function TakeoffViewerModule({
                   <span className="text-xs font-medium text-content-primary whitespace-nowrap">
                     {t('takeoff_viewer.suggestions_pending', { defaultValue: '{{n}} AI suggestions', n: suggestionCount })}
                   </span>
+                  {/* "Accept all" confirms the weak proposals along with the
+                      strong ones, and the bar had no way to say so: the score
+                      was visible only per row, in a list the user had to open.
+                      Naming the count here is what makes the button an
+                      informed decision rather than a gamble. */}
+                  {suggestionBands.low > 0 && (
+                    <span
+                      className="rounded-full bg-rose-100 px-1.5 py-0.5 text-[10px] font-semibold text-rose-700 dark:bg-rose-900/40 dark:text-rose-300 whitespace-nowrap"
+                      title={t('takeoff_viewer.suggestions_low_hint', {
+                        defaultValue: 'Accept all confirms these too. Check them first.',
+                      })}
+                      data-testid="suggestions-low-confidence"
+                    >
+                      {t('takeoff_viewer.suggestions_low_confidence', {
+                        defaultValue: '{{n}} low confidence',
+                        n: suggestionBands.low,
+                      })}
+                    </span>
+                  )}
                   <button
-                    onClick={acceptAllSuggestions}
-                    className="rounded-full bg-emerald-500 px-2.5 py-1 text-[11px] font-semibold text-white hover:bg-emerald-600 transition-colors"
+                    onClick={() => void acceptAllSuggestions()}
+                    disabled={reviewBusy}
+                    className="rounded-full bg-emerald-500 px-2.5 py-1 text-[11px] font-semibold text-white hover:bg-emerald-600 transition-colors disabled:opacity-60 disabled:cursor-wait"
                     data-testid="accept-all-suggestions"
                   >
                     {t('takeoff_viewer.accept_all', { defaultValue: 'Accept all' })}
                   </button>
                   <button
-                    onClick={dismissAllSuggestions}
-                    className="rounded-full bg-surface-secondary px-2.5 py-1 text-[11px] font-semibold text-content-secondary hover:bg-surface-tertiary transition-colors"
+                    onClick={() => void dismissAllSuggestions()}
+                    disabled={reviewBusy}
+                    className="rounded-full bg-surface-secondary px-2.5 py-1 text-[11px] font-semibold text-content-secondary hover:bg-surface-tertiary transition-colors disabled:opacity-60 disabled:cursor-wait"
                     data-testid="dismiss-all-suggestions"
                   >
                     {t('takeoff_viewer.dismiss_all', { defaultValue: 'Dismiss all' })}
@@ -7346,7 +8265,7 @@ export default function TakeoffViewerModule({
                       const allGroupsOnPage = new Set<string>();
                       for (const m of pageMeasurements) allGroupsOnPage.add(m.group || 'General');
                       const visible = new Map(legendSummaries.map((s) => [s.name, s]));
-                      const rows: Array<{ name: string; color: string; count: number; total: number; unit: string; hidden: boolean }> = [];
+                      const rows: Array<{ name: string; color: string; count: number; total: number; unit: string; isCount: boolean; hidden: boolean }> = [];
                       for (const name of Array.from(allGroupsOnPage).sort()) {
                         // Derive hidden from hiddenGroups directly, never from a
                         // group's absence in the summaries: a visible group whose
@@ -7370,12 +8289,16 @@ export default function TakeoffViewerModule({
                               (m.group || 'General') === name &&
                               (groupHidden || !hiddenMeasurements.has(m.id)),
                           );
+                          const quantifiable = items.filter((it) => !ANNOTATION_TYPES.has(it.type));
                           rows.push({
                             name,
                             color: groupColorMap[name] || '#3B82F6',
                             count: items.length,
                             total: items.reduce((s, it) => s + it.value, 0),
                             unit: items.find((it) => it.unit)?.unit ?? '',
+                            isCount:
+                              quantifiable.length > 0 &&
+                              quantifiable.every((it) => it.type === 'count'),
                             hidden: groupHidden,
                           });
                         }
@@ -7402,7 +8325,7 @@ export default function TakeoffViewerModule({
                             style={{ backgroundColor: row.color }}
                           />
                           <span className="flex-1 text-[11px] font-semibold text-content-primary truncate">
-                            {row.name}
+                            {displayGroupName(row.name)}
                           </span>
                           <span className="text-[10px] font-mono text-content-tertiary tabular-nums">
                             {row.count}
@@ -7410,7 +8333,14 @@ export default function TakeoffViewerModule({
                           <span className="text-[10px] font-mono text-content-secondary tabular-nums min-w-0">
                             {(() => {
                               const d = convertQuantity(row.total, row.unit, measurementSystem);
-                              return formatGroupTotal(d.value, d.unit);
+                              // Count-only groups render whole pieces (K-14);
+                              // the unit takes the locale's trade code (de: Stk).
+                              return formatGroupTotal(
+                                d.value,
+                                localizedUnitCode(d.unit, i18n.language),
+                                undefined,
+                                row.isCount,
+                              );
                             })()}
                           </span>
                           {row.hidden
@@ -7446,7 +8376,7 @@ export default function TakeoffViewerModule({
                     scale.unitLabel,
                     measurementSystem,
                   );
-                  return `1px = ${perPixel.value.toFixed(4)} ${perPixel.unit}`;
+                  return `1px = ${formatFixedDigits(perPixel.value, 4)} ${perPixel.unit}`;
                 })()}
               </p>
               <div className="mt-2 flex gap-1 flex-wrap">
@@ -7501,7 +8431,7 @@ export default function TakeoffViewerModule({
                   data-testid="active-group-select"
                 >
                   {Array.from(new Set([...availableGroups, activeGroup])).map((g) => (
-                    <option key={g} value={g}>{g}</option>
+                    <option key={g} value={g}>{displayGroupName(g)}</option>
                   ))}
                   <option value="__new__">
                     {t('takeoff_viewer.new_group', { defaultValue: '+ New group' })}
@@ -7724,8 +8654,7 @@ export default function TakeoffViewerModule({
                     fileKind="takeoff"
                     fileId={selectedMeasurement.serverId}
                     onChipClick={(ref) => {
-                      const openTab = (path: string) =>
-                        window.open(path, '_blank', 'noopener');
+                      const openTab = (path: string) => openLink(path);
                       switch (ref.target_type) {
                         case 'rfi':
                           openTab(`/rfi/${ref.target_id}`);
@@ -7774,7 +8703,7 @@ export default function TakeoffViewerModule({
                     data-testid="prop-group-select"
                   >
                     {availableGroups.map((g) => (
-                      <option key={g} value={g}>{g}</option>
+                      <option key={g} value={g}>{displayGroupName(g)}</option>
                     ))}
                     <option value="__new__">{t('takeoff_viewer.new_group', { defaultValue: '+ New group' })}</option>
                   </select>
@@ -7808,7 +8737,7 @@ export default function TakeoffViewerModule({
                     ))}
                     <input
                       type="color"
-                      value={selectedMeasurement.color || groupColorMap[selectedMeasurement.group] || '#3B82F6'}
+                      value={resolveMeasurementColor(selectedMeasurement, groupColorMap)}
                       onChange={(e) => updateSelectedMeasurement({ color: e.target.value })}
                       className="h-5 w-6 cursor-pointer rounded border border-border bg-transparent p-0"
                       title={t('takeoff_viewer.prop_color_custom', { defaultValue: 'Custom color' })}
@@ -7816,6 +8745,51 @@ export default function TakeoffViewerModule({
                       data-testid="prop-color-custom"
                     />
                   </div>
+                  {/* Un-pin the override (issue #396). Every control above SETS
+                      a colour and none of them unsets one, so picking a colour
+                      for a single measurement used to be a one-way door: the
+                      row stopped following its group and could never be put
+                      back, because hand-matching the group's current hex pins
+                      that hex instead of restoring following. "No override" is
+                      a real stored state (group_color NULL), which is where
+                      every new measurement starts. A checkbox rather than a
+                      clear button, because the state is binary and the box also
+                      shows at a glance whether this row is pinned.
+                      Annotations (arrow, rectangle, highlight, cloud, text) are
+                      created with an explicit colour by design, so they are not
+                      offered the choice. */}
+                  {!isAnnotationType(selectedMeasurement.type) && (
+                    <label
+                      className="mt-1.5 flex cursor-pointer items-center gap-1.5"
+                      data-testid="prop-use-group-color"
+                    >
+                      <input
+                        type="checkbox"
+                        checked={!selectedMeasurement.color}
+                        onChange={(e) =>
+                          updateSelectedMeasurement(
+                            e.target.checked
+                              ? { color: undefined }
+                              : {
+                                  // Un-checking pins whatever is on screen right
+                                  // now, so the control is symmetric with the
+                                  // swatches: both land on an explicit colour.
+                                  color: resolveMeasurementColor(
+                                    selectedMeasurement,
+                                    groupColorMap,
+                                  ),
+                                },
+                          )
+                        }
+                        className="h-3.5 w-3.5 accent-oe-blue"
+                      />
+                      <span className="text-[11px] text-content-secondary">
+                        {t('takeoff_viewer.prop_use_group_color', {
+                          defaultValue: 'Use group color',
+                        })}
+                      </span>
+                    </label>
+                  )}
                 </div>
 
                 {/* Fill opacity (issue #311): area, volume and count carry a
@@ -8079,11 +9053,18 @@ export default function TakeoffViewerModule({
                       data-testid="prop-value"
                     >
                       {selectedMeasurement.value
-                        ? convertQuantity(
-                            selectedMeasurement.value,
-                            selectedMeasurement.unit || '',
-                            measurementSystem,
-                          ).value.toFixed(3)
+                        ? (() => {
+                            const v = convertQuantity(
+                              selectedMeasurement.value,
+                              selectedMeasurement.unit || '',
+                              measurementSystem,
+                            ).value;
+                            // Counts are whole pieces (K-14); measured values
+                            // keep 3 digits, locale-rendered (K-15).
+                            return selectedMeasurement.type === 'count'
+                              ? formatCountQuantity(v)
+                              : formatFixedDigits(v, 3);
+                          })()
                         : '—'}
                     </div>
                   </div>
@@ -8095,10 +9076,41 @@ export default function TakeoffViewerModule({
                       className="min-w-[44px] rounded border border-border/60 bg-surface-secondary/60 px-2 py-1 text-xs text-content-primary text-center"
                       data-testid="prop-unit"
                     >
-                      {displayUnitFor(selectedMeasurement.unit || '', measurementSystem) || '—'}
+                      {localizedUnitCode(
+                        displayUnitFor(selectedMeasurement.unit || '', measurementSystem),
+                        i18n.language,
+                      ) || '—'}
                     </div>
                   </div>
                 </div>
+
+                {/* Where the ratio behind that quantity came from. Read-only:
+                    it is recorded at capture, not chosen here. Shown for every
+                    measurement, including the ones with no source stored, so a
+                    sheet found to be mis-scaled can be narrowed to the rows
+                    that actually inherited the bad calibration instead of
+                    re-checking the whole document by hand. */}
+                {!isAnnotationType(selectedMeasurement.type) && (
+                  <div>
+                    <label className="text-[10px] font-semibold text-content-tertiary block mb-0.5">
+                      {t('takeoff_viewer.prop_scale_source', { defaultValue: 'Scale from' })}
+                    </label>
+                    <div
+                      className="w-full rounded border border-border/60 bg-surface-secondary/60 px-2 py-1 text-xs text-content-secondary"
+                      data-testid="prop-scale-source"
+                      data-scale-source={selectedMeasurement.scaleSource ?? 'unknown'}
+                    >
+                      {(() => {
+                        const stored = selectedMeasurement.scaleSource;
+                        const entry = stored ? SCALE_SOURCE_TEXT[stored] : undefined;
+                        if (entry) return t(entry.key, { defaultValue: entry.fallback });
+                        return t('takeoff_viewer.scale_source_unknown', {
+                          defaultValue: 'Unknown',
+                        });
+                      })()}
+                    </div>
+                  </div>
+                )}
 
                 {/* Opening deduction toggle - area measurements only. A
                     deduction (door / window / cut-out) is subtracted from the
@@ -8282,7 +9294,7 @@ export default function TakeoffViewerModule({
                               selectedMeasurement.unit || '',
                               measurementSystem,
                             );
-                            return `${eff.value.toFixed(3)} ${eff.unit}`;
+                            return `${formatFixedDigits(eff.value, 3)} ${localizedUnitCode(eff.unit, i18n.language)}`;
                           })()}
                         </span>
                       </div>
@@ -8410,6 +9422,61 @@ export default function TakeoffViewerModule({
                   <Trash2 size={12} />
                   {t('takeoff_viewer.prop_delete', { defaultValue: 'Delete measurement' })}
                 </button>
+
+                {/* Match to a cost position - search every loaded cost catalogue by
+                    this measurement's type/size and apply a priced BOQ position to it. */}
+                {activeProjectId && (
+                  <div className="pt-2 border-t border-oe-blue/20">
+                    <p className="text-[10px] font-bold uppercase tracking-widest text-oe-blue mb-1.5">
+                      {t('match.apply_section_title', { defaultValue: 'Find a cost position' })}
+                    </p>
+                    <div className="h-96 rounded-md border border-border-light overflow-hidden bg-surface-primary">
+                      <ElementCostMatchPanel
+                        key={selectedMeasurement.id}
+                        source="pdf"
+                        projectId={activeProjectId}
+                        elementKey={selectedMeasurement.id}
+                        compact
+                        rawElementData={{
+                          source: 'pdf',
+                          id: selectedMeasurement.id,
+                          label: selectedMeasurement.label ?? selectedMeasurement.annotation ?? '',
+                          measurementType: selectedMeasurement.type,
+                          value: selectedMeasurement.value,
+                          unit: selectedMeasurement.unit,
+                          properties: selectedMeasurement.annotation
+                            ? { note: selectedMeasurement.annotation }
+                            : {},
+                        }}
+                        envelope={{
+                          category: selectedMeasurement.type,
+                          description:
+                            selectedMeasurement.label ||
+                            selectedMeasurement.annotation ||
+                            selectedMeasurement.type,
+                          quantities: pdfMeasurementQuantities(selectedMeasurement),
+                          unitHint: selectedMeasurement.unit || null,
+                        }}
+                        quantityOverride={
+                          Number.isFinite(selectedMeasurement.value)
+                            ? selectedMeasurement.value
+                            : null
+                        }
+                        onApplied={async (result) => {
+                          // Native back-link: bind the created position to this measurement
+                          // so the takeoff row shows as linked. Only synced measurements
+                          // (with a serverId) can be linked; unsynced ones still got a
+                          // priced position created in the BOQ.
+                          if (selectedMeasurement.serverId) {
+                            await takeoffApi.linkToBoq(selectedMeasurement.serverId, result.position_id, {
+                              pushQuantity: false,
+                            });
+                          }
+                        }}
+                      />
+                    </div>
+                  </div>
+                )}
               </div>
             )}
 
@@ -8488,7 +9555,7 @@ export default function TakeoffViewerModule({
 
               <div className="space-y-2 max-h-[400px] overflow-auto">
                 {/* Measurement groups (non-annotation types) */}
-                {Object.entries(groupedPageMeasurements).map(([groupName, groupMs]) => {
+                {[...groupedPageMeasurements].map(([groupName, groupMs]) => {
                   const measurementOnly = groupMs.filter((m) => !isAnnotationType(m.type));
                   if (measurementOnly.length === 0) return null;
                   const groupColor = groupColorMap[groupName] || '#3B82F6';
@@ -8496,8 +9563,60 @@ export default function TakeoffViewerModule({
                   const isCollapsed = collapsedGroups.has(groupName);
                   return (
                     <div key={groupName}>
-                      {/* Group header */}
-                      <div className="flex items-center gap-1.5 mb-1">
+                      {/* Group header. Doubles as the drop target for a group
+                          drag (issue #400); the same half-of-the-row rule as the
+                          measurement rows decides which side the block lands on. */}
+                      <div
+                        className={clsx(
+                          'flex items-center gap-1.5 mb-1',
+                          dragOverGroup?.name === groupName
+                            && (dragOverGroup.place === 'before'
+                              ? 'border-t-2 border-t-oe-blue'
+                              : 'border-b-2 border-b-oe-blue'),
+                          draggingGroup === groupName && 'opacity-40',
+                        )}
+                        onDragOver={(e) => {
+                          if (!draggingGroup || draggingGroup === groupName) return;
+                          e.preventDefault();
+                          e.dataTransfer.dropEffect = 'move';
+                          const box = e.currentTarget.getBoundingClientRect();
+                          const place = e.clientY < box.top + box.height / 2 ? 'before' : 'after';
+                          if (dragOverGroup?.name !== groupName || dragOverGroup.place !== place) {
+                            setDragOverGroup({ name: groupName, place });
+                          }
+                        }}
+                        onDrop={(e) => {
+                          if (!draggingGroup || draggingGroup === groupName) return;
+                          e.preventDefault();
+                          const box = e.currentTarget.getBoundingClientRect();
+                          const place = e.clientY < box.top + box.height / 2 ? 'before' : 'after';
+                          reorderGroupByDrag(draggingGroup, groupName, place);
+                          setDraggingGroup(null);
+                          setDragOverGroup(null);
+                        }}
+                      >
+                        {/* Grip for the group block (issue #400). Only the grip
+                            is draggable, so collapsing or hiding a group never
+                            starts a drag by accident. */}
+                        <span
+                          draggable
+                          onDragStart={(e) => {
+                            e.stopPropagation();
+                            e.dataTransfer.effectAllowed = 'move';
+                            e.dataTransfer.setData('text/plain', groupName);
+                            setDraggingGroup(groupName);
+                          }}
+                          onDragEnd={() => {
+                            setDraggingGroup(null);
+                            setDragOverGroup(null);
+                          }}
+                          className="shrink-0 -ml-1 cursor-grab active:cursor-grabbing text-content-tertiary opacity-40 hover:opacity-100 transition-opacity"
+                          aria-label={t('takeoff_viewer.drag_group_to_reorder', { defaultValue: 'Drag to reorder group' })}
+                          title={t('takeoff_viewer.drag_group_to_reorder', { defaultValue: 'Drag to reorder group' })}
+                          data-testid="group-drag-handle"
+                        >
+                          <GripVertical size={12} />
+                        </span>
                         <button
                           onClick={() => toggleGroupCollapse(groupName)}
                           className="p-0.5 rounded hover:bg-surface-secondary text-content-tertiary transition-colors"
@@ -8537,6 +9656,38 @@ export default function TakeoffViewerModule({
                             <div
                               key={m.id}
                               onClick={() => setSelectedMeasurementId((cur) => (cur === m.id ? null : m.id))}
+                              // Drop target for drag-to-reorder (issue #379). Only a
+                              // real drag (a grip-initiated one, not a suggestion, not
+                              // the dragged row itself) enables the drop; preventDefault
+                              // on dragOver is what makes the row a valid target.
+                              onDragOver={(e) => {
+                                if (!draggingMeasurementId || draggingMeasurementId === m.id || m.suggested) return;
+                                e.preventDefault();
+                                e.dataTransfer.dropEffect = 'move';
+                                // Which half of the row the pointer is in decides
+                                // the side (issue #392). Measured against the row's
+                                // own box every time rather than cached, because the
+                                // list scrolls under the pointer during a drag.
+                                const box = e.currentTarget.getBoundingClientRect();
+                                const place = e.clientY < box.top + box.height / 2 ? 'before' : 'after';
+                                if (dragOverTarget?.id !== m.id || dragOverTarget.place !== place) {
+                                  setDragOverTarget({ id: m.id, place });
+                                }
+                              }}
+                              onDrop={(e) => {
+                                if (!draggingMeasurementId || draggingMeasurementId === m.id || m.suggested) return;
+                                e.preventDefault();
+                                // Recompute from the release point rather than
+                                // trusting the hover state: a drop can arrive
+                                // without a final dragOver on the same side, and
+                                // dropping somewhere other than where the line was
+                                // drawn is the bug this whole change is about.
+                                const box = e.currentTarget.getBoundingClientRect();
+                                const place = e.clientY < box.top + box.height / 2 ? 'before' : 'after';
+                                reorderMeasurementByDrag(draggingMeasurementId, m.id, place);
+                                setDraggingMeasurementId(null);
+                                setDragOverTarget(null);
+                              }}
                               className={clsx(
                                 'rounded-sm px-2 py-1 group/item transition-all cursor-pointer',
                                 selectedMeasurementId === m.id
@@ -8545,15 +9696,55 @@ export default function TakeoffViewerModule({
                                 // Dim a hidden measurement, keeping it listed so it
                                 // can be restored, the way hidden groups behave (#359).
                                 hiddenMeasurements.has(m.id) && 'opacity-50',
+                                // Drop indicator + dragged-row feedback (issue #379).
+                                // The line is drawn on the edge the row will land
+                                // against (issue #392); a top-only line could not
+                                // express "below this one" at all.
+                                dragOverTarget?.id === m.id
+                                  && (dragOverTarget.place === 'before'
+                                    ? 'border-t-2 border-t-oe-blue'
+                                    : 'border-b-2 border-b-oe-blue'),
+                                draggingMeasurementId === m.id && 'opacity-40',
                               )}
                               data-testid="measurement-item"
                               data-selected={selectedMeasurementId === m.id}
                               data-hidden={hiddenMeasurements.has(m.id)}
                             >
                               <div className="flex items-center gap-2 leading-tight">
+                                {/* Drag handle (issue #379): initiates a reorder of
+                                    the paint (z) stack. Only the grip is draggable so
+                                    a normal row drag never starts by accident; hidden
+                                    for unsaved AI suggestions (not persisted). */}
+                                {!m.suggested && (
+                                  <span
+                                    draggable
+                                    onClick={(e) => e.stopPropagation()}
+                                    onDragStart={(e) => {
+                                      e.dataTransfer.effectAllowed = 'move';
+                                      // Some browsers require data to be set for a drag
+                                      // to begin; the id is also read from state.
+                                      e.dataTransfer.setData('text/plain', m.id);
+                                      setDraggingMeasurementId(m.id);
+                                    }}
+                                    onDragEnd={() => {
+                                      setDraggingMeasurementId(null);
+                                      setDragOverTarget(null);
+                                    }}
+                                    className="shrink-0 -ml-1 cursor-grab active:cursor-grabbing text-content-tertiary opacity-0 group-hover/item:opacity-60 hover:opacity-100 transition-opacity"
+                                    aria-label={t('takeoff_viewer.drag_to_reorder', { defaultValue: 'Drag to reorder' })}
+                                    title={t('takeoff_viewer.drag_to_reorder', { defaultValue: 'Drag to reorder' })}
+                                    data-testid="measurement-drag-handle"
+                                  >
+                                    <GripVertical size={12} />
+                                  </span>
+                                )}
                                 <span
                                   className="h-2 w-2 rounded-full shrink-0"
-                                  style={{ backgroundColor: groupColor }}
+                                  // Resolve the per-measurement colour first, the
+                                  // same way the canvas paint pass does (issue #376);
+                                  // fall back to the group colour when the user never
+                                  // recoloured this individual measurement.
+                                  style={{ backgroundColor: m.color || groupColor }}
                                 />
                                 <div className="flex-1 min-w-0 flex items-center gap-1.5">
                                   {editingAnnotationId === m.id ? (
@@ -8583,20 +9774,40 @@ export default function TakeoffViewerModule({
                                       <Pencil size={10} className="shrink-0 opacity-0 group-hover/item:opacity-60 transition-opacity" />
                                     </button>
                                   )}
-                                  <span className="text-2xs text-content-tertiary capitalize truncate shrink">
+                                  {/* No `capitalize` here (audit case-2 K-11): the label
+                                      carries SI units, and "m²" must not render as "M²".
+                                      The sibling type badge keeps it - "distance" ->
+                                      "Distance" is a word, not a unit. */}
+                                  <span className="text-2xs text-content-tertiary truncate shrink">
                                     {/* Issue #287: show the measurement label in the
                                         user's system (m -> ft); identity for metric. */}
                                     {measurementLabel(m, scale, measurementSystem)}
                                   </span>
-                                  {m.suggested && (
-                                    <span
-                                      className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full bg-violet-100 text-violet-700 dark:bg-violet-900/40 dark:text-violet-300 text-[9px] font-semibold shrink-0"
-                                      title={t('takeoff_viewer.suggested_hint', { defaultValue: 'AI suggestion - accept to keep it' })}
-                                    >
-                                      <Sparkles size={8} />
-                                      {typeof m.confidence === 'number' ? `${Math.round(m.confidence * 100)}%` : t('takeoff_viewer.suggested', { defaultValue: 'AI' })}
-                                    </span>
-                                  )}
+                                  {m.suggested && (() => {
+                                    // The percentage on its own told a reviewer
+                                    // nothing: 62 is either fine or alarming
+                                    // depending on cut points only the server
+                                    // knows. The band carries that judgement,
+                                    // the number stays for anyone comparing two
+                                    // suggestions inside the same band.
+                                    const band = confidenceBand(m.confidence, confidenceThresholds);
+                                    const bandText = CONFIDENCE_BAND_TEXT[band];
+                                    const bandLabel = t(bandText.key, { defaultValue: bandText.fallback });
+                                    return (
+                                      <span
+                                        className={clsx(
+                                          'inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full text-[9px] font-semibold shrink-0',
+                                          CONFIDENCE_BAND_CLASSES[band],
+                                        )}
+                                        title={`${bandLabel} - ${t('takeoff_viewer.suggested_hint', { defaultValue: 'AI suggestion - accept to keep it' })}`}
+                                        data-testid="suggestion-confidence"
+                                        data-band={band}
+                                      >
+                                        <Sparkles size={8} />
+                                        {typeof m.confidence === 'number' ? `${Math.round(m.confidence * 100)}%` : t('takeoff_viewer.suggested', { defaultValue: 'AI' })}
+                                      </span>
+                                    );
+                                  })()}
                                   {m.linkedPositionOrdinal && (
                                     <button
                                       type="button"
@@ -8614,7 +9825,7 @@ export default function TakeoffViewerModule({
                                   {m.suggested && (
                                     <>
                                       <button
-                                        onClick={(e) => { e.stopPropagation(); acceptSuggestion(m.id); }}
+                                        onClick={(e) => { e.stopPropagation(); void acceptSuggestion(m.id); }}
                                         className="p-0.5 rounded text-emerald-600 hover:bg-emerald-100 dark:hover:bg-emerald-900/30 transition-colors"
                                         aria-label={t('takeoff_viewer.accept_suggestion', { defaultValue: 'Accept suggestion' })}
                                         title={t('takeoff_viewer.accept_suggestion', { defaultValue: 'Accept suggestion' })}
@@ -8623,7 +9834,7 @@ export default function TakeoffViewerModule({
                                         <Check size={13} />
                                       </button>
                                       <button
-                                        onClick={(e) => { e.stopPropagation(); rejectSuggestion(m.id); }}
+                                        onClick={(e) => { e.stopPropagation(); void rejectSuggestion(m.id); }}
                                         className="p-0.5 rounded text-rose-500 hover:bg-rose-100 dark:hover:bg-rose-900/30 transition-colors"
                                         aria-label={t('takeoff_viewer.reject_suggestion', { defaultValue: 'Reject suggestion' })}
                                         title={t('takeoff_viewer.reject_suggestion', { defaultValue: 'Reject suggestion' })}
@@ -8675,6 +9886,34 @@ export default function TakeoffViewerModule({
                                   >
                                     {hiddenMeasurements.has(m.id) ? <EyeOff size={12} /> : <Eye size={12} />}
                                   </button>
+                                  {/* Paint order (issue #379): bring this
+                                      measurement to the front / send it to the
+                                      back of the z-stack so it draws on top of /
+                                      beneath overlapping shapes, on both the
+                                      canvas and the exported PDF. Hidden for
+                                      unsaved AI suggestions (not persisted). */}
+                                  {!m.suggested && (
+                                    <>
+                                      <button
+                                        onClick={(e) => { e.stopPropagation(); reorderMeasurement(m.id, 'front'); }}
+                                        className="opacity-0 group-hover/item:opacity-100 p-0.5 rounded text-content-tertiary hover:text-content-primary hover:bg-surface-secondary transition-all shrink-0"
+                                        aria-label={t('takeoff_viewer.bring_to_front', { defaultValue: 'Bring to front' })}
+                                        title={t('takeoff_viewer.bring_to_front', { defaultValue: 'Bring to front' })}
+                                        data-testid="bring-to-front"
+                                      >
+                                        <ArrowUpToLine size={12} />
+                                      </button>
+                                      <button
+                                        onClick={(e) => { e.stopPropagation(); reorderMeasurement(m.id, 'back'); }}
+                                        className="opacity-0 group-hover/item:opacity-100 p-0.5 rounded text-content-tertiary hover:text-content-primary hover:bg-surface-secondary transition-all shrink-0"
+                                        aria-label={t('takeoff_viewer.send_to_back', { defaultValue: 'Send to back' })}
+                                        title={t('takeoff_viewer.send_to_back', { defaultValue: 'Send to back' })}
+                                        data-testid="send-to-back"
+                                      >
+                                        <ArrowDownToLine size={12} />
+                                      </button>
+                                    </>
+                                  )}
                                   <button
                                     onClick={(e) => { e.stopPropagation(); deleteMeasurement(m.id); }}
                                     className="opacity-40 group-hover/item:opacity-100 text-content-tertiary hover:text-semantic-error transition-all shrink-0"

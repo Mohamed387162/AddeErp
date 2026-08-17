@@ -20,9 +20,12 @@ import { useCallback, useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useMutation } from '@tanstack/react-query';
 import { Button } from '@/shared/ui/Button';
+import { openLink } from '@/shared/lib/desktop';
 import { useToastStore } from '@/stores/useToastStore';
 import { createRFI, type RFI, type RFIPriority } from '@/features/rfi/api';
 import { useCreateReference } from '@/features/file-references/hooks';
+import { formatCountQuantity, formatQuantity } from '../lib/measurement-format';
+import { localizedUnitCode } from '@/shared/lib/unitLabels';
 import type { Measurement } from '../lib/takeoff-types';
 
 export interface CreateRfiFromMeasurementDialogProps {
@@ -42,13 +45,11 @@ export interface CreateRfiFromMeasurementDialogProps {
 const PRIORITIES: readonly RFIPriority[] = ['low', 'normal', 'high'];
 
 /** Compact quantity formatter mirroring the ledger so the prefilled text
- *  reads naturally (metric, as stored). */
+ *  reads naturally (metric, as stored). Shares the ledger ladder and
+ *  locale rendering (K-12): the prefill is editable human text, so it
+ *  speaks the app language like the ledger it mirrors. */
 function formatQty(value: number): string {
-  if (!Number.isFinite(value) || value === 0) return '0';
-  const abs = Math.abs(value);
-  if (abs < 1) return value.toFixed(3);
-  if (abs < 100) return value.toFixed(2);
-  return value.toFixed(1);
+  return formatQuantity(value);
 }
 
 const INPUT_CLASS =
@@ -62,7 +63,7 @@ export function CreateRfiFromMeasurementDialog({
   onClose,
   onCreated,
 }: CreateRfiFromMeasurementDialogProps) {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
   const addToast = useToastStore((s) => s.addToast);
 
   // Durable server id - the "file" side of the reference. The host only
@@ -90,8 +91,13 @@ export function CreateRfiFromMeasurementDialog({
       defaultValue:
         'Please confirm the measured {{type}} of {{value}} {{unit}} ({{annotation}}) on page {{page}} of {{doc}}.',
       type: measurement.type,
-      value: formatQty(measurement.value),
-      unit: measurement.unit || '',
+      // Counts prefill as whole pieces with the locale's trade unit
+      // code (K-14: the question read "17,00 pcs" in German).
+      value:
+        measurement.type === 'count'
+          ? formatCountQuantity(measurement.value)
+          : formatQty(measurement.value),
+      unit: localizedUnitCode(measurement.unit || '', i18n.language),
       annotation,
       page: measurement.page,
       doc,
@@ -139,7 +145,7 @@ export function CreateRfiFromMeasurementDialog({
         }),
         action: {
           label: t('takeoff_crosslink.rfi_view', { defaultValue: 'View RFI' }),
-          onClick: () => window.open(`/rfi/${rfi.id}`, '_blank', 'noopener'),
+          onClick: () => openLink(`/rfi/${rfi.id}`),
         },
       });
       onCreated?.(rfi);

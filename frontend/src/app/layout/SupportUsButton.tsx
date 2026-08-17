@@ -22,13 +22,21 @@ import {
   Users,
   ArrowRight,
   Sparkles,
+  MessageSquareQuote,
 } from 'lucide-react';
 import clsx from 'clsx';
 import { copyToClipboard } from '@/shared/lib/browser';
+import {
+  reviewAskShownWithin,
+  CROSS_SURFACE_QUIET_MS,
+} from '@/stores/useReviewPromptStore';
 
 const REPO_URL = 'https://github.com/datadrivenconstruction/OpenConstructionERP';
 const PAYPAL_DONATE_URL = 'https://www.paypal.com/donate/?hosted_button_id=DWBCLNLY2VWAA';
 const GITHUB_SPONSORS_URL = 'https://github.com/sponsors/datadrivenconstruction';
+// Clean product URL. The "?source=search" suffix this used to carry is G2's
+// own search-result tracking and does not belong in a link handed to a user.
+const G2_REVIEWS_URL = 'https://www.g2.com/products/openconstructionerp/reviews';
 const CASE_STUDY_EMAIL = 'info@datadrivenconstruction.io';
 const CASE_STUDY_MAILTO = `mailto:${CASE_STUDY_EMAIL}?subject=${encodeURIComponent(
   'Case study / article - OpenConstructionERP',
@@ -153,12 +161,23 @@ export function SupportUsButton({ condensed = false }: { condensed?: boolean } =
    *   • not already open
    *   • active-tab time has crossed the threshold
    *   • cooldown window has elapsed since the last view (manual or auto)
+   *   • the review card has not just asked the same thing
+   *
+   * Only the UNPROMPTED popup is gated. Opening the modal from the button is
+   * someone deciding to support us, and that is never suppressed - see
+   * handleOpen above, which has no such check.
    */
   useEffect(() => {
     if (isDemo || open) return;
     if (activeMs < AUTO_POPUP_AFTER_MS) return;
     const seenAt = readSeenAt();
     if (seenAt && Date.now() - seenAt < COOLDOWN_MS) return;
+    // ReviewPromptCard makes the same asks (star, review, share). If it has
+    // shown in the last few days, don't stack this modal on top of it. The
+    // window is short and the card is hard-capped, so this can only ever
+    // delay the modal, never mute it - the reasoning is written out in full
+    // on reviewAskShownWithin().
+    if (reviewAskShownWithin(CROSS_SURFACE_QUIET_MS)) return;
     setOpen(true);
     writeSeenAt();
   }, [activeMs, isDemo, open]);
@@ -374,7 +393,47 @@ function SupportUsModal({ onClose, copied, setCopied }: ModalProps) {
             />
           </a>
 
-          {/* 2. Share on social */}
+          {/* 2. Review on G2 */}
+          <a
+            href={G2_REVIEWS_URL}
+            target="_blank"
+            rel="noopener noreferrer"
+            className={clsx(
+              'group flex items-start gap-3 rounded-xl border-2 p-4',
+              'border-rose-300/50 bg-gradient-to-br from-rose-50/60 to-orange-50/30',
+              'dark:border-rose-500/30 dark:from-rose-950/30 dark:to-orange-950/20',
+              'hover:border-rose-500 hover:shadow-md hover:-translate-y-0.5 transition-all',
+            )}
+          >
+            <div className="shrink-0 h-11 w-11 rounded-xl bg-rose-500/15 text-rose-600 dark:text-rose-300 flex items-center justify-center group-hover:bg-rose-600 group-hover:text-white transition-colors">
+              <MessageSquareQuote size={20} strokeWidth={1.75} />
+            </div>
+            <div className="min-w-0 flex-1">
+              <h3 className="text-sm sm:text-base font-semibold text-content-primary flex items-center gap-2">
+                {t('support.action_review_title', {
+                  defaultValue: 'Review us on G2',
+                })}
+                <span className="text-2xs font-semibold uppercase tracking-wider text-rose-600 dark:text-rose-300 px-1.5 py-0.5 rounded bg-rose-500/10">
+                  {t('support.action_review_tag', {
+                    defaultValue: 'Means a lot',
+                  })}
+                </span>
+              </h3>
+              <p className="mt-0.5 text-xs text-content-secondary leading-relaxed">
+                {t('support.action_review_body', {
+                  defaultValue:
+                    'We would be grateful if you rate us or write a short review on G2. Two minutes of honest feedback from a real user helps other construction teams trust and discover the platform - it genuinely means a lot to us.',
+                })}
+              </p>
+            </div>
+            <ExternalLink
+              size={14}
+              className="shrink-0 mt-1 text-content-quaternary group-hover:text-rose-600 transition-colors"
+              aria-hidden
+            />
+          </a>
+
+          {/* 3. Share on social */}
           <div
             className={clsx(
               'group rounded-xl border-2 p-4',

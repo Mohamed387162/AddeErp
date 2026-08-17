@@ -4,10 +4,10 @@
 
 Provides 5 complete demo projects with BOQ, Schedule, Budget, and Tendering data:
   1. residential-berlin  - Wohnanlage Berlin-Mitte (existing seed, re-created)
-  2. office-london       - One Canary Square (existing seed, re-created)
+  2. office-london       - Halesworth Wharf Tower (existing seed, re-created)
   3. medical-us          - Downtown Medical Center (new)
   4. warehouse-dubai     - Logistics Hub Jebel Ali (new)
-  5. school-paris        - Ecole Primaire Belleville (new)
+  5. school-paris        - École Primaire Belleville (new)
 """
 
 from __future__ import annotations
@@ -18,9 +18,10 @@ from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from decimal import ROUND_HALF_UP, Decimal
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.demo_showcase import GERMAN_SHOWCASE_DEMO_IDS
 from app.modules.boq.models import BOQ, BOQMarkup, Position
 from app.modules.changeorders.models import ChangeOrder, ChangeOrderItem
 from app.modules.contacts.models import Contact
@@ -62,6 +63,26 @@ def _total(qty: float, rate: float) -> str:
 
 def _id() -> uuid.UUID:
     return uuid.uuid4()
+
+
+def _phase_progress(start: datetime, end: datetime, now: datetime) -> tuple[int, str]:
+    """Percent complete and status of a programme phase, read off the calendar.
+
+    How far a phase has run is a fact about its dates: one that finished last
+    year is complete, one that has not started is planned, and one in flight is
+    somewhere in between. Deriving it from the phase's position in the list
+    instead puts every activity strictly between 0 and 100, so no phase is ever
+    finished or ever still to come, and every status collapses to
+    ``in_progress`` - which any screen counting activities by status then
+    reports as a programme permanently under way.
+    """
+    if end <= now:
+        prog = 100
+    elif start >= now:
+        prog = 0
+    else:
+        prog = max(0, min(99, int((now - start).days / max((end - start).days, 1) * 100)))
+    return prog, "completed" if prog >= 100 else "in_progress" if prog > 0 else "planned"
 
 
 def _make_section(
@@ -155,6 +176,157 @@ def _sum_positions(positions: list[Position]) -> float:
     return sum(float(p.total) for p in positions if p.unit != "")
 
 
+def _tender_scopes(items: list[Position], package_count: int) -> list[list[Position]]:
+    """Split the priced lines into one contiguous scope per tender package.
+
+    Contiguous because the list is built section by section, so a slice of it
+    is a run of related trades rather than an arbitrary handful of lines.
+
+    The cut balances money, not line count. Every package's bids are the same
+    share of the grand total, and the budget comparison measures a bid against
+    the lines its own package holds, so a scope worth half of what its bidders
+    quote would put all three of them 100% over budget for a reason nobody can
+    read off the screen. Cutting on the running total keeps each scope near its
+    share, and a bill of few enough lines gives one line to each package rather
+    than crowding them into the first.
+    """
+    if package_count <= 1:
+        return [list(items)]
+    if len(items) <= package_count:
+        return [[item] for item in items] + [[] for _ in range(package_count - len(items))]
+
+    values = [Decimal(str(item.quantity or 0)) * Decimal(str(item.unit_rate or 0)) for item in items]
+    cumulative: list[Decimal] = []
+    running = Decimal(0)
+    for value in values:
+        running += value
+        cumulative.append(running)
+    total = running
+    if total <= 0:
+        size, remainder = divmod(len(items), package_count)
+        scopes: list[list[Position]] = []
+        cursor = 0
+        for index in range(package_count):
+            take = size + (1 if index < remainder else 0)
+            scopes.append(items[cursor : cursor + take])
+            cursor += take
+        return scopes
+
+    scopes = []
+    cursor = 0
+    for index in range(1, package_count):
+        target = total * Decimal(index) / Decimal(package_count)
+        end = cursor
+        while end < len(items) and (cumulative[end - 1] if end else Decimal(0)) < target:
+            end += 1
+        # Cut on whichever side of the target is nearer. Stopping at the first
+        # line that crosses it hands a fat line to the earlier package every
+        # time, and four of those in a row leave the last package short by the
+        # sum of all four overshoots.
+        if end - 1 > cursor and target - cumulative[end - 2] < cumulative[end - 1] - target:
+            end -= 1
+        # One line for this package at the least, and one left for each package
+        # still to come: a single line worth a third of the bill must not empty
+        # the two packages behind it.
+        end = min(max(end, cursor + 1), len(items) - (package_count - index))
+        scopes.append(items[cursor:end])
+        cursor = end
+    scopes.append(items[cursor:])
+    return scopes
+
+
+def _bid_line_items(
+    scope: list[Position],
+    *,
+    bid_total: float,
+    bidder_index: int,
+) -> list[dict]:
+    """Spread one bidder's submitted total across a package scope, line by line.
+
+    A bid whose only number is a grand total leaves the price comparison with
+    nothing to compare. Both the leveling matrix and the budget comparison are
+    built by indexing ``line_items`` on ``position_id``, so an empty list
+    renders a matrix of empty cells no matter how many bidders submitted: the
+    screen whose whole purpose is per-line spread has no per-line data in it.
+
+    The submitted total is an input here, never an output. Several packs state
+    their bid figures in the package description ("3 Angebote, Spread 10,9 %")
+    and derive the bid factor from them, so the lines have to add up to the
+    number that is already written down rather than replace it.
+
+    Within that constraint each line moves deterministically around the
+    reference rate, so the matrix has real spread to colour and a reseed
+    produces the same comparison. Every so often a bidder leaves a line out
+    entirely, which is what gives the imputation path something to impute; on
+    short scopes that is skipped, where dropping one line would remove a
+    visible share of the package rather than a detail. A bidder who omits
+    scope still submitted their total, so it is spread over the lines they did
+    quote - which is precisely what leveling is meant to expose.
+
+    Line totals are the exact product of rate and quantity, not a rounded one,
+    because the matrix reads a disagreement between the two as a *scaled* bid
+    line and badges it.
+    """
+    quoted: list[tuple[Position, Decimal, Decimal]] = []
+    omit_allowed = bidder_index > 0 and len(scope) >= 8
+    for line_index, position in enumerate(scope):
+        if omit_allowed and (line_index + bidder_index * 5) % 19 == 0:
+            continue
+        # -5% .. +5% of the reference rate, decided by position rather than by
+        # chance. Shape only at this stage; the scale comes from the total.
+        spread = Decimal((line_index * 7 + bidder_index * 13) % 11 - 5) / Decimal(100)
+        quantity = Decimal(str(position.quantity))
+        shaped = Decimal(str(position.unit_rate)) * (Decimal(1) + spread)
+        quoted.append((position, quantity, shaped))
+
+    shaped_total = sum((qty * rate for _pos, qty, rate in quoted), Decimal(0))
+    if not quoted or shaped_total <= 0:
+        return []
+
+    target = Decimal(str(bid_total))
+    scale = target / shaped_total
+    lines: list[dict] = []
+    for position, quantity, shaped in quoted:
+        rate = (shaped * scale).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        lines.append(
+            {
+                "position_id": str(position.id),
+                "description": position.description or "",
+                "unit": position.unit or "",
+                "quantity": float(quantity),
+                "unit_rate": str(rate),
+                "total": float(rate * quantity),
+            }
+        )
+
+    # Rounding every rate to the cent leaves the column short or long of the
+    # submitted total. Correct it on the smallest lines first: one cent of
+    # rate moves a line by its own quantity, so the narrowest line is the one
+    # that can be nudged in the finest steps, and a scope-wide accumulation
+    # becomes a few cents on a six-figure package. It does not land exactly,
+    # and deliberately so - closing the last cents would need a line total
+    # that disagrees with its own rate times quantity, which is exactly what
+    # the matrix badges as a scaled bid line.
+    def _column_total() -> Decimal:
+        return sum((Decimal(str(line["total"])) for line in lines), Decimal(0))
+
+    for index in sorted(range(len(lines)), key=lambda i: Decimal(str(lines[i]["quantity"]))):
+        residual = target - _column_total()
+        if residual == 0:
+            break
+        quantity = Decimal(str(lines[index]["quantity"]))
+        if quantity <= 0:
+            continue
+        rate = (Decimal(str(lines[index]["unit_rate"])) + residual / quantity).quantize(
+            Decimal("0.01"), rounding=ROUND_HALF_UP
+        )
+        if rate <= 0:
+            continue
+        lines[index]["unit_rate"] = str(rate)
+        lines[index]["total"] = float(rate * quantity)
+    return lines
+
+
 # ---------------------------------------------------------------------------
 # Demo template descriptor
 # ---------------------------------------------------------------------------
@@ -220,6 +392,20 @@ class DemoTemplate:
     actual_spend_ratio: float = 0.0
     spi_override: float = 0.0
     cpi_override: float = 0.0
+    # Optional: e-invoice showcase. Three keys, all optional:
+    #   "buyer_contact" - extra master data (legal_name, vat_number, address)
+    #     merged onto the generated client contact, so the buyer side of an
+    #     EN 16931 document (BG-8 postal address, BR-DE-8/9 city + post code,
+    #     BR-9/11 country) can be answered from the linked contact;
+    #   "invoice" - overrides for the seeded receivable invoice row itself
+    #     (invoice_number, notes, line_items);
+    #   "einvoice" - the payload stored under metadata["einvoice"], where the
+    #     e-invoice engine reads the Leitweg-ID / buyer reference (BT-10),
+    #     the seller party and the payment details.
+    # When set, the generic seed adds ONE receivable invoice linked to the
+    # client contact, complete enough to pass an XRechnung dry-run out of
+    # the box.
+    einvoice_showcase: dict | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -230,9 +416,9 @@ _BERLIN = DemoTemplate(
     demo_id="residential-berlin",
     project_name="Wohnanlage Berlin-Mitte",
     project_description=(
-        "Neubau einer Wohnanlage mit 48 Wohneinheiten, 3 Treppenhaeuser, "
-        "Tiefgarage mit 60 Stellplaetzen. 5 Geschosse + Staffelgeschoss. "
-        "Grundstueck ca. 4.200 m2, BGF ca. 7.840 m2. "
+        "Neubau einer Wohnanlage mit 48 Wohneinheiten, 3 Treppenhäuser, "
+        "Tiefgarage mit 60 Stellplätzen. 5 Geschosse + Staffelgeschoss. "
+        "Grundstück ca. 4.200 m2, BGF ca. 7.840 m2. "
         "KfW Effizienzhaus 55. Baukosten ca. 12 Mio EUR."
     ),
     region="DACH",
@@ -263,48 +449,48 @@ _BERLIN = DemoTemplate(
             "KG 300 - Baugrube / Erdbau",
             {"din276": "300"},
             [
-                ("300.1", "Spundwandverbau Larssen 603 (Sheet piling)", "m2", 1400, 95.00, {"din276": "300"}),
-                ("300.2", "Grundwasserabsenkung / Wasserhaltung (Dewatering)", "lsum", 1, 85000.00, {"din276": "300"}),
-                ("300.3", "Aushub Baugrube (Pit excavation)", "m3", 6500, 14.50, {"din276": "300"}),
-                ("300.4", "Bodenabtransport und Entsorgung (Soil disposal)", "m3", 5800, 22.00, {"din276": "300"}),
+                ("300.1", "Spundwandverbau Larssen 603", "m2", 1400, 95.00, {"din276": "300"}),
+                ("300.2", "Grundwasserabsenkung / Wasserhaltung", "lsum", 1, 85000.00, {"din276": "300"}),
+                ("300.3", "Aushub Baugrube", "m3", 6500, 14.50, {"din276": "300"}),
+                ("300.4", "Bodenabtransport und Entsorgung", "m3", 5800, 22.00, {"din276": "300"}),
                 (
                     "300.5",
-                    "Baugrundgutachten / Baugrundsondierung (Ground testing)",
+                    "Baugrundgutachten / Baugrundsondierung",
                     "lsum",
                     1,
                     18000.00,
                     {"din276": "300"},
                 ),
-                ("300.6", "Verfuellung und Hinterfuellung (Backfill)", "m3", 1200, 16.50, {"din276": "300"}),
-                ("300.7", "Verdichtung Planum (Compaction)", "m2", 2800, 4.80, {"din276": "300"}),
-                ("300.8", "Boeschungssicherung (Slope protection)", "m2", 650, 38.00, {"din276": "300"}),
-                ("300.9", "Kampfmittelsondierung (Ordnance survey)", "m2", 4200, 3.20, {"din276": "300"}),
-                ("300.10", "Baustrasse Schottertragschicht (Temporary haul road)", "m2", 800, 28.00, {"din276": "300"}),
+                ("300.6", "Verfüllung und Hinterfüllung", "m3", 1200, 16.50, {"din276": "300"}),
+                ("300.7", "Verdichtung Planum", "m2", 2800, 4.80, {"din276": "300"}),
+                ("300.8", "Böschungssicherung", "m2", 650, 38.00, {"din276": "300"}),
+                ("300.9", "Kampfmittelsondierung", "m2", 4200, 3.20, {"din276": "300"}),
+                ("300.10", "Baustraße Schottertragschicht", "m2", 800, 28.00, {"din276": "300"}),
             ],
         ),
         # ── KG 320 Gruendung (Foundation) ─────────────────────────────
         (
             "320",
-            "KG 320 - Gruendung",
+            "KG 320 - Gründung",
             {"din276": "320"},
             [
-                ("320.1", "Bohrpfaehle d=600mm, L=12m (Bored piles)", "m", 960, 145.00, {"din276": "320"}),
-                ("320.2", "Pfahlkopfplatten (Pile caps)", "m3", 85, 310.00, {"din276": "320"}),
-                ("320.3", "Grundbalken (Ground beams)", "m3", 120, 295.00, {"din276": "320"}),
-                ("320.4", "Sauberkeitsschicht C12/15 (Blinding concrete)", "m2", 2800, 12.50, {"din276": "320"}),
-                ("320.5", "Bodenplatte C30/37, d=30cm bewehrt (Foundation slab)", "m3", 840, 285.00, {"din276": "320"}),
+                ("320.1", "Bohrpfähle d=600mm, L=12m", "m", 960, 145.00, {"din276": "320"}),
+                ("320.2", "Pfahlkopfplatten", "m3", 85, 310.00, {"din276": "320"}),
+                ("320.3", "Grundbalken", "m3", 120, 295.00, {"din276": "320"}),
+                ("320.4", "Sauberkeitsschicht C12/15", "m2", 2800, 12.50, {"din276": "320"}),
+                ("320.5", "Bodenplatte C30/37, d=30cm bewehrt", "m3", 840, 285.00, {"din276": "320"}),
                 (
                     "320.6",
-                    "Abdichtung KMB unter Bodenplatte (Waterproofing membrane)",
+                    "Abdichtung KMB unter Bodenplatte",
                     "m2",
                     2800,
                     42.00,
                     {"din276": "320"},
                 ),
-                ("320.7", "Drainageleitung DN150 (Drainage channels)", "m", 320, 65.00, {"din276": "320"}),
+                ("320.7", "Drainageleitung DN150", "m", 320, 65.00, {"din276": "320"}),
                 (
                     "320.8",
-                    "Perimeterdaemmung XPS 120mm (Insulation to foundation)",
+                    "Perimeterdämmung XPS 120mm",
                     "m2",
                     1600,
                     48.00,
@@ -315,43 +501,43 @@ _BERLIN = DemoTemplate(
         # ── KG 330 Aussenwande (External Walls) ──────────────────────
         (
             "330",
-            "KG 330 - Aussenwande",
+            "KG 330 - Außenwände",
             {"din276": "330"},
             [
-                ("330.1", "Stahlbetonwaende C30/37, 25cm (RC walls)", "m3", 420, 380.00, {"din276": "330"}),
-                ("330.2", "Schalung Waende Rahmenschalung (Wall formwork)", "m2", 3360, 32.00, {"din276": "330"}),
-                ("330.3", "Bewehrung BSt 500 S, inkl. Biegen (Reinforcement)", "t", 52, 1850.00, {"din276": "330"}),
-                ("330.4", "WDVS Mineralwolle 160mm (EIFS insulation)", "m2", 4800, 98.00, {"din276": "330"}),
-                ("330.5", "Mineralischer Oberputz (Mineral render)", "m2", 4800, 28.00, {"din276": "330"}),
-                ("330.6", "Fenstersturz Stahlbeton (Window lintels)", "m", 480, 65.00, {"din276": "330"}),
-                ("330.7", "Fensterbanke aussen Aluminium (Window cills)", "m", 480, 42.00, {"din276": "330"}),
-                ("330.8", "Dehnungsfugen Fassade (Movement joints)", "m", 260, 35.00, {"din276": "330"}),
-                ("330.9", "Eckschutzprofile Aluminium (Corner protection)", "m", 380, 18.50, {"din276": "330"}),
+                ("330.1", "Stahlbetonwände C30/37, 25cm", "m3", 420, 380.00, {"din276": "330"}),
+                ("330.2", "Schalung Wände Rahmenschalung", "m2", 3360, 32.00, {"din276": "330"}),
+                ("330.3", "Bewehrung BSt 500 S, inkl. Biegen", "t", 52, 1850.00, {"din276": "330"}),
+                ("330.4", "WDVS Mineralwolle 160mm", "m2", 4800, 98.00, {"din276": "330"}),
+                ("330.5", "Mineralischer Oberputz", "m2", 4800, 28.00, {"din276": "330"}),
+                ("330.6", "Fenstersturz Stahlbeton", "m", 480, 65.00, {"din276": "330"}),
+                ("330.7", "Fensterbanke außen Aluminium", "m", 480, 42.00, {"din276": "330"}),
+                ("330.8", "Dehnungsfugen Fassade", "m", 260, 35.00, {"din276": "330"}),
+                ("330.9", "Eckschutzprofile Aluminium", "m", 380, 18.50, {"din276": "330"}),
                 (
                     "330.10",
-                    "Sockelputz Keller geschlaemmt (Basement plinth render)",
+                    "Sockelputz Keller geschlämmt",
                     "m2",
                     480,
                     32.00,
                     {"din276": "330"},
                 ),
-                ("330.11", "Kelleraussenwand WU-Beton 30cm (Basement RC wall)", "m3", 185, 395.00, {"din276": "330"}),
+                ("330.11", "Kelleraußenwand WU-Beton 30cm", "m3", 185, 395.00, {"din276": "330"}),
             ],
         ),
         # ── KG 340 Innenwaende (Internal Walls) ─────────────────────
         (
             "340",
-            "KG 340 - Innenwaende",
+            "KG 340 - Innenwände",
             {"din276": "340"},
             [
-                ("340.1", "Tragendes Mauerwerk KS 17,5cm (Load-bearing masonry)", "m2", 3200, 68.00, {"din276": "340"}),
-                ("340.2", "Trennwand Trockenbau 12,5cm CW75 (Partition drywall)", "m2", 4200, 52.00, {"din276": "340"}),
-                ("340.3", "Gipskartonvorsatzschale (Plasterboard lining)", "m2", 1800, 38.00, {"din276": "340"}),
-                ("340.4", "Brandschutzwand F90 Trockenbau (Fire-rated wall)", "m2", 800, 125.00, {"din276": "340"}),
-                ("340.5", "Tueroffnungen/Zargen Stahl (Door openings/frames)", "pcs", 192, 285.00, {"din276": "340"}),
+                ("340.1", "Tragendes Mauerwerk KS 17,5cm", "m2", 3200, 68.00, {"din276": "340"}),
+                ("340.2", "Trennwand Trockenbau 12,5cm CW75", "m2", 4200, 52.00, {"din276": "340"}),
+                ("340.3", "Gipskartonvorsatzschale", "m2", 1800, 38.00, {"din276": "340"}),
+                ("340.4", "Brandschutzwand F90 Trockenbau", "m2", 800, 125.00, {"din276": "340"}),
+                ("340.5", "Türöffnungen/Zargen Stahl", "pcs", 192, 285.00, {"din276": "340"}),
                 (
                     "340.6",
-                    "Schallschutz Trennwaende Mineralwolle (Acoustic insulation)",
+                    "Schallschutz Trennwände Mineralwolle",
                     "m2",
                     3200,
                     18.00,
@@ -359,22 +545,22 @@ _BERLIN = DemoTemplate(
                 ),
                 (
                     "340.7",
-                    "Wandfliesen Nassraeume 60x30cm (Wall tiling wet areas)",
+                    "Wandfliesen Nassräume 60x30cm",
                     "m2",
                     2400,
                     65.00,
                     {"din276": "340"},
                 ),
-                ("340.8", "Innenanstrich Dispersionsfarbe (Paint finish)", "m2", 14000, 8.50, {"din276": "340"}),
+                ("340.8", "Innenanstrich Dispersionsfarbe", "m2", 14000, 8.50, {"din276": "340"}),
                 (
                     "340.9",
-                    "Vorsatzschalen Installationswaende (Service wall linings)",
+                    "Vorsatzschalen Installationswände",
                     "m2",
                     960,
                     48.00,
                     {"din276": "340"},
                 ),
-                ("340.10", "Spiegel Nassraeume 80x60cm (Wet area mirrors)", "pcs", 96, 65.00, {"din276": "340"}),
+                ("340.10", "Spiegel Nassräume 80x60cm", "pcs", 96, 65.00, {"din276": "340"}),
             ],
         ),
         # ── KG 350 Decken (Floor Slabs) ──────────────────────────────
@@ -383,12 +569,12 @@ _BERLIN = DemoTemplate(
             "KG 350 - Decken",
             {"din276": "350"},
             [
-                ("350.1", "Stahlbeton-Flachdecke C30/37, 25cm (RC flat slab)", "m3", 1560, 320.00, {"din276": "350"}),
-                ("350.2", "Schalung Decken Deckentische (Slab formwork)", "m2", 6240, 28.00, {"din276": "350"}),
-                ("350.3", "Bewehrung Decken BSt 500 (Slab reinforcement)", "t", 140, 1850.00, {"din276": "350"}),
+                ("350.1", "Stahlbeton-Flachdecke C30/37, 25cm", "m3", 1560, 320.00, {"din276": "350"}),
+                ("350.2", "Schalung Decken Deckentische", "m2", 6240, 28.00, {"din276": "350"}),
+                ("350.3", "Bewehrung Decken BSt 500", "t", 140, 1850.00, {"din276": "350"}),
                 (
                     "350.4",
-                    "Schwimmender Estrich CT-C30-F5, 65mm (Floating screed)",
+                    "Schwimmender Estrich CT-C30-F5, 65mm",
                     "m2",
                     5200,
                     32.00,
@@ -396,32 +582,32 @@ _BERLIN = DemoTemplate(
                 ),
                 (
                     "350.5",
-                    "Trittschalldaemmung EPS-T 30mm (Impact sound insulation)",
+                    "Trittschalldämmung EPS-T 30mm",
                     "m2",
                     5200,
                     18.00,
                     {"din276": "350"},
                 ),
-                ("350.6", "Bodenfliesen 60x60cm Feinsteinzeug (Floor tiling)", "m2", 2200, 68.00, {"din276": "350"}),
-                ("350.7", "Parkett Eiche 3-Schicht (Parquet flooring)", "m2", 3000, 85.00, {"din276": "350"}),
-                ("350.8", "Balkonabdichtung FLK (Balcony waterproofing)", "m2", 960, 55.00, {"din276": "350"}),
-                ("350.9", "Randdaemmstreifen PE 10mm (Edge insulation strips)", "m", 4200, 2.80, {"din276": "350"}),
-                ("350.10", "Sockelleisten Eiche furniert (Skirting boards oak)", "m", 3600, 12.50, {"din276": "350"}),
+                ("350.6", "Bodenfliesen 60x60cm Feinsteinzeug", "m2", 2200, 68.00, {"din276": "350"}),
+                ("350.7", "Parkett Eiche 3-Schicht", "m2", 3000, 85.00, {"din276": "350"}),
+                ("350.8", "Balkonabdichtung FLK", "m2", 960, 55.00, {"din276": "350"}),
+                ("350.9", "Randdämmstreifen PE 10mm", "m", 4200, 2.80, {"din276": "350"}),
+                ("350.10", "Sockelleisten Eiche furniert", "m", 3600, 12.50, {"din276": "350"}),
             ],
         ),
         # ── KG 360 Daecher (Roof) ────────────────────────────────────
         (
             "360",
-            "KG 360 - Daecher",
+            "KG 360 - Dächer",
             {"din276": "360"},
             [
-                ("360.1", "Stahlbeton-Dachdecke C30/37 (RC roof slab)", "m3", 195, 340.00, {"din276": "360"}),
-                ("360.2", "Warmdachdaemmung PIR 200mm (Warm roof insulation)", "m2", 1400, 62.00, {"din276": "360"}),
-                ("360.3", "Dachabdichtung EPDM 1,5mm (EPDM membrane)", "m2", 1400, 48.00, {"din276": "360"}),
-                ("360.4", "Kiesschuettung 50mm (Gravel ballast)", "m2", 600, 14.00, {"din276": "360"}),
+                ("360.1", "Stahlbeton-Dachdecke C30/37", "m3", 195, 340.00, {"din276": "360"}),
+                ("360.2", "Warmdachdämmung PIR 200mm", "m2", 1400, 62.00, {"din276": "360"}),
+                ("360.3", "Dachabdichtung EPDM 1,5mm", "m2", 1400, 48.00, {"din276": "360"}),
+                ("360.4", "Kiesschüttung 50mm", "m2", 600, 14.00, {"din276": "360"}),
                 (
                     "360.5",
-                    "Dachdurchfuehrungen und Entlueftung (Roof penetrations)",
+                    "Dachdurchführungen und Entlüftung",
                     "pcs",
                     32,
                     280.00,
@@ -429,15 +615,15 @@ _BERLIN = DemoTemplate(
                 ),
                 (
                     "360.6",
-                    "Absturzsicherung Attika Gelaender (Fall protection rails)",
+                    "Absturzsicherung Attika Geländer",
                     "m",
                     260,
                     145.00,
                     {"din276": "360"},
                 ),
-                ("360.7", "Blitzschutzanlage komplett (Lightning protection)", "lsum", 1, 28000.00, {"din276": "360"}),
-                ("360.8", "Extensivbegruenungs-Substrat (Green roof substrate)", "m2", 800, 52.00, {"din276": "360"}),
-                ("360.9", "Lichtkuppeln Treppenhaus (Stairwell rooflights)", "pcs", 3, 2800.00, {"din276": "360"}),
+                ("360.7", "Blitzschutzanlage komplett", "lsum", 1, 28000.00, {"din276": "360"}),
+                ("360.8", "Extensivbegrünungs-Substrat", "m2", 800, 52.00, {"din276": "360"}),
+                ("360.9", "Lichtkuppeln Treppenhaus", "pcs", 3, 2800.00, {"din276": "360"}),
             ],
         ),
         # ── KG 370 Baukonstruktive Einbauten ─────────────────────────
@@ -446,10 +632,10 @@ _BERLIN = DemoTemplate(
             "KG 370 - Baukonstruktive Einbauten",
             {"din276": "370"},
             [
-                ("370.1", "Stahlbetontreppen Fertigteil (RC precast stairs)", "pcs", 15, 4200.00, {"din276": "370"}),
+                ("370.1", "Stahlbetontreppen Fertigteil", "pcs", 15, 4200.00, {"din276": "370"}),
                 (
                     "370.2",
-                    "Treppengelaender Edelstahl (Stainless steel balustrade)",
+                    "Treppengeländer Edelstahl",
                     "m",
                     180,
                     285.00,
@@ -457,7 +643,7 @@ _BERLIN = DemoTemplate(
                 ),
                 (
                     "370.3",
-                    "Balkone Stahlbeton auskragend (Cantilevered RC balconies)",
+                    "Balkone Stahlbeton auskragend",
                     "m2",
                     960,
                     295.00,
@@ -465,7 +651,7 @@ _BERLIN = DemoTemplate(
                 ),
                 (
                     "370.4",
-                    "Isokorb Typ K thermische Trennung (Thermal break connectors)",
+                    "Isokorb Typ K thermische Trennung",
                     "pcs",
                     96,
                     185.00,
@@ -473,7 +659,7 @@ _BERLIN = DemoTemplate(
                 ),
                 (
                     "370.5",
-                    "Balkongelaender Stahl pulverbeschichtet (Balcony railings)",
+                    "Balkongeländer Stahl pulverbeschichtet",
                     "m",
                     480,
                     165.00,
@@ -481,13 +667,13 @@ _BERLIN = DemoTemplate(
                 ),
                 (
                     "370.6",
-                    "Schachtwaende Aufzug Stahlbeton (Elevator shaft walls)",
+                    "Schachtwände Aufzug Stahlbeton",
                     "m3",
                     42,
                     420.00,
                     {"din276": "370"},
                 ),
-                ("370.7", "Podeste und Zwischenpodeste (Landings)", "m2", 120, 285.00, {"din276": "370"}),
+                ("370.7", "Podeste und Zwischenpodeste", "m2", 120, 285.00, {"din276": "370"}),
             ],
         ),
         # ── KG 410 Abwasser (Drainage) ───────────────────────────────
@@ -496,65 +682,65 @@ _BERLIN = DemoTemplate(
             "KG 410 - Abwasser, Wasser, Gas",
             {"din276": "410"},
             [
-                ("410.1", "Schmutzwasserleitung HDPE DN110 (Soil pipes HDPE)", "m", 1600, 42.00, {"din276": "410"}),
-                ("410.2", "Abwassersammelleitung DN150 (Waste pipes)", "m", 800, 58.00, {"din276": "410"}),
-                ("410.3", "Revisionsschaechte DN400 (Inspection chambers)", "pcs", 12, 680.00, {"din276": "410"}),
-                ("410.4", "ACO Entwaesserungsrinnen (ACO drainage channels)", "m", 85, 145.00, {"din276": "410"}),
-                ("410.5", "Regenfallrohre DN100 Edelstahl (Rainwater pipes)", "m", 320, 65.00, {"din276": "410"}),
-                ("410.6", "Hebeanlage Tiefgarage (Pump station)", "pcs", 2, 4800.00, {"din276": "410"}),
-                ("410.7", "Fettabscheider Kueche (Separator)", "pcs", 1, 3200.00, {"din276": "410"}),
-                ("410.8", "Trinkwasserleitung PE-X/Kupfer (Water supply)", "m", 3600, 38.00, {"din276": "410"}),
-                ("410.9", "Sanitaerobjekte komplett je WE (Sanitary fixtures)", "pcs", 192, 1850.00, {"din276": "410"}),
+                ("410.1", "Schmutzwasserleitung HDPE DN110", "m", 1600, 42.00, {"din276": "410"}),
+                ("410.2", "Abwassersammelleitung DN150", "m", 800, 58.00, {"din276": "410"}),
+                ("410.3", "Revisionsschächte DN400", "pcs", 12, 680.00, {"din276": "410"}),
+                ("410.4", "ACO Entwässerungsrinnen", "m", 85, 145.00, {"din276": "410"}),
+                ("410.5", "Regenfallrohre DN100 Edelstahl", "m", 320, 65.00, {"din276": "410"}),
+                ("410.6", "Hebeanlage Tiefgarage", "pcs", 2, 4800.00, {"din276": "410"}),
+                ("410.7", "Fettabscheider Küche", "pcs", 1, 3200.00, {"din276": "410"}),
+                ("410.8", "Trinkwasserleitung PE-X/Kupfer", "m", 3600, 38.00, {"din276": "410"}),
+                ("410.9", "Sanitärobjekte komplett je WE", "pcs", 192, 1850.00, {"din276": "410"}),
             ],
         ),
         # ── KG 420 Waermeversorgung (Heating) ────────────────────────
         (
             "420",
-            "KG 420 - Waermeversorgung",
+            "KG 420 - Wärmeversorgung",
             {"din276": "420"},
             [
-                ("420.1", "Luft-Wasser-Waermepumpe 80kW (Air-source heat pump)", "pcs", 2, 38000.00, {"din276": "420"}),
-                ("420.2", "Pufferspeicher 500L (Buffer storage)", "pcs", 2, 2800.00, {"din276": "420"}),
+                ("420.1", "Luft-Wasser-Wärmepumpe 80kW", "pcs", 2, 38000.00, {"din276": "420"}),
+                ("420.2", "Pufferspeicher 500L", "pcs", 2, 2800.00, {"din276": "420"}),
                 (
                     "420.3",
-                    "Fussbodenheizung PE-Xa Rohr (Underfloor heating pipes)",
+                    "Fußbodenheizung PE-Xa Rohr",
                     "m2",
                     4800,
                     48.00,
                     {"din276": "420"},
                 ),
-                ("420.4", "Heizkreisverteiler je Geschoss (Manifolds)", "pcs", 12, 1200.00, {"din276": "420"}),
-                ("420.5", "Heizkoerper Typ 22 Badzimmer (Radiators bathrooms)", "pcs", 48, 420.00, {"din276": "420"}),
-                ("420.6", "Thermostatventile Danfoss (Thermostatic valves)", "pcs", 192, 45.00, {"din276": "420"}),
-                ("420.7", "Isolierte Rohrleitungen Heizung (Insulated pipework)", "m", 1600, 32.00, {"din276": "420"}),
-                ("420.8", "Gebaeudeautomation GLT Regelung (BMS controls)", "lsum", 1, 35000.00, {"din276": "420"}),
+                ("420.4", "Heizkreisverteiler je Geschoss", "pcs", 12, 1200.00, {"din276": "420"}),
+                ("420.5", "Heizkörper Typ 22 Badzimmer", "pcs", 48, 420.00, {"din276": "420"}),
+                ("420.6", "Thermostatventile Regulan", "pcs", 192, 45.00, {"din276": "420"}),
+                ("420.7", "Isolierte Rohrleitungen Heizung", "m", 1600, 32.00, {"din276": "420"}),
+                ("420.8", "Gebäudeautomation GLT Regelung", "lsum", 1, 35000.00, {"din276": "420"}),
             ],
         ),
         # ── KG 430 Lueftung (Ventilation) ────────────────────────────
         (
             "430",
-            "KG 430 - Lueftungsanlagen",
+            "KG 430 - Lüftungsanlagen",
             {"din276": "430"},
             [
-                ("430.1", "Wohnraumlueftung KWL mit WRG je WE (MVHR unit)", "pcs", 48, 3200.00, {"din276": "430"}),
-                ("430.2", "Zuluftleitungen Wickelfalzrohr (Supply ductwork)", "m", 1200, 42.00, {"din276": "430"}),
-                ("430.3", "Abluftleitungen Wickelfalzrohr (Extract ductwork)", "m", 1200, 42.00, {"din276": "430"}),
-                ("430.4", "Kuechenabluft Dunstabzug (Kitchen extract)", "pcs", 48, 280.00, {"din276": "430"}),
-                ("430.5", "Badentlueftung DN100 (Bathroom extract)", "pcs", 96, 185.00, {"din276": "430"}),
-                ("430.6", "Brandschutzklappen EI90 (Fire dampers)", "pcs", 36, 320.00, {"din276": "430"}),
+                ("430.1", "Wohnraumlüftung KWL mit WRG je WE", "pcs", 48, 3200.00, {"din276": "430"}),
+                ("430.2", "Zuluftleitungen Wickelfalzrohr", "m", 1200, 42.00, {"din276": "430"}),
+                ("430.3", "Abluftleitungen Wickelfalzrohr", "m", 1200, 42.00, {"din276": "430"}),
+                ("430.4", "Küchenabluft Dunstabzug", "pcs", 48, 280.00, {"din276": "430"}),
+                ("430.5", "Badentlüftung DN100", "pcs", 96, 185.00, {"din276": "430"}),
+                ("430.6", "Brandschutzklappen EI90", "pcs", 36, 320.00, {"din276": "430"}),
                 (
                     "430.7",
-                    "Schalldaempfer Telefonieschalldaempfer (Acoustic attenuators)",
+                    "Schalldämpfer Telefonieschalldämpfer",
                     "pcs",
                     48,
                     145.00,
                     {"din276": "430"},
                 ),
-                ("430.8", "Dachhaube Zuluft/Abluft (Roof cowls)", "pcs", 12, 480.00, {"din276": "430"}),
-                ("430.9", "Luftleitungen flexibel DN125 (Flexible ductwork)", "m", 960, 18.50, {"din276": "430"}),
+                ("430.8", "Dachhaube Zuluft/Abluft", "pcs", 12, 480.00, {"din276": "430"}),
+                ("430.9", "Luftleitungen flexibel DN125", "m", 960, 18.50, {"din276": "430"}),
                 (
                     "430.10",
-                    "Lueftungsgitter Zuluft/Abluft (Supply/extract grilles)",
+                    "Lüftungsgitter Zuluft/Abluft",
                     "pcs",
                     192,
                     32.00,
@@ -568,40 +754,40 @@ _BERLIN = DemoTemplate(
             "KG 440 - Elektrotechnik",
             {"din276": "440"},
             [
-                ("440.1", "Hauptverteilung NSHV 400A (Main distribution board)", "pcs", 1, 12500.00, {"din276": "440"}),
+                ("440.1", "Hauptverteilung NSHV 400A", "pcs", 1, 12500.00, {"din276": "440"}),
                 (
                     "440.2",
-                    "Unterverteilung je Geschoss (Sub-distribution per floor)",
+                    "Unterverteilung je Geschoss",
                     "pcs",
                     6,
                     3800.00,
                     {"din276": "440"},
                 ),
-                ("440.3", "Kabeltrassensystem (Cable trays)", "m", 2400, 28.00, {"din276": "440"}),
-                ("440.4", "NYM-J Leitungen komplett (NYM cables)", "m", 48000, 3.20, {"din276": "440"}),
-                ("440.5", "Schalter und Steckdosen je WE (Switches/sockets)", "pcs", 48, 1250.00, {"din276": "440"}),
-                ("440.6", "LED-Einbauleuchten Wohnungen (LED downlights)", "pcs", 480, 65.00, {"din276": "440"}),
+                ("440.3", "Kabeltrassensystem", "m", 2400, 28.00, {"din276": "440"}),
+                ("440.4", "NYM-J Leitungen komplett", "m", 48000, 3.20, {"din276": "440"}),
+                ("440.5", "Schalter und Steckdosen je WE", "pcs", 48, 1250.00, {"din276": "440"}),
+                ("440.6", "LED-Einbauleuchten Wohnungen", "pcs", 480, 65.00, {"din276": "440"}),
                 (
                     "440.7",
-                    "Sicherheitsbeleuchtung Fluchtwege (Emergency lighting)",
+                    "Sicherheitsbeleuchtung Fluchtwege",
                     "pcs",
                     96,
                     185.00,
                     {"din276": "440"},
                 ),
-                ("440.8", "E-Ladestation Tiefgarage 11kW (EV charging points)", "pcs", 12, 2800.00, {"din276": "440"}),
-                ("440.9", "Gegensprechanlage/Klingel je WE (Intercom/doorbell)", "pcs", 48, 380.00, {"din276": "440"}),
-                ("440.10", "Rauchwarnmelder vernetzt (Smoke detectors)", "pcs", 288, 45.00, {"din276": "440"}),
+                ("440.8", "E-Ladestation Tiefgarage 11kW", "pcs", 12, 2800.00, {"din276": "440"}),
+                ("440.9", "Gegensprechanlage/Klingel je WE", "pcs", 48, 380.00, {"din276": "440"}),
+                ("440.10", "Rauchwarnmelder vernetzt", "pcs", 288, 45.00, {"din276": "440"}),
                 (
                     "440.11",
-                    "Potentialausgleich und Erdung (Equipotential bonding)",
+                    "Potentialausgleich und Erdung",
                     "lsum",
                     1,
                     8500.00,
                     {"din276": "440"},
                 ),
-                ("440.12", "Treppenhaus Beleuchtung LED (Stairwell lighting)", "pcs", 36, 145.00, {"din276": "440"}),
-                ("440.13", "Tiefgarage Beleuchtung LED (Garage lighting)", "m2", 1200, 28.00, {"din276": "440"}),
+                ("440.12", "Treppenhaus Beleuchtung LED", "pcs", 36, 145.00, {"din276": "440"}),
+                ("440.13", "Tiefgarage Beleuchtung LED", "m2", 1200, 28.00, {"din276": "440"}),
             ],
         ),
         # ── KG 500 Aufzuege (Elevators) ──────────────────────────────
@@ -610,57 +796,57 @@ _BERLIN = DemoTemplate(
             "KG 500 - Aufzugsanlagen",
             {"din276": "500"},
             [
-                ("500.1", "Personenaufzug 630kg / 8 Personen (Passenger lift)", "pcs", 3, 85000.00, {"din276": "500"}),
-                ("500.2", "Schachttueren Edelstahl (Shaft doors)", "pcs", 18, 1200.00, {"din276": "500"}),
-                ("500.3", "Maschinenraumausstattung (Machine room equipment)", "pcs", 3, 4500.00, {"din276": "500"}),
-                ("500.4", "Aufzugssteuerung und Notruf (Lift controls)", "pcs", 3, 6800.00, {"din276": "500"}),
+                ("500.1", "Personenaufzug 630kg / 8 Personen", "pcs", 3, 85000.00, {"din276": "500"}),
+                ("500.2", "Schachttüren Edelstahl", "pcs", 18, 1200.00, {"din276": "500"}),
+                ("500.3", "Maschinenraumausstattung", "pcs", 3, 4500.00, {"din276": "500"}),
+                ("500.4", "Aufzugssteuerung und Notruf", "pcs", 3, 6800.00, {"din276": "500"}),
             ],
         ),
         # ── KG 540 Aussenanlagen (External Works) ────────────────────
         (
             "540",
-            "KG 540 - Aussenanlagen",
+            "KG 540 - Außenanlagen",
             {"din276": "540"},
             [
                 (
                     "540.1",
-                    "Asphaltzufahrt und Stellplaetze (Asphalt access road)",
+                    "Asphaltzufahrt und Stellplätze",
                     "m2",
                     1200,
                     48.00,
                     {"din276": "540"},
                 ),
-                ("540.2", "Betonpflaster Gehwege 200x100 (Concrete paving)", "m2", 1600, 68.00, {"din276": "540"}),
-                ("540.3", "Bepflanzung und Rasen (Landscaping/planting)", "m2", 2400, 28.00, {"din276": "540"}),
-                ("540.4", "Kinderspielplatz EN 1176 (Children's playground)", "lsum", 1, 48000.00, {"din276": "540"}),
-                ("540.5", "Fahrradabstellanlage ueberdacht (Bicycle storage)", "pcs", 96, 120.00, {"din276": "540"}),
-                ("540.6", "Muellstandplatz mit Einhausung (Waste enclosure)", "pcs", 2, 9500.00, {"din276": "540"}),
-                ("540.7", "Aussenbeleuchtung Pollerleuchten (External lighting)", "pcs", 45, 850.00, {"din276": "540"}),
-                ("540.8", "Grundstueckseinfriedung Zaun (Boundary fencing)", "m", 280, 95.00, {"din276": "540"}),
-                ("540.9", "Tiefgarage Zufahrtsrampe Beton (Garage access ramp)", "m2", 180, 185.00, {"din276": "540"}),
-                ("540.10", "Briefkastenanlage Edelstahl (Mailbox installation)", "pcs", 48, 95.00, {"din276": "540"}),
-                ("540.11", "Schmutzfangmatte Eingangsbereich (Entrance matting)", "m2", 24, 145.00, {"din276": "540"}),
+                ("540.2", "Betonpflaster Gehwege 200x100", "m2", 1600, 68.00, {"din276": "540"}),
+                ("540.3", "Bepflanzung und Rasen", "m2", 2400, 28.00, {"din276": "540"}),
+                ("540.4", "Kinderspielplatz EN 1176", "lsum", 1, 48000.00, {"din276": "540"}),
+                ("540.5", "Fahrradabstellanlage überdacht", "pcs", 96, 120.00, {"din276": "540"}),
+                ("540.6", "Müllstandplatz mit Einhausung", "pcs", 2, 9500.00, {"din276": "540"}),
+                ("540.7", "Außenbeleuchtung Pollerleuchten", "pcs", 45, 850.00, {"din276": "540"}),
+                ("540.8", "Grundstückseinfriedung Zaun", "m", 280, 95.00, {"din276": "540"}),
+                ("540.9", "Tiefgarage Zufahrtsrampe Beton", "m2", 180, 185.00, {"din276": "540"}),
+                ("540.10", "Briefkastenanlage Edelstahl", "pcs", 48, 95.00, {"din276": "540"}),
+                ("540.11", "Schmutzfangmatte Eingangsbereich", "m2", 24, 145.00, {"din276": "540"}),
             ],
         ),
     ],
     markups=[
         ("Baustellengemeinkosten (BGK)", 10.0, "overhead", "direct_cost"),
-        ("Allgemeine Geschaeftskosten (AGK)", 8.0, "overhead", "direct_cost"),
+        ("Allgemeine Geschäftskosten (AGK)", 8.0, "overhead", "direct_cost"),
         ("Wagnis (W)", 2.0, "contingency", "direct_cost"),
         ("Gewinn (G)", 3.0, "profit", "direct_cost"),
         ("Mehrwertsteuer (MwSt.)", 19.0, "tax", "cumulative"),
     ],
     total_months=22,
-    tender_name="Rohbau (Structural)",
+    tender_name="Rohbau",
     tender_companies=[
-        ("Hochtief AG", "tender@hochtief.de", 0.98),
-        ("Strabag SE", "bids@strabag.com", 1.05),
-        ("Zueblin GmbH", "vergabe@zueblin.de", 1.02),
+        ("Verdanko Hochbau AG", "tender@verdanko-hochbau.example", 0.98),
+        ("Terrolt Bauunternehmung SE", "bids@terrolt-bau.example", 1.05),
+        ("Kessmar Rohbau GmbH", "vergabe@kessmar-rohbau.example", 1.02),
     ],
     project_metadata={
-        "address": "Chausseestrasse 45, 10115 Berlin",
-        "client": "Berliner Wohnungsbaugesellschaft mbH",
-        "architect": "Sauerbruch Hutton",
+        "address": "Chausseestraße 45, 10115 Berlin",
+        "client": "Vennhof Wohnbaugesellschaft mbH",
+        "architect": "Rehwald Tannberg",
         "gfa_m2": 7800,
         "units": 48,
         "storeys": 6,
@@ -669,62 +855,62 @@ _BERLIN = DemoTemplate(
     },
     tender_packages=[
         (
-            "Rohbau (Structural)",
-            "Erdarbeiten, Gruendung, Stahlbetonrohbau, Mauerwerk",
+            "Rohbau",
+            "Erdarbeiten, Gründung, Stahlbetonrohbau, Mauerwerk",
             "evaluating",
             [
-                ("Hochtief AG", "tender@hochtief.de", 0.98),
-                ("Strabag SE", "bids@strabag.com", 1.05),
-                ("Zueblin GmbH", "vergabe@zueblin.de", 1.02),
+                ("Verdanko Hochbau AG", "tender@verdanko-hochbau.example", 0.98),
+                ("Terrolt Bauunternehmung SE", "bids@terrolt-bau.example", 1.05),
+                ("Kessmar Rohbau GmbH", "vergabe@kessmar-rohbau.example", 1.02),
             ],
         ),
         (
-            "Fassade/Dach (Envelope)",
-            "WDVS, Putzarbeiten, Flachdachabdichtung, Begruenungen",
+            "Fassade/Dach",
+            "WDVS, Putzarbeiten, Flachdachabdichtung, Begrünungen",
             "evaluating",
             [
-                ("Sto SE & Co. KGaA", "vergabe@sto.de", 0.97),
-                ("Caparol / DAW SE", "ausschreibung@caparol.de", 1.04),
-                ("Brillux GmbH", "tender@brillux.de", 1.01),
+                ("Sanverth Fassadensysteme SE & Co. KGaA", "vergabe@sanverth.example", 0.97),
+                ("Farbwerk Odenau SE", "ausschreibung@farbwerk-odenau.example", 1.04),
+                ("Lorvend Anstrichsysteme GmbH", "tender@lorvend.example", 1.01),
             ],
         ),
         (
-            "HLS Heizung/Lueftung/Sanitaer (MEP Mechanical)",
-            "Waermepumpe, Fussbodenheizung, Lueftung, Sanitaerinstallation",
+            "HLS Heizung/Lüftung/Sanitär",
+            "Wärmepumpe, Fußbodenheizung, Lüftung, Sanitärinstallation",
             "evaluating",
             [
-                ("Imtech Deutschland", "vergabe@imtech.de", 0.99),
-                ("Caverion GmbH", "angebote@caverion.de", 1.06),
-                ("Goldbeck Gebaudetechnik", "hls@goldbeck.de", 1.03),
+                ("Norvent Gebäudetechnik", "vergabe@norvent.example", 0.99),
+                ("Thalvent Gebäudetechnik GmbH", "angebote@thalvent.example", 1.06),
+                ("Weidmar Gebäudetechnik", "hls@weidmar.example", 1.03),
             ],
         ),
         (
-            "Elektro (MEP Electrical)",
-            "Stark- und Schwachstrominstallation, Beleuchtung, E-Mobilitaet",
+            "Elektro",
+            "Stark- und Schwachstrominstallation, Beleuchtung, E-Mobilität",
             "evaluating",
             [
-                ("Cegelec / VINCI Energies", "angebote@cegelec.de", 0.97),
-                ("Spie GmbH", "tender@spie.de", 1.05),
-                ("Wisag Elektrotechnik", "vergabe@wisag.de", 1.02),
+                ("Elvenau / Vercelin Energies", "angebote@elvenau.example", 0.97),
+                ("Alvenor Elektrotechnik GmbH", "tender@alvenor.example", 1.05),
+                ("Vellingrat Elektrotechnik", "vergabe@vellingrat-elektro.example", 1.02),
             ],
         ),
         (
-            "Innenausbau (Interior Finishes)",
-            "Trockenbau, Estrich, Fliesen, Parkett, Malerarbeiten, Tueren",
+            "Innenausbau",
+            "Trockenbau, Estrich, Fliesen, Parkett, Malerarbeiten, Türen",
             "evaluating",
             [
-                ("Lindner Group", "vergabe@lindner-group.com", 0.96),
-                ("Brochier Ausbau", "angebote@brochier.de", 1.04),
-                ("Wolff & Mueller Ausbau", "ausbau@wolff-mueller.de", 1.01),
+                ("Falkwerk Innenausbau Gruppe", "vergabe@falkwerk-gruppe.example", 0.96),
+                ("Trennfeld Ausbau", "angebote@trennfeld.example", 1.04),
+                ("Reinberg & Sauter Ausbau", "ausbau@reinberg-sauter.example", 1.01),
             ],
         ),
         (
-            "Aussenanlagen (External Works)",
+            "Außenanlagen",
             "Pflasterung, Bepflanzung, Spielplatz, Zaun, Beleuchtung",
             "evaluating",
             [
-                ("Galabau Meier GmbH", "angebote@galabau-meier.de", 0.99),
-                ("GreenTech Landschaftsbau", "vergabe@greentech-gala.de", 1.06),
+                ("Wandelrieth Landschaftsbau GmbH", "angebote@wandelrieth-galabau.example", 0.99),
+                ("Kranzhofen Landschaftsbau", "vergabe@kranzhofen-gala.example", 1.06),
             ],
         ),
     ],
@@ -736,7 +922,7 @@ _BERLIN = DemoTemplate(
 
 _LONDON = DemoTemplate(
     demo_id="office-london",
-    project_name="One Canary Square",
+    project_name="Halesworth Wharf Tower",
     project_description=(
         "New-build 12-storey Grade A office tower with 2-level basement car park. "
         "Steel frame, composite floors, unitised curtain walling. "
@@ -748,7 +934,7 @@ _LONDON = DemoTemplate(
     currency="GBP",
     locale="en",
     address={
-        "street": "1 Canada Square, Canary Wharf",
+        "street": "8 Thorne Quay, Eastferry Reach",
         "city": "London",
         "postcode": "E14 5AB",
         "country": "United Kingdom",
@@ -889,14 +1075,14 @@ _LONDON = DemoTemplate(
     total_months=24,
     tender_name="Shell & Core Package",
     tender_companies=[
-        ("Laing O'Rourke", "tenders@lor.com", 0.96),
-        ("Balfour Beatty", "bids@bb.com", 1.08),
-        ("Mace Group", "proc@mace.com", 1.01),
+        ("Brenhall Construction", "tenders@brenhall.example", 0.96),
+        ("Tarnwick Infrastructure", "bids@tarnwick.example", 1.08),
+        ("Marlwen Group", "proc@marlwen.example", 1.01),
     ],
     project_metadata={
-        "address": "Canary Wharf, London E14",
-        "client": "Canary Wharf Group plc",
-        "architect": "Foster + Partners",
+        "address": "Eastferry Reach, London E14",
+        "client": "Vittram Estates plc",
+        "architect": "Calmoor + Partners",
         "gia_m2": 16400,
         "nia_m2": 12800,
         "storeys": 12,
@@ -932,10 +1118,10 @@ _US_MEDICAL = DemoTemplate(
     validation_rule_sets=["masterformat", "boq_quality"],
     project_metadata={"building_type": "hospital", "area_m2": 25000, "stories": 5},
     boq_name="Downtown Medical Center \u2014 Full Estimate",
-    boq_description="Detailed cost estimate for 200-bed medical center, MasterFormat divisions",
+    boq_description="Detailed cost estimate for 200-bed medical center, standard divisions",
     budget_boq_name="Downtown Medical Center - Budget Estimate",
     boq_metadata={
-        "standard": "CSI MasterFormat 2018",
+        "standard": "Division-based work-results classification",
         "phase": "Detailed Estimate",
         "base_date": "2025-Q2",
         "price_level": "US National Average 2025",
@@ -1085,9 +1271,9 @@ _US_MEDICAL = DemoTemplate(
     total_months=22,
     tender_name="Structural Steel Package",
     tender_companies=[
-        ("Turner Construction", "bids@turnerconstruction.com", 0.97),
-        ("Skanska USA", "tenders@skanska.us", 1.04),
-        ("Whiting-Turner", "procurement@whiting-turner.com", 1.01),
+        ("Brackwell Construction", "bids@brackwell.example", 0.97),
+        ("Nordholt Construction USA", "tenders@nordholt.example", 1.04),
+        ("Ellsmere-Payne", "procurement@ellsmere-payne.example", 1.01),
     ],
     tender_packages=[
         (
@@ -1095,9 +1281,9 @@ _US_MEDICAL = DemoTemplate(
             "Structural steel frame, metal deck, connections, fireproofing",
             "evaluating",
             [
-                ("Turner Construction", "bids@turnerconstruction.com", 0.97),
-                ("Skanska USA", "tenders@skanska.us", 1.04),
-                ("Whiting-Turner", "procurement@whiting-turner.com", 1.01),
+                ("Brackwell Construction", "bids@brackwell.example", 0.97),
+                ("Nordholt Construction USA", "tenders@nordholt.example", 1.04),
+                ("Ellsmere-Payne", "procurement@ellsmere-payne.example", 1.01),
             ],
         ),
         (
@@ -1105,9 +1291,9 @@ _US_MEDICAL = DemoTemplate(
             "Mechanical, electrical, plumbing, fire protection, medical gas",
             "evaluating",
             [
-                ("JE Dunn Construction", "bids@jedunn.com", 0.98),
-                ("Hensel Phelps", "tenders@henselphelps.com", 1.05),
-                ("Robins & Morton", "procurement@robinsmorton.com", 1.02),
+                ("RM Falgren Construction", "bids@rmfalgren.example", 0.98),
+                ("Skelverne Builders", "tenders@skelverne.example", 1.05),
+                ("Rowan & Merrick", "procurement@rowanmerrick.example", 1.02),
             ],
         ),
     ],
@@ -1163,7 +1349,7 @@ _DUBAI = DemoTemplate(
     boq_name="Cost Estimate \u2014 Logistics Warehouse",
     boq_description="Detailed cost estimate for Jebel Ali logistics facility",
     boq_metadata={
-        "standard": "CSI MasterFormat 2018",
+        "standard": "Division-based work-results classification",
         "phase": "Detailed Estimate",
         "base_date": "2026-Q2",
         "price_level": "Dubai 2026",
@@ -1255,14 +1441,14 @@ _DUBAI = DemoTemplate(
     total_months=12,
     tender_name="Main Construction Package",
     tender_companies=[
-        ("Alec Engineering", "bids@alec.ae", 0.97),
-        ("Arabtec Construction", "tender@arabtec.com", 1.06),
-        ("Al Habtoor Leighton", "procurement@hlg.ae", 1.02),
+        ("Rimaya Engineering & Contracting", "bids@rimaya.example", 0.97),
+        ("Gulfmarq Construction", "tender@gulfmarq.example", 1.06),
+        ("Al Munthir Constructors", "procurement@almunthir.example", 1.02),
     ],
     project_metadata={
         "address": "Jebel Ali Free Zone, Dubai, UAE",
-        "client": "DP World Logistics",
-        "architect": "Khatib & Alami",
+        "client": "Marsa Gate Logistics",
+        "architect": "Miraaf Design Consultants",
         "gfa_m2": 45000,
         "clear_height_m": 12,
         "loading_docks": 8,
@@ -1276,7 +1462,7 @@ _DUBAI = DemoTemplate(
 
 _PARIS = DemoTemplate(
     demo_id="school-paris",
-    project_name="Ecole Primaire Belleville",
+    project_name="École Primaire Belleville",
     project_description=(
         "Construction d'une ecole primaire de 15 classes, gymnase, cantine, "
         "preau, et aires de jeux. Surface de plancher 4.200 m2. "
@@ -1885,14 +2071,14 @@ _PARIS = DemoTemplate(
     total_months=18,
     tender_name="Lot Gros Oeuvre (Structural/Foundations)",
     tender_companies=[
-        ("Bouygues Batiment", "appels@bouygues.fr", 0.98),
-        ("Eiffage Construction", "marches@eiffage.fr", 1.05),
-        ("Vinci Construction", "offres@vinci-construction.fr", 1.01),
+        ("Vaurenne Batiment", "appels@vaurenne.example", 0.98),
+        ("Tholmery Construction", "marches@tholmery.example", 1.05),
+        ("Vercelin Construction", "offres@vercelin-construction.example", 1.01),
     ],
     project_metadata={
         "address": "Rue de Belleville 120, 75020 Paris",
         "client": "Mairie de Paris - DASCO",
-        "architect": "Atelier du Pont",
+        "architect": "Atelier Tremoy",
         "sdp_m2": 4200,
         "classrooms": 15,
         "gymnasium_m2": 600,
@@ -1906,9 +2092,9 @@ _PARIS = DemoTemplate(
             "Terrassement, fondations, beton arme, maconnerie",
             "evaluating",
             [
-                ("Bouygues Batiment", "appels@bouygues.fr", 0.98),
-                ("Eiffage Construction", "marches@eiffage.fr", 1.05),
-                ("Vinci Construction", "offres@vinci-construction.fr", 1.01),
+                ("Vaurenne Batiment", "appels@vaurenne.example", 0.98),
+                ("Tholmery Construction", "marches@tholmery.example", 1.05),
+                ("Vercelin Construction", "offres@vercelin-construction.example", 1.01),
             ],
         ),
         (
@@ -1916,9 +2102,9 @@ _PARIS = DemoTemplate(
             "Structure CLT, lamelle-colle, toiture, etancheite, photovoltaique",
             "evaluating",
             [
-                ("Mathis (Groupe Dassault)", "appels@mathis.eu", 0.97),
-                ("Piveteaubois", "marches@piveteaubois.com", 1.04),
-                ("Rubner Holzbau", "offres@rubner.com", 1.02),
+                ("Charnay (Groupe Vireval)", "appels@charnay-bois.example", 0.97),
+                ("Fauveaubois", "marches@fauveaubois.example", 1.04),
+                ("Aldrein Holzbau", "offres@aldrein.example", 1.02),
             ],
         ),
         (
@@ -1926,9 +2112,9 @@ _PARIS = DemoTemplate(
             "Geothermie, plancher chauffant, ventilation, plomberie sanitaire",
             "evaluating",
             [
-                ("Dalkia (Groupe EDF)", "appels@dalkia.fr", 0.99),
-                ("Engie Solutions", "marches@engie.fr", 1.06),
-                ("Idex Energies", "offres@idex.fr", 1.03),
+                ("Calorna (Groupe Enervia)", "appels@calorna.example", 0.99),
+                ("Solvenar Solutions", "marches@solvenar.example", 1.06),
+                ("Novarem Energies", "offres@novarem.example", 1.03),
             ],
         ),
         (
@@ -1936,9 +2122,9 @@ _PARIS = DemoTemplate(
             "Courant fort, courant faible, SSI, photovoltaique raccordement",
             "evaluating",
             [
-                ("Cegelec (VINCI Energies)", "appels@cegelec.fr", 0.97),
-                ("Spie France", "marches@spie.fr", 1.05),
-                ("Eiffage Energie Systemes", "offres@eiffage-energie.fr", 1.02),
+                ("Elvenau (Vercelin Energies)", "appels@elvenau.example", 0.97),
+                ("Alvenor France", "marches@alvenor.example", 1.05),
+                ("Tholmery Energie Systemes", "offres@tholmery-energie.example", 1.02),
             ],
         ),
         (
@@ -1946,9 +2132,9 @@ _PARIS = DemoTemplate(
             "Cloisons, revetements sols/murs, menuiseries interieures, amenagements exterieurs",
             "evaluating",
             [
-                ("Malet (Groupe Fayat)", "appels@malet.fr", 0.98),
-                ("Bateg (Groupe Vinci)", "marches@bateg.fr", 1.04),
-                ("Sogea Ile-de-France", "offres@sogea-idf.fr", 1.01),
+                ("Ravineau (Groupe Tolbiac)", "appels@ravineau.example", 0.98),
+                ("Bregat (Groupe Vercelin)", "marches@bregat.example", 1.04),
+                ("Vaudrey Ile-de-France", "offres@vaudrey-idf.example", 1.01),
             ],
         ),
     ],
@@ -1972,8 +2158,8 @@ DEMO_TEMPLATES: dict[str, DemoTemplate] = {t.demo_id: t for t in [_BERLIN, _LOND
 
 # Fresh-install seed: four demo projects covering the broadest spread of
 # archetypes (residential, industrial, healthcare/intl, education/fit-out)
-# without leaning on a single very large UK example. The London/One Canary
-# Square template stays available in DEMO_TEMPLATES for ad-hoc install via
+# without leaning on a single very large UK example. The London office-tower
+# template stays available in DEMO_TEMPLATES for ad-hoc install via
 # POST /api/demo/install/office-london, but it isn't auto-seeded because
 # operators consistently asked us to drop it from the default workspace.
 DEFAULT_DEMO_IDS: tuple[str, ...] = (
@@ -1983,12 +2169,13 @@ DEFAULT_DEMO_IDS: tuple[str, ...] = (
     "medical-us",  # international healthcare - US MasterFormat, USD
 )
 
-# Rich generic-install showcase: the nine non-flagship country projects that a
+# Rich generic-install showcase: the twelve non-flagship country projects that a
 # normal (no pack) install seeds alongside the flagship reference project so the
 # fresh workspace lands a fully worked-out, globe-spanning portfolio. Ordered to
 # read residential -> industrial -> education -> healthcare -> commercial across
-# DACH, Gulf, FR, US, China, Brazil, India and Canada, closed by the German food
-# retail showcase. Each id resolves to a DemoTemplate (built-in or pack-authored,
+# DACH, Gulf, FR, US, China, Brazil, India and Canada, closed by the German
+# showcase quartet (Heilbronn, Frankfurt, Heidelberg, Karlsruhe). Each id
+# resolves to a DemoTemplate (built-in or pack-authored,
 # auto-registered from demo_packs/) so install_demo_project materializes the
 # full module set per project. The retail showcase is additionally backfilled
 # flagship-style on every boot (main.py) so existing installs pick it up.
@@ -2002,6 +2189,12 @@ SHOWCASE_DEMO_IDS: tuple[str, ...] = (
     "govt-building-delhi",  # India - CPWD, INR
     "condo-toronto",  # Canada - residential, CAD
     "retail-market-heilbronn",  # Germany - food retail, DIN 276 + GAEB, EUR
+    # The German showcase quartet: the three pack-authored siblings of the
+    # Heilbronn flagship, so a fresh install seeds all four German projects
+    # out of the box instead of leaving three behind POST /api/demo/install.
+    "office-frankfurt",  # Germany - BIM office, DIN 276 + HOAI, EUR
+    "retail-market-heidelberg",  # Germany - food retail, DIN 276, EUR
+    "retail-market-karlsruhe",  # Germany - food retail, DIN 276, EUR
 )
 
 # Catalog info for the marketplace / frontend
@@ -2033,7 +2226,7 @@ DEMO_CATALOG: list[dict] = [
         "name": "Downtown Medical Center",
         "description": (
             "200-bed hospital with ED, surgical suites, diagnostic imaging."
-            " 5-story steel frame. MasterFormat classification with full MEP systems."
+            " 5-story steel frame. Division-based classification with full MEP systems."
         ),
         "country": "US",
         "currency": "USD",
@@ -2091,7 +2284,7 @@ PACK_DEMO_PROJECT: dict[str, str] = {
     "saudi-vision2030": "mixed-use-riyadh",
     "south-africa": "mixed-use-johannesburg",
     "uk-jct": "commercial-london",
-    "us-rsmeans": "commercial-denver",
+    "us-costdata": "commercial-denver",
 }
 
 # Country-name → ISO 3166-1 alpha-2, for catalog rows auto-derived from a
@@ -2282,7 +2475,7 @@ async def _get_or_create_owner(session: AsyncSession) -> uuid.UUID:
             id=_id(),
             email="demo@openconstructionerp.com",
             hashed_password="$2b$12$DEMO_HASH_NOT_FOR_PRODUCTION_USE_ONLY",
-            full_name="Demo User",
+            full_name="Elena Marchetti",
             role="admin",
             locale="en",
             is_active=True,
@@ -2430,24 +2623,24 @@ _MATERIAL_HEAVY_KW = (
     "abdichtung",
     "waterproof",
     "insulation",
-    "daemmung",
+    "dämmung",
     "isolation",
     "window",
     "fenster",
     "glazing",
     "door",
-    "tuer",
+    "tür",
     "porte",
     "cladding",
     "fassade",
     "bardage",
     "hvac",
     "heating",
-    "lueftung",
+    "lüftung",
     "electrical",
     "elektro",
     "plumbing",
-    "sanitaer",
+    "sanitär",
     "elevator",
     "aufzug",
     "lift",
@@ -2671,7 +2864,7 @@ def _enrich_position_metadata(description: str, unit: str, unit_rate: float, cla
                 ("Scaffolding", "equipment", 0.05, 40.0),
             ],
         )
-    elif any(k in desc_lower for k in ["insulation", "daemmung", "dämmung", "isolation", "thermal"]):
+    elif any(k in desc_lower for k in ["insulation", "dämmung", "dämmung", "isolation", "thermal"]):
         meta["cwicr_ref"] = "CWICR-INS-001"
         meta["resources"] = _make_resources(
             unit_rate,
@@ -2729,15 +2922,15 @@ def _enrich_position_metadata(description: str, unit: str, unit_rate: float, cla
         for k in [
             "hvac",
             "heating",
-            "lueftung",
+            "lüftung",
             "lüftung",
             "heizung",
             "ventilation",
             "air handling",
             "klima",
-            "waermepumpe",
+            "wärmepumpe",
             "wärme",
-            "fussbodenheizung",
+            "fußbodenheizung",
             "heizk",
         ]
     ):
@@ -2756,14 +2949,14 @@ def _enrich_position_metadata(description: str, unit: str, unit_rate: float, cla
         k in desc_lower
         for k in [
             "plumbing",
-            "sanitaer",
+            "sanitär",
             "sanitär",
             "drainage",
             "water supply",
             "plomberie",
             "abwasser",
             "trinkwasser",
-            "entwaesserung",
+            "entwässerung",
         ]
     ):
         meta["cwicr_ref"] = "CWICR-PLB-001"
@@ -2849,7 +3042,7 @@ def _enrich_position_metadata(description: str, unit: str, unit_rate: float, cla
                 ("Cutting tools", "equipment", 0.05, 30.0),
             ],
         )
-    elif any(k in desc_lower for k in ["door", "tuer", "tür", "porte"]):
+    elif any(k in desc_lower for k in ["door", "tür", "tür", "porte"]):
         meta["cwicr_ref"] = "CWICR-DOR-001"
         meta["resources"] = _make_resources(
             unit_rate,
@@ -2873,7 +3066,7 @@ def _enrich_position_metadata(description: str, unit: str, unit_rate: float, cla
                 ("Testing equipment", "equipment", 0.10, 45.0),
             ],
         )
-    elif any(k in desc_lower for k in ["pile", "pfahl", "pieux", "bohrpfaehle"]):
+    elif any(k in desc_lower for k in ["pile", "pfahl", "pieux", "bohrpfähle"]):
         meta["cwicr_ref"] = "CWICR-PIL-001"
         meta["resources"] = _make_resources(
             unit_rate,
@@ -2953,15 +3146,15 @@ def _enrich_position_metadata(description: str, unit: str, unit_rate: float, cla
             "dewatering",
             "wasserhaltung",
             "backfill",
-            "verfuellung",
-            "hinterfuellung",
+            "verfüllung",
+            "hinterfüllung",
             "verdichtung",
             "compaction",
-            "boeschung",
+            "böschung",
             "slope",
             "kampfmittel",
             "ordnance",
-            "baustrasse",
+            "baustraße",
             "haul road",
             "soil disposal",
             "bodenabtransport",
@@ -3045,7 +3238,7 @@ def _enrich_position_metadata(description: str, unit: str, unit_rate: float, cla
             "separator",
             "revisionsschae",
             "inspection chamber",
-            "sanitaerobjekt",
+            "sanitärobjekt",
             "sanitary fixture",
             "trinkwasser",
         ]
@@ -3066,15 +3259,15 @@ def _enrich_position_metadata(description: str, unit: str, unit_rate: float, cla
         for k in [
             "pufferspeicher",
             "buffer",
-            "gebaeudeautomation",
+            "gebäudeautomation",
             "bms",
             "dunstabzug",
             "kitchen extract",
-            "schalldaempfer",
+            "schalldämpfer",
             "attenuator",
             "dachhaube",
             "cowl",
-            "lueftungsgitter",
+            "lüftungsgitter",
             "grille",
         ]
     ):
@@ -3120,7 +3313,7 @@ def _enrich_position_metadata(description: str, unit: str, unit_rate: float, cla
             "escalier",
             "podest",
             "landing",
-            "gelaender",
+            "geländer",
             "balustrade",
             "railing",
             "garde-corps",
@@ -3227,11 +3420,11 @@ def _enrich_position_metadata(description: str, unit: str, unit_rate: float, cla
             "gravel",
             "ballast",
             "substrat",
-            "gruendach",
+            "gründach",
             "green roof",
             "lichtkuppel",
             "rooflight",
-            "durchfuehrung",
+            "durchführung",
             "penetration",
         ]
     ):
@@ -3255,7 +3448,7 @@ def _enrich_position_metadata(description: str, unit: str, unit_rate: float, cla
             "fahrrad",
             "bicycle",
             "vélo",
-            "muellstand",
+            "müllstand",
             "waste enclosure",
             "poubelle",
             "briefkasten",
@@ -3408,7 +3601,7 @@ def _enrich_position_metadata(description: str, unit: str, unit_rate: float, cla
             "refriger",
             "chambre froide",
             "cooling",
-            "kuehlung",
+            "kühlung",
         ]
     ):
         meta["cwicr_ref"] = "CWICR-REF-001"
@@ -3758,12 +3951,12 @@ def _enrich_position_metadata(description: str, unit: str, unit_rate: float, cla
     elif any(
         k in desc_lower
         for k in [
-            "ft-stuetzen",
+            "ft-stützen",
             "ft-attika",
             "fertigteil",
-            "koecher",
-            "vergussmoertel",
-            "sichtoberflaechen",
+            "köcher",
+            "vergussmörtel",
+            "sichtoberflächen",
         ]
     ):
         meta["cwicr_ref"] = "CWICR-FTC-001"
@@ -3805,14 +3998,14 @@ def _enrich_position_metadata(description: str, unit: str, unit_rate: float, cla
         k in desc_lower
         for k in [
             "co2",
-            "kuehlraum",
+            "kühlraum",
             "tk-zelle",
-            "luftkuehler",
+            "luftkühler",
             "verdampfer",
             "enthitzer",
             "kondensator",
-            "waermerueckgewinnung",
-            "kaeltetechnik",
+            "wärmerückgewinnung",
+            "kältetechnik",
             "wartungsvertrag",
         ]
     ):
@@ -3836,7 +4029,7 @@ def _enrich_position_metadata(description: str, unit: str, unit_rate: float, cla
             "bodentank",
             "einbruchmelde",
             "m-bus",
-            "energiezaehler",
+            "energiezähler",
             "din vde",
             "leerrohrtrasse",
             "trafostation",
@@ -3881,13 +4074,13 @@ def _enrich_position_metadata(description: str, unit: str, unit_rate: float, cla
     elif any(
         k in desc_lower
         for k in [
-            "wasserzaehler",
+            "wasserzähler",
             "druckminderer",
             "feinfilter",
-            "spuelung",
+            "spülung",
             "desinfektion",
             "zisterne",
-            "uebergabescha",
+            "übergabescha",
         ]
     ):
         meta["cwicr_ref"] = "CWICR-PLB-003"
@@ -3909,7 +4102,7 @@ def _enrich_position_metadata(description: str, unit: str, unit_rate: float, cla
             "ballenpresse",
             "scheuersaug",
             "wertstoffe",
-            "muellpress",
+            "müllpress",
             "rvm",
             "sortieranlage",
             "verschleisspaket",
@@ -3937,12 +4130,12 @@ def _enrich_position_metadata(description: str, unit: str, unit_rate: float, cla
             "einkaufswagen",
             "pfandbon",
             "backstation",
-            "praesentation",
-            "aktionsmoebel",
-            "moebel",
+            "präsentation",
+            "aktionsmöbel",
+            "möbel",
             "spinde",
             "gondelkopf",
-            "erstbestueckung",
+            "erstbestückung",
             "ladeneinrichtung",
             "warentrenner",
             "brotregal",
@@ -3982,7 +4175,7 @@ def _enrich_position_metadata(description: str, unit: str, unit_rate: float, cla
         k in desc_lower
         for k in [
             "rasterdecke",
-            "revisionsoeffnung",
+            "revisionsöffnung",
             "unterdecke",
         ]
     ):
@@ -4004,8 +4197,8 @@ def _enrich_position_metadata(description: str, unit: str, unit_rate: float, cla
             "dock-tor",
             "rolltor",
             "schnelllauftor",
-            "beschlaege",
-            "schliessanlage",
+            "beschläge",
+            "schließanlage",
             "glasreinigung",
             "einstellarbeiten",
         ]
@@ -4038,9 +4231,9 @@ def _enrich_position_metadata(description: str, unit: str, unit_rate: float, cla
         for k in [
             "bodenaustausch",
             "tragschicht",
-            "auffuellung",
+            "auffüllung",
             "verdichtet",
-            "ueberschussmassen",
+            "überschussmassen",
             "entsorgung",
             "abfuhr",
             "frostschutzschicht",
@@ -4064,7 +4257,7 @@ def _enrich_position_metadata(description: str, unit: str, unit_rate: float, cla
             "einbauteile",
             "kernbohrung",
             "industrieboden",
-            "oberflaechenhaert",
+            "oberflächenhärt",
             "trennlage",
             "pe-folie",
         ]
@@ -4085,7 +4278,7 @@ def _enrich_position_metadata(description: str, unit: str, unit_rate: float, cla
         for k in [
             "bordstein",
             "einfassung",
-            "belagsflaechen",
+            "belagsflächen",
         ]
     ):
         meta["cwicr_ref"] = "CWICR-PAV-002"
@@ -4103,7 +4296,7 @@ def _enrich_position_metadata(description: str, unit: str, unit_rate: float, cla
         k in desc_lower
         for k in [
             "baumscheibe",
-            "bewaesserung",
+            "bewässerung",
             "pflanzung",
             "hochbeet",
             "entwicklungspflege",
@@ -4129,7 +4322,7 @@ def _enrich_position_metadata(description: str, unit: str, unit_rate: float, cla
         k in desc_lower
         for k in [
             "sozialcontainer",
-            "buerocontainer",
+            "bürocontainer",
             "container",
             "bauschild",
             "verkehrssicherung",
@@ -4139,7 +4332,7 @@ def _enrich_position_metadata(description: str, unit: str, unit_rate: float, cla
             "endreinigung",
             "gemeinkosten",
             "bautagesbericht",
-            "schnurgeruest",
+            "schnurgerüst",
             "absteckung",
         ]
     ):
@@ -4193,8 +4386,8 @@ def _enrich_position_metadata(description: str, unit: str, unit_rate: float, cla
 def _clean_trade(section_title: str) -> str:
     """Extract a short, human trade label from a section title.
 
-    Section titles look like ``"KG 330 - Aussenwande"`` or
-    ``"Division 03 - Concrete"`` or ``"2.1 Structural Steel"``. Strip a
+    Section titles look like ``"KG 330 - Außenwände"`` or
+    ``"Division 03 - Cast-in-place concrete"`` or ``"2.1 Structural Steel"``. Strip a
     leading code token + separator so we keep the readable trade name.
     """
     title = " ".join(str(section_title or "").split())
@@ -4251,6 +4444,29 @@ def _country_code_for(template: DemoTemplate) -> str:
     """Best-effort ISO-3166 alpha-2 from the template address country name."""
     addr = template.address or {}
     return _COUNTRY_ISO2.get(str(addr.get("country", "")), "")
+
+
+def _period_label(base: datetime, offset_months: int) -> str:
+    """Return the ``YYYY-MM`` label of the month ``offset_months`` after ``base``.
+
+    The month carries into the year, which is the whole point. Wrapping the
+    month with ``% 12`` while keeping ``base.year`` is what the progress
+    series did before: a 22-month programme starting in April labelled its
+    13th month exactly like its 1st. Readings are keyed by that label, so the
+    two collided, and sorting the collided labels turned a monotone ladder
+    into a collapse - the S-curve fell 36.7 points in a single month and
+    ended the year below its own July. Every demo project is affected the
+    moment it runs past its start month a year later.
+
+    Args:
+        base: Project start; only its year and month are read.
+        offset_months: Whole months after ``base``, 0 being the start month.
+
+    Returns:
+        The period label, sortable as a string because the year leads it.
+    """
+    total = base.month - 1 + offset_months
+    return f"{base.year + total // 12}-{total % 12 + 1:02d}"
 
 
 def _generate_module_data(
@@ -4334,6 +4550,14 @@ def _generate_module_data(
             "notes": "Structural engineer",
         },
     ]
+    # E-invoice showcase: the client contact doubles as the buyer of the
+    # seeded receivable invoice, and EN 16931 reads the buyer's postal
+    # address, VAT id and legal name off that contact (einvoice_parties).
+    # Merged here so the master data lives on the directory record once
+    # instead of being retyped onto the invoice.
+    buyer_extra = (template.einvoice_showcase or {}).get("buyer_contact")
+    if isinstance(buyer_extra, dict):
+        contacts[0].update({k: v for k, v in buyer_extra.items() if v})
     # Add MEP + QS consultants only when the template names them, so demos
     # without metadata keep the original 3-consultant shape.
     if mep_name:
@@ -4362,19 +4586,26 @@ def _generate_module_data(
                 "notes": "Cost consultant / quantity surveyor",
             }
         )
-    if main_contractor_name:
-        contacts.append(
-            {
-                "contact_type": "contractor",
-                "company_name": main_contractor_name,
-                "first_name": "Project",
-                "last_name": "Director",
-                "primary_email": _email_for(main_contractor_name, "contact"),
-                "primary_phone": "",
-                "country_code": cc,
-                "notes": "Main contractor",
-            }
-        )
+    # Unconditional, where this used to be written only when the template named
+    # a firm. Every generated demo raises a main construction contract and a
+    # punch list, and both are with the main contractor, so a demo whose
+    # template happens not to name one still needs the party those rows point
+    # at. Without this row office-frankfurt seeded a main contract with no
+    # counterparty and a punch list that read Unassigned on every line, which is
+    # how the gap was found. Same reasoning as the authority contact below.
+    contractor_name = main_contractor_name or "Principal Contractor"
+    contacts.append(
+        {
+            "contact_type": "contractor",
+            "company_name": contractor_name,
+            "first_name": "Project",
+            "last_name": "Director",
+            "primary_email": _email_for(contractor_name, "contact"),
+            "primary_phone": "",
+            "country_code": cc,
+            "notes": "Main contractor",
+        }
+    )
     for i, (company, email) in enumerate(firms[:3]):
         contacts.append(
             {
@@ -4388,6 +4619,29 @@ def _generate_module_data(
                 "notes": f"{trades[i][1] if i < len(trades) else 'Works'} subcontractor",
             }
         )
+
+    # Every generated demo corresponds with a permitting body. The notice of
+    # commencement, its acknowledgement and the inspection report in the
+    # correspondence seed below are all to or from one, and without this row
+    # those three letters name a party that exists nowhere in the contact
+    # register, so nothing on the screen can link to it. The curated German
+    # demo has carried an authority contact for exactly this reason.
+    authority_city = (template.address or {}).get("city")
+    authority_slug = "".join(ch.lower() for ch in (authority_city or "") if ch.isalnum())[:24]
+    contacts.append(
+        {
+            "contact_type": "authority",
+            "company_name": (
+                f"{authority_city} Building Control Office" if authority_city else "Local Building Control Office"
+            ),
+            "first_name": "Building",
+            "last_name": "Inspector",
+            "primary_email": f"permits@{authority_slug or 'buildingcontrol'}.example",
+            "primary_phone": "",
+            "country_code": cc,
+            "notes": "Permitting and inspection authority",
+        }
+    )
 
     # ── Tasks (8-12 across the timeline) ─────────────────────────────────
     task_seeds = [
@@ -4482,14 +4736,79 @@ def _generate_module_data(
         )
 
     # ── Safety incidents (3-4) ───────────────────────────────────────────
-    incident_seeds = [
+    # Every project that falls through to this generator used to get the same
+    # four incidents with the same titles and the same root causes, so two
+    # projects rendered a safety register identical down to the pixel -
+    # measured across two demo projects whose screens compared 0 bits apart
+    # and 1.00 alike on text.
+    #
+    # A sliding window over the pool does not fix that: it can only produce as
+    # many registers as the pool is long, so a pool of seven left all 34
+    # templates sharing seven registers. Both the start and the step vary, which
+    # makes the slice a combination rather than a window. The pool length is
+    # prime, so every step from 1 to 10 walks all 11 entries before repeating
+    # and the four picks within one register are always distinct.
+    #
+    # Both are taken from the template's rank rather than from a hash of its
+    # id. A hash only makes a collision unlikely, and unlikely was not good
+    # enough here - hashing the id left four pairs of projects still sharing a
+    # register. Rank makes the (start, step) pair injective up to 110 templates,
+    # so no two projects can collide by construction. Ranking is over the sorted
+    # ids, so it does not move when the template literal is reordered, and it is
+    # stable across re-seeds of one build.
+    incident_pool = [
         ("near_miss", "moderate", "Near miss - material fell from height", "Edge protection gap"),
-        ("first_aid", "minor", "Minor hand laceration during handling", "Cut-resistant gloves not worn"),
+        ("injury", "minor", "Minor hand laceration during handling", "Cut-resistant gloves not worn"),
         ("near_miss", "moderate", "Plant / pedestrian near miss in laydown area", "Segregation not enforced"),
         ("property_damage", "minor", "Temporary services strike during excavation", "Service scan not refreshed"),
+        (
+            "near_miss",
+            "major",
+            "Load swung outside the exclusion zone during a lift",
+            "Lift plan not re-briefed after the crane moved",
+        ),
+        ("injury", "minor", "Eye irritation from airborne dust", "Water suppression not connected before cutting"),
+        (
+            "property_damage",
+            "moderate",
+            "Stacked materials toppled in high wind",
+            "Stack height above the method statement limit",
+        ),
+        (
+            "environmental",
+            "minor",
+            "Silt-laden runoff reached the site drain",
+            "Bunding not reinstated after the pour",
+        ),
+        ("injury", "moderate", "Slip on a wet access ramp", "Ramp left uncovered after the wash-down"),
+        (
+            "fire",
+            "minor",
+            "Smouldering waste bin beside hot works",
+            "Fire watch stood down before the cooling period ended",
+        ),
+        ("near_miss", "minor", "Scaffold board dislodged underfoot", "Board not clipped after an inspection"),
     ]
+    known = sorted(DEMO_TEMPLATES)
+    # An id outside the shipped estate still has to land somewhere, so it falls
+    # back to a position-weighted sum of its characters, offset past the known
+    # ranks. Weighting by position keeps two ids built from the same letters apart.
+    rank = (
+        known.index(demo_id)
+        if demo_id in DEMO_TEMPLATES
+        else len(known) + sum((i + 1) * ord(ch) for i, ch in enumerate(demo_id))
+    )
+    offset = rank % len(incident_pool)
+    step = 1 + (rank // len(incident_pool)) % (len(incident_pool) - 1)
+    incident_seeds = [incident_pool[(offset + k * step) % len(incident_pool)] for k in range(4)]
     safety_incidents: list[dict] = []
     for i, (itype, sev, title, cause) in enumerate(incident_seeds):
+        # The most recent incident is still under investigation and the one
+        # before it still has an action outstanding. Seeded entirely closed,
+        # the Open Incidents tile reads zero on every project and the register
+        # gives a reader nothing to work from.
+        last = i == len(incident_seeds) - 1
+        pending = i == len(incident_seeds) - 2
         safety_incidents.append(
             {
                 "incident_number": f"INC-{i + 1:03d}",
@@ -4499,30 +4818,46 @@ def _generate_module_data(
                 "incident_type": itype,
                 "severity": sev,
                 "description": f"{title} during {trades[i % len(trades)][1].lower() if trades else 'works'}.",
-                "root_cause": cause,
+                "root_cause": None if last else cause,
                 "corrective_actions": [
                     {
-                        "description": "Toolbox talk and re-brief affected crew",
+                        "description": (
+                            "Toolbox talk and re-brief affected crew"
+                            if not last
+                            else "Investigation under way, actions to follow"
+                        ),
                         "due_date": _d(13 + i * 9),
-                        "status": "completed",
+                        "status": "completed" if not (last or pending) else "open" if last else "in_progress",
                     }
                 ],
-                "status": "closed",
+                "status": "investigating" if last else "corrective_action" if pending else "closed",
             }
         )
 
     # ── Safety observations (6) ──────────────────────────────────────────
+    # (type, severity, likelihood, status, description).
+    #
+    # The types are the four ``ObservationCreate`` accepts. This list used to
+    # carry unsafe_behavior, housekeeping and environmental, none of which the
+    # API will take back and none of which the type picker offers, so a reader
+    # who opened one of those rows could not re-select the value it already
+    # held.
+    #
+    # The statuses are not all terminal on purpose. Seeded entirely closed, an
+    # observation register shows nothing to act on, and the whole point of the
+    # register is what is still outstanding.
     obs_seeds = [
-        ("unsafe_condition", 4, 3, "Scaffold handrail incomplete on working platform"),
-        ("unsafe_behavior", 3, 4, "Operative without eye protection during cutting"),
-        ("housekeeping", 3, 2, "Access route partially blocked by stored materials"),
-        ("unsafe_condition", 4, 3, "Unprotected slab edge at leading edge of works"),
-        ("environmental", 2, 3, "Dust generation during dry cutting"),
-        ("positive", 1, 1, "Good practice - full PPE and clean work area observed"),
+        ("unsafe_condition", 4, 3, "closed", "Scaffold handrail incomplete on working platform"),
+        ("unsafe_act", 3, 4, "closed", "Operative without eye protection during cutting"),
+        ("unsafe_condition", 3, 2, "closed", "Access route partially blocked by stored materials"),
+        ("unsafe_condition", 4, 3, "in_progress", "Unprotected slab edge at leading edge of works"),
+        ("unsafe_condition", 2, 3, "open", "Dust generation during dry cutting"),
+        ("positive", 1, 1, "closed", "Good practice - full PPE and clean work area observed"),
     ]
     safety_observations: list[dict] = []
-    for i, (otype, sev, lik, desc) in enumerate(obs_seeds):
+    for i, (otype, sev, lik, ostatus, desc) in enumerate(obs_seeds):
         positive = otype == "positive"
+        done = ostatus == "closed"
         safety_observations.append(
             {
                 "observation_number": f"OBS-{i + 1:03d}",
@@ -4532,8 +4867,16 @@ def _generate_module_data(
                 "severity": sev,
                 "likelihood": lik,
                 "immediate_action": None if positive else "Corrected on the spot",
-                "corrective_action": None if positive else "Re-brief crew and add to inspection checklist",
-                "status": "closed" if positive else "resolved",
+                # An outstanding observation names what is still to be done
+                # rather than reporting it as already done.
+                "corrective_action": (
+                    None
+                    if positive
+                    else "Re-brief crew and add to inspection checklist"
+                    if done
+                    else "Awaiting re-inspection before the entry can be closed"
+                ),
+                "status": ostatus,
             }
         )
 
@@ -4579,7 +4922,7 @@ def _generate_module_data(
         if amount <= 0:
             amount = 25000.0 + i * 5000.0
         amount = round(amount, 2)
-        status = ("paid", "approved", "submitted")[i % 3]
+        status = ("paid", "approved", "sent")[i % 3]
         invoices.append(
             {
                 "invoice_number": f"INV-{base.year}-{i + 1:03d}",
@@ -4589,6 +4932,10 @@ def _generate_module_data(
                 "currency_code": cur,
                 "status": status,
                 "notes": f"{firm} - interim valuation, {trade}",
+                # The issuing firm, so the insert can link the invoice to the
+                # subcontractor contact seeded from the same tender list
+                # instead of leaving contact_id empty.
+                "counterparty_company": firm,
                 "line_items": [
                     {
                         "description": f"{item or trade} - works to date",
@@ -4598,6 +4945,44 @@ def _generate_module_data(
                         "amount": f"{amount:.2f}",
                     }
                 ],
+            }
+        )
+
+    # ── E-invoice showcase invoice (one receivable, XRechnung-ready) ─────
+    # Only when the template asks for it: a receivable invoice is billed TO
+    # the client contact, which is the one direction where the linked
+    # contact is the buyer of the document (einvoice_parties), and its
+    # metadata carries what EN 16931 cannot read from anywhere else - the
+    # Leitweg-ID / buyer reference (BT-10), the seller party and the
+    # payment details.
+    ei_showcase = template.einvoice_showcase or {}
+    if ei_showcase.get("einvoice"):
+        ei_row = dict(ei_showcase.get("invoice") or {})
+        first_amount = float(str(invoices[0]["line_items"][0]["amount"])) if invoices else 100000.0
+        invoices.append(
+            {
+                "invoice_number": ei_row.get("invoice_number") or f"AR-{base.year}-001",
+                "invoice_direction": "receivable",
+                "invoice_date": _d(120),
+                "due_date": _d(150),
+                "currency_code": cur,
+                "status": "sent",
+                "notes": ei_row.get("notes"),
+                "counterparty_company": contacts[0].get("company_name"),
+                "contact_ref": "client",
+                "metadata": {"einvoice": dict(ei_showcase["einvoice"])},
+                "line_items": list(
+                    ei_row.get("line_items")
+                    or [
+                        {
+                            "description": "Interim application for works executed to date",
+                            "quantity": "1",
+                            "unit": "lsum",
+                            "unit_rate": f"{first_amount:.2f}",
+                            "amount": f"{first_amount:.2f}",
+                        }
+                    ]
+                ),
             }
         )
 
@@ -4743,21 +5128,28 @@ def _generate_module_data(
         )
 
     # ── Correspondence (6-10) ────────────────────────────────────────────
+    # The last element names the party the letter is with, as a contact role.
+    # It is a field on the seed rather than something read back out of the
+    # subject line. The subjects do name the party, and parsing them is the
+    # obvious shortcut, but they are English prose written to be read on a
+    # screen and they get reworded. A parser keyed on the word "Authority"
+    # would go on producing rows after a rewording, pointing at the wrong
+    # contact or at none, and there is no gate that would notice.
     corr_seeds = [
-        ("outgoing", "Notice of commencement to authority", "letter", 0),
-        ("incoming", "Authority acknowledgement of commencement", "letter", 7),
-        ("outgoing", "Submission of insurance and bonds", "letter", 12),
-        ("incoming", "Client instruction on scope clarification", "letter", 20),
-        ("outgoing", "Monthly progress report to client", "report", 30),
-        ("incoming", "Consultant design clarification", "email", 24),
-        ("outgoing", "Request for information log update", "email", 28),
-        ("incoming", "Subcontractor early-warning notice", "letter", 35),
-        ("outgoing", "Interim valuation cover letter", "letter", 31),
-        ("incoming", "Authority inspection report", "report", 45),
+        ("outgoing", "Notice of commencement to authority", "letter", 0, "authority"),
+        ("incoming", "Authority acknowledgement of commencement", "letter", 7, "authority"),
+        ("outgoing", "Submission of insurance and bonds", "letter", 12, "client"),
+        ("incoming", "Client instruction on scope clarification", "letter", 20, "client"),
+        ("outgoing", "Monthly progress report to client", "report", 30, "client"),
+        ("incoming", "Consultant design clarification", "email", 24, "consultant"),
+        ("outgoing", "Request for information log update", "email", 28, "consultant"),
+        ("incoming", "Subcontractor early-warning notice", "letter", 35, "subcontractor"),
+        ("outgoing", "Interim valuation cover letter", "letter", 31, "client"),
+        ("incoming", "Authority inspection report", "report", 45, "authority"),
     ]
     correspondence: list[dict] = []
     out_i = in_i = 0
-    for i, (direction, subject, ctype, day) in enumerate(corr_seeds):
+    for i, (direction, subject, ctype, day, party) in enumerate(corr_seeds):
         if direction == "outgoing":
             out_i += 1
             ref = f"OUT-{base.year}-{out_i:03d}"
@@ -4773,24 +5165,39 @@ def _generate_module_data(
                 "date_sent": _d(day) if direction == "outgoing" else None,
                 "date_received": _d(day) if direction == "incoming" else None,
                 "notes": f"{subject} - {proj}.",
+                # Resolved to a contact id by the writer, which is where the
+                # ids are minted. Not a column on the record.
+                "party": party,
             }
         )
 
     # ── GAP MODULES (no hand data anywhere today) ────────────────────────
     # variations - issued variation orders derived from the first trades.
+    # German-market projects read their register in German: the section
+    # titles the trades come from are already German, so an English prefix
+    # in front of them is what stands out on screen.
     variations: list[dict] = []
     var_n = min(max(len(trades), 3), 5)
     for i in range(var_n):
         code, trade, item = trades[i % len(trades)] if trades else ("", "General works", "")
         amount = round(8000.0 + i * 6500.0, 2)
+        if cc == "DE":
+            var_title = f"Nachtrag - {trade}: {item or 'zusätzliche Leistungen'}"
+        else:
+            var_title = f"Variation - {trade}: {item or 'additional works'}"
         variations.append(
             {
                 "code": f"VO-{i + 1:03d}",
-                "title": f"Variation - {trade}: {item or 'additional works'}",
+                "title": var_title,
                 "final_cost_impact": f"{amount}",
                 "final_schedule_days": 2 + (i % 4),
                 "currency": cur,
-                "status": ("issued", "agreed", "implemented")[i % 3],
+                # Must come from the variations module's own vocabulary
+                # (_VO_STATUS in modules/variations/schemas.py). "agreed" and
+                # "implemented" read naturally but are not in it, so two of
+                # every three demo orders carried a status the module rejects
+                # on write and cannot offer back in a status dropdown.
+                "status": ("issued", "in_progress", "completed")[i % 3],
                 "agreed_at": _d(40 + i * 12),
             }
         )
@@ -4834,7 +5241,13 @@ def _generate_module_data(
                 "equipment_count": equip,
                 "status": "closed" if i % 2 == 0 else "open",
                 "notes": notes,
-                "weather_summary": {"condition": cond, "temp_c": 12 + (i % 12)},
+                # The reader selects ``conditions``, plural
+                # (frontend/src/features/daily-diary/dailyDiaryInsights.ts). This
+                # wrote the singular, so every diary fell into the insights
+                # panel's "Not recorded" bucket and the weather breakdown drew
+                # one category over a register that was never actually missing
+                # the data.
+                "weather_summary": {"conditions": cond, "temp_c": 12 + (i % 12)},
             }
         )
 
@@ -4889,6 +5302,14 @@ def _generate_module_data(
                 "currency_code": cur,
                 "status": ("issued", "approved", "draft")[i % 3],
                 "notes": f"{firm} - supply for {trade}",
+                # The firm this order is with, as a contact role and a position
+                # in that role's list. The notes above name the same company in
+                # prose; this is the field the link is built from, so a reworded
+                # note cannot move the order to a different vendor. Only the
+                # first few firms get a contact seeded, and orders beyond that
+                # deliberately resolve to nothing rather than to the wrong firm.
+                "party": "subcontractor",
+                "party_index": i % len(firms) if firms else 0,
                 "items": [
                     {
                         "description": f"{item or trade} - supply",
@@ -4910,7 +5331,44 @@ def _generate_module_data(
             "code": f"{demo_id}-MAIN",
             "title": f"Main construction contract - {proj}",
             "contract_type": "lump_sum",
-            "counterparty_type": "contractor",
+            # client, not contractor. The contracts module records the
+            # counterparty as client or subcontractor, which is a statement of
+            # which side of the demo estate the money is on, and the estate
+            # holds the trade subcontracts below, so the party keeping these
+            # books is the main contractor and its head contract is with the
+            # client. "contractor" was not on the list at all: neither the
+            # create endpoint nor the picker in the UI offers it, so the seeded
+            # row was one the product itself would refuse.
+            "counterparty_type": "client",
+            # The contact role to link to, kept separate from counterparty_type
+            # above even though the two words agree today. They are two
+            # vocabularies owned by two modules: the contracts one describes the
+            # contract, the contacts one describes the register. Reusing one as
+            # a key into the other would break silently the first time either
+            # adds a value the other does not have.
+            "party": "client",
+            "party_index": 0,
+            # Who actually signs. The counterparty pair above records one side
+            # and a category; the signature register needs both sides by name,
+            # because a contract one party has not executed is not executed.
+            # Without these rows the contract cannot be put up for signature at
+            # all, which made the whole signing path undemonstrable in a demo.
+            "parties": [
+                {
+                    "party_role": "employer",
+                    "party": "client",
+                    "party_index": 0,
+                    "display_name": client_name or f"{proj} Client",
+                    "is_primary": True,
+                },
+                {
+                    "party_role": "contractor",
+                    "party": "contractor",
+                    "party_index": 0,
+                    "display_name": contractor_name,
+                    "is_primary": False,
+                },
+            ],
             "total_value": f"{round(contract_total, 2)}",
             "currency": cur[:3],
             "status": "active",
@@ -4918,18 +5376,50 @@ def _generate_module_data(
             "end_date": _d(months * 30),
         }
     )
-    for i, (company, _) in enumerate(firms[:3]):
+    sub_firms = firms[:3]
+    for i, (company, _) in enumerate(sub_firms):
         trade = trades[i % len(trades)][1] if trades else "Works"
         sub_value = round((contract_total * 0.15) + i * 50000.0, 2)
+        # The last subcontract is still a draft. Every contract being active
+        # left the register with nothing standing at the step between agreeing
+        # a deal and billing it: the compliance gate and the signature only
+        # appear on a draft, so a demo where everything is signed can show the
+        # whole lifecycle except the part where the contract becomes binding.
+        sub_status = "draft" if i == len(sub_firms) - 1 else "active"
         contracts.append(
             {
                 "code": f"{demo_id}-SUB-{i + 1:02d}",
                 "title": f"Subcontract - {trade} ({company})",
                 "contract_type": "remeasurement",
                 "counterparty_type": "subcontractor",
+                # The subcontractor contacts are built from firms[:3] in this
+                # same order, so the nth subcontract is the nth firm's. Without
+                # the index all three would point at one company while their
+                # titles named three.
+                "party": "subcontractor",
+                "party_index": i,
+                # A subcontract is signed by the main contractor buying the
+                # work and the firm selling it, not by the employer, who is
+                # not a party to it.
+                "parties": [
+                    {
+                        "party_role": "contractor",
+                        "party": "contractor",
+                        "party_index": 0,
+                        "display_name": contractor_name,
+                        "is_primary": True,
+                    },
+                    {
+                        "party_role": "subcontractor",
+                        "party": "subcontractor",
+                        "party_index": i,
+                        "display_name": company,
+                        "is_primary": False,
+                    },
+                ],
                 "total_value": f"{sub_value}",
                 "currency": cur[:3],
-                "status": "active",
+                "status": sub_status,
                 "start_date": _d(14),
                 "end_date": _d(months * 30 - 14),
             }
@@ -5001,14 +5491,26 @@ def _generate_module_data(
     ]
 
     # progress - percent-complete observations + planned S-curve per month.
+    #
+    # The plan covers the whole programme and the actuals stop at today, which
+    # is the shape an S-curve is drawn from: a planned line running to the end
+    # and an actual line that stops where the site is. "Today-ish" used to mean
+    # two months short of the END of the programme, so a thirty-month job in
+    # its fifth month filed itself as 88 per cent built, with readings dated
+    # two years into the future, while its own 4D schedule - which reads the
+    # real clock against each phase window - said eleven. Both numbers were on
+    # the same screen.
     progress_entries: list[dict] = []
     progress_plan: list[dict] = []
+    installed = datetime.now()
+    elapsed_months = (installed.year - base.year) * 12 + (installed.month - base.month) + 1
+    last_actual = max(1, min(months, elapsed_months))
     for m in range(1, months + 1):
-        period = f"{base.year}-{(base.month + m - 1 - 1) % 12 + 1:02d}"
+        period = _period_label(base, m - 1)
         planned = round(min(100.0, m / months * 100.0), 3)
         actual = round(min(100.0, max(0.0, planned - 5.0)), 3)
         progress_plan.append({"period_label": period, "planned_pct": planned, "notes": "Planned S-curve"})
-        if m <= max(months - 2, 1):  # actuals only up to "today-ish"
+        if m <= last_actual:
             progress_entries.append(
                 {
                     "period_label": period,
@@ -5018,57 +5520,12 @@ def _generate_module_data(
             )
     progress: list[dict] = progress_entries  # primary key the block consumes
 
-    # ── Takeoff measurements (2-4 derived from real priced BOQ items) ────
-    # Map the section item's unit onto a takeoff measurement type so /takeoff
-    # is never blank: m2 -> area, m -> distance, pcs/Stk -> count, m3 -> volume.
-    def _measure_type(unit: str) -> tuple[str, str] | None:
-        u = (unit or "").strip().lower()
-        if u in {"m2", "m²", "sqm"}:
-            return "area", "m2"
-        if u in {"m3", "m³", "cum"}:
-            return "volume", "m3"
-        if u in {"m", "lm", "rm", "lfm"}:
-            return "distance", "m"
-        if u in {"pcs", "pc", "stk", "st", "nr", "no", "ea", "each", "unit"}:
-            return "count", "pcs"
-        return None
-
-    takeoff: list[dict] = []
-    take_colors = ["#3B82F6", "#10B981", "#F59E0B", "#EF4444"]
-    for code, trade, _item in trades:
-        if len(takeoff) >= 4:
-            break
-        section = next((s for s in template.sections if str(s[0]) == code), None)
-        if not section:
-            continue
-        sec_items = section[3] if len(section) > 3 else []
-        for it in sec_items:
-            try:
-                desc = str(it[1]).split("(")[0].strip()
-                unit = str(it[2])
-                qty = float(it[3])
-            except (IndexError, TypeError, ValueError):
-                continue
-            mapped = _measure_type(unit)
-            if not mapped or qty <= 0:
-                continue
-            mtype, munit = mapped
-            idx = len(takeoff)
-            row: dict = {
-                "type": mtype,
-                "group_name": trade[:100] or "General",
-                "group_color": take_colors[idx % len(take_colors)],
-                "annotation": f"{desc} ({trade})",
-                "measurement_unit": munit,
-                "page": 1,
-            }
-            if mtype == "count":
-                row["count_value"] = int(round(qty))
-                row["measurement_value"] = float(round(qty))
-            else:
-                row["measurement_value"] = float(round(qty, 3))
-            takeoff.append(row)
-            break  # one measurement per trade keeps the spread varied
+    # Takeoff measurements are NOT generated here any more. The old block
+    # minted rows straight from BOQ items with no document, no points and no
+    # scale - list entries that broke the moment they were opened on a sheet.
+    # Real takeoff documents + geometry-backed measurements are seeded by
+    # app.modules.takeoff.seed.seed_takeoff_demo (demo enrichment), which also
+    # prunes any legacy document-less rows from earlier installs.
 
     # ── Documents (6-8 realistic project docs derived from the template) ─
     # Every entry is a PDF so the demo workspace never ships a byte-less
@@ -5253,8 +5710,25 @@ def _generate_module_data(
     #   (code, title, description, reason_category, status, cost_impact,
     #    schedule_impact_days, items_list) where each item is
     #   (description, change_type, orig_qty, new_qty, orig_rate, new_rate, unit)
-    co_reasons = ["client_request", "design_change", "site_condition", "value_engineering", "client_request"]
-    co_statuses = ["approved", "pending", "approved", "implemented", "pending"]
+    # Every code here has to be in REASON_CATEGORY_LABELS, or the register prints
+    # it raw and the change order cannot be updated through its own schema.
+    # "site_condition" was such a code: it is the same cause as "unforeseen".
+    co_reasons = ["client_request", "design_change", "unforeseen", "value_engineering", "regulatory"]
+    # Must come from the changeorders module's own vocabulary
+    # (VALID_TRANSITIONS in modules/changeorders/service.py). "pending" and
+    # "implemented" read naturally but are not in it, so three of every five
+    # demo orders carried a status the register printed raw, the status
+    # filter could not select and the card's stepper mapped to step zero.
+    co_statuses = ["approved", "submitted", "approved", "executed", "submitted"]
+    # What each machine reason is called on a German cover sheet, for the
+    # generated German descriptions below.
+    co_reason_labels_de = {
+        "client_request": "Auftraggeberwunsch",
+        "design_change": "Planungsänderung",
+        "unforeseen": "Unvorhergesehene Bedingungen",
+        "value_engineering": "Wertanalyse",
+        "regulatory": "Behördliche Auflage",
+    }
     change_orders: list[dict] = []
     co_n = min(max(len(trades), 3), 5)
     for i in range(co_n):
@@ -5274,21 +5748,27 @@ def _generate_module_data(
                     unit, rate = "lsum", 12000.0
         add_qty = float(5 + i * 3)
         cost_impact = round(add_qty * rate, 2)
+        co_reason = co_reasons[i % len(co_reasons)]
+        if cc == "DE":
+            co_title = f"Nachtrag - {trade}: {item or 'zusätzliche Leistungen'}"
+            co_desc = f"{co_reason_labels_de[co_reason]}: Auswirkung auf {trade} - {proj}."
+            co_item_desc = f"{item or trade} - Mehrmenge"
+        else:
+            co_title = f"Change order - {trade}: {item or 'additional works'}"
+            co_desc = f"{co_reason.replace('_', ' ').capitalize()} affecting {trade.lower()} on {proj}."
+            co_item_desc = f"{item or trade} - additional quantity"
         change_orders.append(
             (
                 f"CO-{i + 1:03d}",
-                f"Change order - {trade}: {item or 'additional works'}",
-                (
-                    f"{co_reasons[i % len(co_reasons)].replace('_', ' ').capitalize()} "
-                    f"affecting {trade.lower()} on {proj}."
-                ),
-                co_reasons[i % len(co_reasons)],
+                co_title,
+                co_desc,
+                co_reason,
                 co_statuses[i % len(co_statuses)],
                 cost_impact,
                 2 + (i % 4),
                 [
                     (
-                        f"{item or trade} - additional quantity",
+                        co_item_desc,
                         "added",
                         "0",
                         f"{add_qty:g}",
@@ -5330,7 +5810,6 @@ def _generate_module_data(
         "documents": documents,
         "risks": risks,
         "change_orders": change_orders,
-        "takeoff": takeoff,
     }
 
 
@@ -5338,6 +5817,149 @@ def _generate_module_data(
 # Module-wide demo data seeder  (Contacts, Tasks, RFIs, Meetings, Safety,
 # Inspections, Finance, Punchlist, Field Reports, NCRs, Submittals, Correspondence)
 # ---------------------------------------------------------------------------
+
+
+def _seeded_party_id(contact_ids_by_type: dict[str, list[str]], role: str | None, index: int = 0) -> str | None:
+    """Id of the ``index``-th contact seeded with ``role``, or ``None`` if there is none.
+
+    Every register that names a counterparty resolves it through here, so the
+    lookup behaves the same in all of them and can be tested without a database.
+
+    ``role`` is a contact role and always arrives as an explicit field on the
+    seed row. It is never read back out of a title, a subject or a code: those
+    are English prose that gets reworded, and a parser keyed on a word in them
+    would go on producing rows pointing at the wrong party or at none, with no
+    gate able to see it.
+
+    ``index`` picks between several contacts holding the same role, so the
+    subcontract for a given firm points at that firm rather than at whichever
+    subcontractor happens to have been written first.
+
+    An index past the end returns ``None`` rather than falling back to the
+    first. The registers seed more rows than there are firms with contacts, and
+    a row whose title names one company while its link points at another is
+    worse than a row with no link: the empty cell is visibly missing, and the
+    wrong link reads as correct on every screen that shows it.
+
+    ``None`` is a real answer in the ordinary case too. The contacts block is
+    fail-soft, so when that module is not loaded nothing was seeded and every
+    caller simply stores no link.
+    """
+    ids = contact_ids_by_type.get(role or "") or []
+    if not ids or not 0 <= index < len(ids):
+        return None
+    return ids[index]
+
+
+def _contacts_for_project(hand_written: list[dict] | None, generated: list[dict]) -> list[dict]:
+    """The contacts to seed: the hand-written list if there is one, else the generated one.
+
+    With one repair on top. Every hand-written list names a client, its
+    subcontractors and its consultants, and no main contractor, while the
+    registers seeded afterwards point at one anyway: the punchlist assigns to
+    "contractor" by default, and both contract signature blocks name it. A role
+    nobody seeded resolves to ``None`` without complaining, which is deliberate
+    in ``_seeded_party_id`` and wrong here. Measured on five of the six
+    hand-written projects: every punch item read as unassigned, and the contract
+    parties carried a company name with no contact behind it.
+
+    The generated list always carries a main contractor built from the same
+    template metadata, so it is borrowed rather than a firm being invented per
+    project. It also means a hand-written list added later cannot reopen this
+    hole by forgetting the same row.
+    """
+    contacts = list(hand_written or generated)
+    if not any(c.get("contact_type") == "contractor" for c in contacts):
+        contacts += [c for c in generated if c.get("contact_type") == "contractor"]
+    return contacts
+
+
+def _uuid_or_none(value: str | None) -> uuid.UUID | None:
+    """Contact id as a UUID, for the columns typed that way rather than as text.
+
+    The registers disagree about how they store a contact reference: some
+    columns are ``String(36)`` and take the id as it comes, others are real
+    UUID columns. This converts for the second kind so a caller never has to
+    decide what ``None`` means twice.
+    """
+    return uuid.UUID(value) if value else None
+
+
+# ── RFI dates ────────────────────────────────────────────────────────────────
+# An RFI carries three dates the register does arithmetic on, and the seeder
+# used to put two of them on the project's story clock (``base``, a fixed
+# calendar date) while ``created_at`` fell back to the column default, which is
+# the moment the demo was installed. The screen measures both against today, so
+# every row asserted two things that could not both be true: raised 22 days ago,
+# and 113 days past a deadline. The answered half reported a response time of
+# zero, because ``responded_at`` sat months before the row existed and the
+# router clamps a negative span to zero.
+#
+# All three now hang off the day the RFI was raised, and the RFIs are placed
+# along the axis between the project start and today instead of all on one date.
+
+# How long after it was raised the reply is due, and the day the site needs the
+# answer by. Kept at the spacing the seeder already used between the two.
+_RFI_RESPONSE_DUE_DAYS = 10
+_RFI_DATE_REQUIRED_DAYS = 14
+
+# Days ago the nth still-open RFI was raised. The first is far enough back to
+# have passed its deadline, so the overdue pill has one honest row to sit on,
+# and the others are still inside theirs. Every one of them used to be overdue.
+_RFI_OPEN_RAISED_DAYS_AGO = (16, 9, 5, 2)
+
+# Where the nth answered RFI sits in the project so far, as a fraction of the
+# time elapsed, and how many days it took to answer. Both spread, so the
+# register reports a range of response times rather than one number.
+_RFI_ANSWERED_POSITION = (0.08, 0.24, 0.41, 0.57, 0.12, 0.33, 0.49, 0.66)
+_RFI_ANSWERED_TURNAROUND_DAYS = (6, 11, 4, 9, 7, 13, 5, 8)
+
+# A demo installed within days of its project start still needs room for the
+# story its rows tell, so the fractions above are taken against at least this.
+_RFI_MIN_PROJECT_DAYS = 30
+
+
+def _rfi_schedule(
+    *, answered: bool, ordinal: int, base: datetime, now: datetime
+) -> tuple[datetime, str, str, str | None]:
+    """Date one RFI: when it was raised, when a reply is due, when one came.
+
+    ``ordinal`` counts within the status, so the open rows and the answered
+    rows each spread across their own offsets instead of sharing a day.
+
+    Two things hold whatever the clock says, because they are what the screen
+    reads as a contradiction otherwise: the deadline falls after the day the
+    RFI was raised, and an answered one was answered some days after it was
+    raised rather than at the same instant.
+
+    ``base`` and ``now`` are naive, as the seeder's project start is. The
+    returned ``created_at`` is UTC-aware to match the timestamptz column.
+    Returns ``(created_at, response_due_date, date_required, responded_at)``,
+    the last three formatted as the date strings those columns store.
+    """
+    elapsed = max((now - base).days, _RFI_MIN_PROJECT_DAYS)
+    if answered:
+        position = _RFI_ANSWERED_POSITION[ordinal % len(_RFI_ANSWERED_POSITION)]
+        turnaround = _RFI_ANSWERED_TURNAROUND_DAYS[ordinal % len(_RFI_ANSWERED_TURNAROUND_DAYS)]
+        raised = base + timedelta(days=round(elapsed * position))
+        # Pull it back rather than let the answer land in the future, which is
+        # what the fractions above would do on a demo installed near the start.
+        latest = now - timedelta(days=turnaround)
+        if raised > latest:
+            raised = max(latest, base)
+        responded: datetime | None = raised + timedelta(days=turnaround)
+    else:
+        days_ago = _RFI_OPEN_RAISED_DAYS_AGO[ordinal % len(_RFI_OPEN_RAISED_DAYS_AGO)]
+        # Against the real span, not the floored one, so nothing is raised
+        # before the project it belongs to started.
+        raised = now - timedelta(days=min(days_ago, max((now - base).days, 0)))
+        responded = None
+    return (
+        raised.replace(tzinfo=UTC),
+        (raised + timedelta(days=_RFI_RESPONSE_DUE_DAYS)).strftime("%Y-%m-%d"),
+        (raised + timedelta(days=_RFI_DATE_REQUIRED_DAYS)).strftime("%Y-%m-%d"),
+        responded.strftime("%Y-%m-%d") if responded else None,
+    )
 
 
 async def _seed_module_data(
@@ -5372,40 +5994,40 @@ async def _seed_module_data(
         "residential-berlin": [
             {
                 "contact_type": "client",
-                "company_name": "Berliner Wohnungsbaugesellschaft mbH",
+                "company_name": "Vennhof Wohnbaugesellschaft mbH",
                 "first_name": "Klaus",
                 "last_name": "Weber",
-                "primary_email": "k.weber@bwb-berlin.de",
+                "primary_email": "k.weber@vennhof-berlin.example",
                 "primary_phone": "+49 30 12345678",
                 "country_code": "DE",
                 "notes": "Main client contact",
             },
             {
                 "contact_type": "subcontractor",
-                "company_name": "Hochtief AG",
+                "company_name": "Verdanko Hochbau AG",
                 "first_name": "Hans",
                 "last_name": "Mueller",
-                "primary_email": "h.mueller@hochtief.de",
+                "primary_email": "h.mueller@verdanko-hochbau.example",
                 "primary_phone": "+49 201 8240",
                 "country_code": "DE",
                 "notes": "Structural works subcontractor",
             },
             {
                 "contact_type": "subcontractor",
-                "company_name": "Sto SE Fassadenbau",
+                "company_name": "Sanverth Fassadenbau",
                 "first_name": "Maria",
                 "last_name": "Schmidt",
-                "primary_email": "m.schmidt@sto.de",
+                "primary_email": "m.schmidt@sanverth.example",
                 "primary_phone": "+49 7744 570",
                 "country_code": "DE",
                 "notes": "WDVS facade contractor",
             },
             {
                 "contact_type": "consultant",
-                "company_name": "Sauerbruch Hutton Architekten",
+                "company_name": "Rehwald Tannberg Architekten",
                 "first_name": "Louisa",
-                "last_name": "Hutton",
-                "primary_email": "l.hutton@sauerbruch-hutton.de",
+                "last_name": "Tannberg",
+                "primary_email": "l.tannberg@rehwald-tannberg.example",
                 "primary_phone": "+49 30 39780",
                 "country_code": "DE",
                 "notes": "Lead architect",
@@ -5415,17 +6037,17 @@ async def _seed_module_data(
                 "company_name": "IB Hartmann Tragwerksplanung",
                 "first_name": "Thomas",
                 "last_name": "Hartmann",
-                "primary_email": "t.hartmann@ib-hartmann.de",
+                "primary_email": "t.hartmann@ib-hartmann.example",
                 "primary_phone": "+49 30 44520",
                 "country_code": "DE",
                 "notes": "Structural engineer",
             },
             {
                 "contact_type": "subcontractor",
-                "company_name": "Imtech HLS Berlin",
+                "company_name": "Norvent HLS Berlin",
                 "first_name": "Juergen",
                 "last_name": "Braun",
-                "primary_email": "j.braun@imtech.de",
+                "primary_email": "j.braun@norvent.example",
                 "primary_phone": "+49 30 55120",
                 "country_code": "DE",
                 "notes": "MEP subcontractor",
@@ -5434,70 +6056,70 @@ async def _seed_module_data(
         "office-london": [
             {
                 "contact_type": "client",
-                "company_name": "Canary Properties Ltd",
+                "company_name": "Vittram Properties Ltd",
                 "first_name": "James",
                 "last_name": "Harrison",
-                "primary_email": "j.harrison@canaryprops.co.uk",
+                "primary_email": "j.harrison@vittram-properties.example",
                 "primary_phone": "+44 20 7946 0958",
                 "country_code": "GB",
                 "notes": "Client development manager",
             },
             {
                 "contact_type": "consultant",
-                "company_name": "Arup Group Ltd",
+                "company_name": "Endaby Group Ltd",
                 "first_name": "Sarah",
                 "last_name": "Chen",
-                "primary_email": "s.chen@arup.com",
+                "primary_email": "s.chen@endaby.example",
                 "primary_phone": "+44 20 7636 1531",
                 "country_code": "GB",
                 "notes": "Structural engineer",
             },
             {
                 "contact_type": "consultant",
-                "company_name": "Hoare Lea M&E",
+                "company_name": "Rensley Building Services",
                 "first_name": "David",
                 "last_name": "Thompson",
-                "primary_email": "d.thompson@hoarelea.com",
+                "primary_email": "d.thompson@rensley.example",
                 "primary_phone": "+44 20 3668 7100",
                 "country_code": "GB",
                 "notes": "M&E consultant",
             },
             {
                 "contact_type": "subcontractor",
-                "company_name": "Severfield Steel",
+                "company_name": "Varnsted Steel",
                 "first_name": "Mark",
                 "last_name": "Jones",
-                "primary_email": "m.jones@severfield.com",
+                "primary_email": "m.jones@varnsted-steel.example",
                 "primary_phone": "+44 1845 577896",
                 "country_code": "GB",
                 "notes": "Structural steelwork contractor",
             },
             {
                 "contact_type": "subcontractor",
-                "company_name": "Permasteelisa UK",
+                "company_name": "Fennvale Facades UK",
                 "first_name": "Andrea",
                 "last_name": "Rossi",
-                "primary_email": "a.rossi@permasteelisa.com",
+                "primary_email": "a.rossi@fennvale.example",
                 "primary_phone": "+44 20 8317 3300",
                 "country_code": "GB",
                 "notes": "Curtain wall specialist",
             },
             {
                 "contact_type": "consultant",
-                "company_name": "Gardiner & Theobald",
+                "company_name": "Marbrey & Tolwyn",
                 "first_name": "Emma",
                 "last_name": "Wallace",
-                "primary_email": "e.wallace@gardiner.com",
+                "primary_email": "e.wallace@marbrey-tolwyn.example",
                 "primary_phone": "+44 20 7209 3000",
                 "country_code": "GB",
                 "notes": "Quantity surveyor",
             },
             {
                 "contact_type": "subcontractor",
-                "company_name": "Crown House Technologies",
+                "company_name": "Cardwen Building Technologies",
                 "first_name": "Robert",
                 "last_name": "White",
-                "primary_email": "r.white@crownhouse.co.uk",
+                "primary_email": "r.white@cardwen.example",
                 "primary_phone": "+44 121 717 4600",
                 "country_code": "GB",
                 "notes": "MEP contractor",
@@ -5509,57 +6131,57 @@ async def _seed_module_data(
                 "company_name": "Downtown Health System",
                 "first_name": "Patricia",
                 "last_name": "Martinez",
-                "primary_email": "p.martinez@downtownhealth.org",
+                "primary_email": "p.martinez@downtownhealth.example",
                 "primary_phone": "+1 555 234 5678",
                 "country_code": "US",
                 "notes": "VP of Facilities",
             },
             {
                 "contact_type": "consultant",
-                "company_name": "HKS Architects",
+                "company_name": "Vandermere Architects",
                 "first_name": "Michael",
                 "last_name": "Brooks",
-                "primary_email": "m.brooks@hks.com",
+                "primary_email": "m.brooks@vandermere.example",
                 "primary_phone": "+1 214 969 5599",
                 "country_code": "US",
                 "notes": "Healthcare architect of record",
             },
             {
                 "contact_type": "subcontractor",
-                "company_name": "Southland Industries",
+                "company_name": "Ardenmark Mechanical",
                 "first_name": "Richard",
                 "last_name": "Nguyen",
-                "primary_email": "r.nguyen@southlandind.com",
+                "primary_email": "r.nguyen@ardenmark.example",
                 "primary_phone": "+1 714 901 5800",
                 "country_code": "US",
                 "notes": "MEP contractor",
             },
             {
                 "contact_type": "subcontractor",
-                "company_name": "Turner Construction",
+                "company_name": "Brackwell Construction",
                 "first_name": "Jennifer",
                 "last_name": "Davis",
-                "primary_email": "j.davis@tcco.com",
+                "primary_email": "j.davis@brackwell.example",
                 "primary_phone": "+1 212 229 6000",
                 "country_code": "US",
                 "notes": "General contractor",
             },
             {
                 "contact_type": "consultant",
-                "company_name": "Aon Fire Protection Engineering",
+                "company_name": "Cindervale Fire Protection Engineering",
                 "first_name": "William",
                 "last_name": "Park",
-                "primary_email": "w.park@aon.com",
+                "primary_email": "w.park@cindervale.example",
                 "primary_phone": "+1 312 381 1000",
                 "country_code": "US",
                 "notes": "Fire protection consultant",
             },
             {
                 "contact_type": "supplier",
-                "company_name": "Siemens Healthineers",
+                "company_name": "Corvale Medical Imaging",
                 "first_name": "Lisa",
                 "last_name": "Chen",
-                "primary_email": "l.chen@siemens-healthineers.com",
+                "primary_email": "l.chen@corvale-imaging.example",
                 "primary_phone": "+1 610 448 4500",
                 "country_code": "US",
                 "notes": "Medical imaging equipment supplier",
@@ -5571,47 +6193,47 @@ async def _seed_module_data(
                 "company_name": "Mairie du 20e Arrondissement",
                 "first_name": "Sophie",
                 "last_name": "Dupont",
-                "primary_email": "s.dupont@paris.fr",
+                "primary_email": "s.dupont@paris-20e.example",
                 "primary_phone": "+33 1 43 15 20 20",
                 "country_code": "FR",
                 "notes": "Direction de la construction",
             },
             {
                 "contact_type": "consultant",
-                "company_name": "Chartier Dalix Architectes",
+                "company_name": "Vaissier Delonnay Architectes",
                 "first_name": "Frederic",
-                "last_name": "Chartier",
-                "primary_email": "f.chartier@chartier-dalix.com",
+                "last_name": "Vaissier",
+                "primary_email": "f.vaissier@vaissier-delonnay.example",
                 "primary_phone": "+33 1 44 54 07 00",
                 "country_code": "FR",
                 "notes": "Architect mandate",
             },
             {
                 "contact_type": "subcontractor",
-                "company_name": "Eiffage Construction IDF",
+                "company_name": "Tholmery Construction IDF",
                 "first_name": "Pierre",
                 "last_name": "Moreau",
-                "primary_email": "p.moreau@eiffage.com",
+                "primary_email": "p.moreau@tholmery.example",
                 "primary_phone": "+33 1 49 29 60 00",
                 "country_code": "FR",
                 "notes": "Gros oeuvre contractor",
             },
             {
                 "contact_type": "consultant",
-                "company_name": "BET Fluides Setec",
+                "company_name": "BET Fluides Marconnet",
                 "first_name": "Claire",
                 "last_name": "Martin",
-                "primary_email": "c.martin@setec.fr",
+                "primary_email": "c.martin@marconnet-fluides.example",
                 "primary_phone": "+33 1 82 51 00 00",
                 "country_code": "FR",
                 "notes": "MEP engineer",
             },
             {
                 "contact_type": "subcontractor",
-                "company_name": "Arbonis (CLT Timber)",
+                "company_name": "Boisferme (CLT Timber)",
                 "first_name": "Jean",
                 "last_name": "Lefebvre",
-                "primary_email": "j.lefebvre@arbonis.com",
+                "primary_email": "j.lefebvre@boisferme.example",
                 "primary_phone": "+33 5 58 05 55 00",
                 "country_code": "FR",
                 "notes": "CLT timber structure specialist",
@@ -5620,60 +6242,60 @@ async def _seed_module_data(
         "warehouse-dubai": [
             {
                 "contact_type": "client",
-                "company_name": "Al Futtaim Logistics",
+                "company_name": "Zafeer Logistics Group",
                 "first_name": "Ahmed",
-                "last_name": "Al Maktoum",
-                "primary_email": "a.almaktoum@alfuttaim.ae",
+                "last_name": "Al Nuraimi",
+                "primary_email": "a.alnuraimi@zafeer-logistics.example",
                 "primary_phone": "+971 4 222 7111",
                 "country_code": "AE",
                 "notes": "Project sponsor",
             },
             {
                 "contact_type": "consultant",
-                "company_name": "KEO International Consultants",
+                "company_name": "Meridiem Gulf Consultants",
                 "first_name": "Ravi",
                 "last_name": "Sharma",
-                "primary_email": "r.sharma@keo.com",
+                "primary_email": "r.sharma@meridiem-gulf.example",
                 "primary_phone": "+971 4 338 0738",
                 "country_code": "AE",
                 "notes": "Lead design consultant",
             },
             {
                 "contact_type": "subcontractor",
-                "company_name": "Al Jaber Engineering",
+                "company_name": "Nakheer Engineering",
                 "first_name": "Khalid",
-                "last_name": "Al Jaber",
-                "primary_email": "k.aljaber@ajec.ae",
+                "last_name": "Al Marri",
+                "primary_email": "k.almarri@nakheer.example",
                 "primary_phone": "+971 2 550 7777",
                 "country_code": "AE",
                 "notes": "Steel structure contractor",
             },
             {
                 "contact_type": "subcontractor",
-                "company_name": "Leminar Air Conditioning",
+                "company_name": "Zafran Air Conditioning",
                 "first_name": "Suresh",
                 "last_name": "Nair",
-                "primary_email": "s.nair@leminar.ae",
+                "primary_email": "s.nair@zafran-ac.example",
                 "primary_phone": "+971 4 371 5000",
                 "country_code": "AE",
                 "notes": "HVAC contractor",
             },
             {
                 "contact_type": "consultant",
-                "company_name": "Robert Bird Group",
+                "company_name": "Halvern Fyfe Group",
                 "first_name": "George",
                 "last_name": "Palmer",
-                "primary_email": "g.palmer@robertbird.com",
+                "primary_email": "g.palmer@halvern-fyfe.example",
                 "primary_phone": "+971 4 327 7670",
                 "country_code": "AE",
                 "notes": "Structural engineer",
             },
             {
                 "contact_type": "subcontractor",
-                "company_name": "Emirates Fire Fighting Equipment",
+                "company_name": "Gulf Shield Fire Systems",
                 "first_name": "Omar",
                 "last_name": "Hassan",
-                "primary_email": "o.hassan@effe.ae",
+                "primary_email": "o.hassan@gulfshield-fire.example",
                 "primary_phone": "+971 4 268 9090",
                 "country_code": "AE",
                 "notes": "Fire protection systems",
@@ -5691,70 +6313,70 @@ async def _seed_module_data(
         "retail-market-heilbronn": [
             {
                 "contact_type": "client",
-                "company_name": "Sueddeutsche Handelsimmobilien GmbH",
+                "company_name": "Süddeutsche Handelsimmobilien GmbH",
                 "first_name": "Marion",
                 "last_name": "Roesler",
-                "primary_email": "m.roesler@sueddeutsche-handelsimmobilien.de",
+                "primary_email": "m.roesler@sueddeutsche-handelsimmobilien.example",
                 "primary_phone": "+49 7131 562300",
                 "country_code": "DE",
-                "notes": "S01 Bauherr / owner (retail real-estate company), Bereichsleitung Expansion Sued",
+                "notes": "S01 Bauherr / owner (retail real-estate company), Bereichsleitung Expansion Süd",
             },
             {
                 "contact_type": "client",
-                "company_name": "Sueddeutsche Lebensmittelmaerkte GmbH",
+                "company_name": "Süddeutsche Lebensmittelmärkte GmbH",
                 "first_name": "Thomas",
                 "last_name": "Gerlach",
-                "primary_email": "t.gerlach@sueddeutsche-lebensmittelmaerkte.de",
+                "primary_email": "t.gerlach@sueddeutsche-lebensmittelmaerkte.example",
                 "primary_phone": "+49 7131 894120",
                 "country_code": "DE",
                 "notes": "S02 Betreiber und Mieter / operator and tenant (store operations), Verkaufsleitung Region Unterland",
             },
             {
                 "contact_type": "consultant",
-                "company_name": "Architekturbuero Sandweg + Partner Architekten PartG mbB",
+                "company_name": "Architekturbüro Sandweg + Partner Architekten PartG mbB",
                 "first_name": "Jens",
                 "last_name": "Sandweg",
-                "primary_email": "j.sandweg@sandweg-partner.de",
+                "primary_email": "j.sandweg@sandweg-partner.example",
                 "primary_phone": "+49 7131 204510",
                 "country_code": "DE",
-                "notes": "S03 Objektplanung LP 1-5, kuenstlerische Oberleitung, Bauueberwachung Bauherrenseite (architect)",
+                "notes": "S03 Objektplanung LP 1-5, künstlerische Oberleitung, Bauüberwachung Bauherrenseite (architect)",
             },
             {
                 "contact_type": "consultant",
                 "company_name": "Trautmann Ingenieure Tragwerksplanung GmbH",
                 "first_name": "Katrin",
                 "last_name": "Trautmann",
-                "primary_email": "k.trautmann@trautmann-ing.de",
+                "primary_email": "k.trautmann@trautmann-ing.example",
                 "primary_phone": "+49 7141 488120",
                 "country_code": "DE",
                 "notes": "S04 Tragwerksplanung (structural engineer), Ludwigsburg",
             },
             {
                 "contact_type": "consultant",
-                "company_name": "Dr.-Ing. Carsten Mahler, Pruefingenieur fuer Standsicherheit",
+                "company_name": "Dr.-Ing. Carsten Mahler, Prüfingenieur für Standsicherheit",
                 "first_name": "Carsten",
                 "last_name": "Mahler",
-                "primary_email": "kontakt@pruefingenieur-mahler.de",
+                "primary_email": "kontakt@pruefingenieur-mahler.example",
                 "primary_phone": "+49 711 6339400",
                 "country_code": "DE",
-                "notes": "S05 Pruefstatiker (independent checking engineer), Stuttgart",
+                "notes": "S05 Prüfstatiker (independent checking engineer), Stuttgart",
             },
             {
                 "contact_type": "consultant",
                 "company_name": "Klein & Partner TGA-Planung GmbH",
                 "first_name": "Stefan",
                 "last_name": "Klein",
-                "primary_email": "s.klein@klein-tga.de",
+                "primary_email": "s.klein@klein-tga.example",
                 "primary_phone": "+49 7134 915020",
                 "country_code": "DE",
-                "notes": "S06 TGA-Planung HLSK/ELT, GEG-Nachweis, Entwaesserungsgesuch (MEP design), Weinsberg",
+                "notes": "S06 TGA-Planung HLSK/ELT, GEG-Nachweis, Entwässerungsgesuch (MEP design), Weinsberg",
             },
             {
                 "contact_type": "consultant",
                 "company_name": "Brandschutzconsult Erler & Partner Ingenieure",
                 "first_name": "Andreas",
                 "last_name": "Erler",
-                "primary_email": "a.erler@erler-brandschutz.de",
+                "primary_email": "a.erler@erler-brandschutz.example",
                 "primary_phone": "+49 7131 627340",
                 "country_code": "DE",
                 "notes": "S07 Brandschutzkonzept, Fachbauleitung Brandschutz (fire protection), Heilbronn",
@@ -5764,27 +6386,27 @@ async def _seed_module_data(
                 "company_name": "Baugrundinstitut Neckartal GmbH",
                 "first_name": "Helmut",
                 "last_name": "Volz",
-                "primary_email": "h.volz@baugrund-neckartal.de",
+                "primary_email": "h.volz@baugrund-neckartal.example",
                 "primary_phone": "+49 7133 209880",
                 "country_code": "DE",
-                "notes": "S08 Baugrundgutachter, geotechnische Pruefungen (geotechnical consultant), Lauffen am Neckar",
+                "notes": "S08 Baugrundgutachter, geotechnische Prüfungen (geotechnical consultant), Lauffen am Neckar",
             },
             {
                 "contact_type": "consultant",
-                "company_name": "Vermessungsbuero Stehle, OebVI",
+                "company_name": "Vermessungsbüro Stehle, ÖbVI",
                 "first_name": "Peter",
                 "last_name": "Stehle",
-                "primary_email": "info@vermessung-stehle.de",
+                "primary_email": "info@vermessung-stehle.example",
                 "primary_phone": "+49 7131 781220",
                 "country_code": "DE",
-                "notes": "S09 Amtlicher Lageplan, Absteckung, Gebaeudeeinmessung (licensed surveyor), Heilbronn",
+                "notes": "S09 Amtlicher Lageplan, Absteckung, Gebäudeeinmessung (licensed surveyor), Heilbronn",
             },
             {
                 "contact_type": "consultant",
-                "company_name": "Ingenieurbuero Wanner Arbeitssicherheit",
+                "company_name": "Ingenieurbüro Wanner Arbeitssicherheit",
                 "first_name": "Ralf",
                 "last_name": "Wanner",
-                "primary_email": "r.wanner@wanner-sigeko.de",
+                "primary_email": "r.wanner@wanner-sigeko.example",
                 "primary_phone": "+49 7062 915330",
                 "country_code": "DE",
                 "notes": "S10 SiGeKo nach BaustellV (health and safety coordinator), Ilsfeld",
@@ -5794,40 +6416,40 @@ async def _seed_module_data(
                 "company_name": "Trautwein Bau GmbH & Co. KG",
                 "first_name": "Dieter",
                 "last_name": "Seybold",
-                "primary_email": "d.seybold@trautwein-bau.de",
+                "primary_email": "d.seybold@trautwein-bau.example",
                 "primary_phone": "+49 791 946100",
                 "country_code": "DE",
-                "notes": "S11 Generalunternehmer Rohbau, Ausbau, Standard-TGA, Aussenanlagen-Option (general contractor), Schwaebisch Hall",
+                "notes": "S11 Generalunternehmer Rohbau, Ausbau, Standard-TGA, Außenanlagen-Option (general contractor), Schwäbisch Hall",
             },
             {
                 "contact_type": "subcontractor",
                 "company_name": "Betonwerk Hohenlohe Fertigteile GmbH",
                 "first_name": "Frank",
                 "last_name": "Schenkel",
-                "primary_email": "f.schenkel@betonwerk-hohenlohe.de",
+                "primary_email": "f.schenkel@betonwerk-hohenlohe.example",
                 "primary_phone": "+49 7940 922070",
                 "country_code": "DE",
-                "notes": "S12 Nachunternehmer Stahlbeton-Fertigteile und Montage (precast subcontractor), Kuenzelsau",
+                "notes": "S12 Nachunternehmer Stahlbeton-Fertigteile und Montage (precast subcontractor), Künzelsau",
             },
             {
                 "contact_type": "subcontractor",
                 "company_name": "Flachdachtechnik Maurer GmbH",
                 "first_name": "Lukas",
                 "last_name": "Maurer",
-                "primary_email": "l.maurer@flachdach-maurer.de",
+                "primary_email": "l.maurer@flachdach-maurer.example",
                 "primary_phone": "+49 7946 911450",
                 "country_code": "DE",
                 "notes": "S13 Nachunternehmer Dachabdichtung und Trapezblech (roofing subcontractor), Bretzfeld",
             },
             {
                 "contact_type": "subcontractor",
-                "company_name": "Sommerfeld Kaeltetechnik GmbH",
+                "company_name": "Sommerfeld Kältetechnik GmbH",
                 "first_name": "Patrick",
                 "last_name": "Sommerfeld",
                 "primary_email": "p.sommerfeld@sommerfeld-kaeltetechnik.de",
                 "primary_phone": "+49 7131 396620",
                 "country_code": "DE",
-                "notes": "S14 Direktauftrag Kaeltetechnik CO2-Verbund und Kuehlmoebel (owner direct award refrigeration), Heilbronn",
+                "notes": "S14 Direktauftrag Kältetechnik CO2-Verbund und Kühlmöbel (owner direct award refrigeration), Heilbronn",
             },
             {
                 "contact_type": "subcontractor",
@@ -5844,17 +6466,17 @@ async def _seed_module_data(
                 "company_name": "Stadt Heilbronn, Planungs- und Baurechtsamt",
                 "first_name": "Sachgebiet",
                 "last_name": "Gewerbebauten",
-                "primary_email": "baurechtsamt@heilbronn.de",
+                "primary_email": "baurechtsamt@stadt-heilbronn.example",
                 "primary_phone": "+49 7131 562700",
                 "country_code": "DE",
-                "notes": "S16 Untere Baurechtsbehoerde, Genehmigung und Abnahmen (building permit authority), Heilbronn",
+                "notes": "S16 Untere Baurechtsbehörde, Genehmigung und Abnahmen (building permit authority), Heilbronn",
             },
             {
                 "contact_type": "authority",
                 "company_name": "Neckar Netzgesellschaft mbH",
                 "first_name": "Anschlusswesen",
                 "last_name": "Gewerbe",
-                "primary_email": "netzanschluss@neckar-netz.de",
+                "primary_email": "netzanschluss@neckar-netz.example",
                 "primary_phone": "+49 7131 624000",
                 "country_code": "DE",
                 "notes": "S17 Verteilnetzbetreiber Strom (fictional DSO): Netzanschluss, Trafostation, PV-Einspeisung",
@@ -5867,19 +6489,38 @@ async def _seed_module_data(
                 "primary_email": "u.haeberlen@elektro-haeberlen.de",
                 "primary_phone": "+49 7941 920310",
                 "country_code": "DE",
-                "notes": "S18 Nachunternehmer Elektrotechnik unter GU (electrical subcontractor), Oehringen",
+                "notes": "S18 Nachunternehmer Elektrotechnik unter GU (electrical subcontractor), Öhringen",
             },
         ],
     }
 
+    # Ids of the contacts written below, grouped by role, so records seeded
+    # afterwards can point at the party they are about instead of only naming
+    # it in prose. Declared outside the try because the contacts block is
+    # fail-soft: when the module is not loaded this stays empty and the later
+    # writers simply seed no link, rather than failing on a missing name.
+    contact_ids_by_type: dict[str, list[str]] = {}
+    # Company name -> contact id, so the invoice seed below can link each
+    # invoice to the counterparty it already names in prose. Same fail-soft
+    # contract as contact_ids_by_type.
+    contact_id_by_company: dict[str, str] = {}
+
     try:
-        contact_list = _CONTACTS.get(demo_id) or generated.get("contacts", [])
+        contact_list = _contacts_for_project(_CONTACTS.get(demo_id), generated.get("contacts", []))
         for c in contact_list:
+            contact_id = _id()
+            contact_ids_by_type.setdefault(c["contact_type"], []).append(str(contact_id))
+            company = str(c.get("company_name") or "").strip()
+            if company:
+                contact_id_by_company.setdefault(company, str(contact_id))
             session.add(
                 Contact(
-                    id=_id(),
+                    id=contact_id,
                     contact_type=c["contact_type"],
                     company_name=c.get("company_name"),
+                    legal_name=c.get("legal_name"),
+                    vat_number=c.get("vat_number"),
+                    address=c.get("address"),
                     first_name=c.get("first_name"),
                     last_name=c.get("last_name"),
                     primary_email=c.get("primary_email"),
@@ -5909,7 +6550,7 @@ async def _seed_module_data(
             },
             {
                 "task_type": "task",
-                "title": "Spundwandverbau Statik pruefen",
+                "title": "Spundwandverbau Statik prüfen",
                 "description": "Review sheet pile wall structural calculations with engineer",
                 "status": "completed",
                 "priority": "high",
@@ -5918,14 +6559,14 @@ async def _seed_module_data(
             {
                 "task_type": "decision",
                 "title": "WDVS Systemauswahl",
-                "description": "Choose between Sto StoTherm Classic vs Caparol Dalmatiner",
+                "description": "Choose between Sanverth ThermFix Classic vs Odenau Granulat",
                 "status": "completed",
                 "priority": "normal",
-                "result": "Sto StoTherm Classic selected - better thermal performance",
+                "result": "Sanverth ThermFix Classic selected - better thermal performance",
             },
             {
                 "task_type": "topic",
-                "title": "KfW 55 Foerdermittel Antrag",
+                "title": "KfW 55 Fördermittel Antrag",
                 "description": "Prepare KfW subsidy application for energy-efficient building",
                 "status": "in_progress",
                 "priority": "high",
@@ -5942,7 +6583,7 @@ async def _seed_module_data(
             {
                 "task_type": "task",
                 "title": "Aufzugsangebot vergleichen",
-                "description": "Compare lift offers from KONE, Schindler, and ThyssenKrupp",
+                "description": "Compare lift offers from Ascentia, Verticore, and Hebwerk Nord",
                 "status": "open",
                 "priority": "normal",
                 "due_date": (base + timedelta(days=90)).strftime("%Y-%m-%d"),
@@ -5964,7 +6605,7 @@ async def _seed_module_data(
                 "status": "completed",
                 "priority": "high",
                 "due_date": (base - timedelta(days=21)).strftime("%Y-%m-%d"),
-                "result": "Permasteelisa appointed, contract signed",
+                "result": "Fennvale appointed, contract signed",
             },
             {
                 "task_type": "decision",
@@ -5997,7 +6638,7 @@ async def _seed_module_data(
                 "status": "completed",
                 "priority": "high",
                 "due_date": (base - timedelta(days=60)).strftime("%Y-%m-%d"),
-                "result": "Complete - GI report issued by Arup",
+                "result": "Complete - GI report issued by Endaby",
             },
             {
                 "task_type": "task",
@@ -6014,7 +6655,10 @@ async def _seed_module_data(
                 "title": "Medical equipment list freeze",
                 "description": "Obtain frozen equipment list from radiology, surgery, and ED departments",
                 "status": "in_progress",
-                "priority": "critical",
+                # urgent, not critical: the task scale runs low / normal / high /
+                # urgent. critical is the top of the punchlist scale, which is a
+                # different module with a different vocabulary.
+                "priority": "urgent",
                 "due_date": (base + timedelta(days=30)).strftime("%Y-%m-%d"),
             },
             {
@@ -6134,7 +6778,7 @@ async def _seed_module_data(
                 "description": "Select insulated panel system for -25C cold storage zone",
                 "status": "completed",
                 "priority": "high",
-                "result": "Kingspan QuadCore KS1000 selected - best U-value",
+                "result": "Isoveld CoreMax IC1000 selected - best U-value",
             },
             {
                 "task_type": "topic",
@@ -6266,7 +6910,7 @@ async def _seed_module_data(
                 "question": "Trading floor Level 3 requires 6kPa imposed load for equipment. "
                 "Standard floor design is 3.5kPa. Structural upgrade needed?",
                 "status": "answered",
-                "official_response": "Local strengthening at 12 locations. Arup SK-045 issued.",
+                "official_response": "Local strengthening at 12 locations. Endaby SK-045 issued.",
                 "cost_impact": True,
                 "cost_impact_value": "82000",
                 "schedule_impact": True,
@@ -6395,7 +7039,23 @@ async def _seed_module_data(
 
     try:
         rfi_list = _RFIS.get(demo_id) or generated.get("rfis", [])
+        rfi_now = datetime.now(UTC).replace(tzinfo=None)
+        answered_seen = 0
+        open_seen = 0
         for r in rfi_list:
+            # "closed" counts as open here for the same reason it did before:
+            # only an "answered" row is given a response, so only it can be
+            # dated by one.
+            answered = r["status"] == "answered"
+            if answered:
+                ordinal = answered_seen
+                answered_seen += 1
+            else:
+                ordinal = open_seen
+                open_seen += 1
+            raised_at, due_date, required_date, responded_at = _rfi_schedule(
+                answered=answered, ordinal=ordinal, base=base, now=rfi_now
+            )
             session.add(
                 RFI(
                     id=_id(),
@@ -6408,15 +7068,14 @@ async def _seed_module_data(
                     status=r["status"],
                     official_response=r.get("official_response"),
                     responded_by=owner_id if r["status"] == "answered" else None,
-                    responded_at=(
-                        (base + timedelta(days=5)).strftime("%Y-%m-%d") if r["status"] == "answered" else None
-                    ),
+                    responded_at=responded_at,
                     cost_impact=r.get("cost_impact", False),
                     cost_impact_value=r.get("cost_impact_value"),
                     schedule_impact=r.get("schedule_impact", False),
                     schedule_impact_days=r.get("schedule_impact_days"),
-                    date_required=(base + timedelta(days=14)).strftime("%Y-%m-%d"),
-                    response_due_date=(base + timedelta(days=10)).strftime("%Y-%m-%d"),
+                    date_required=required_date,
+                    response_due_date=due_date,
+                    created_at=raised_at,
                     created_by=owner_str,
                     metadata_={"demo_id": demo_id},
                 )
@@ -6433,12 +7092,12 @@ async def _seed_module_data(
                 "meeting_type": "site",
                 "title": "Bauanlaufbesprechung",
                 "meeting_date": base.strftime("%Y-%m-%d"),
-                "location": "Baubuero Chausseestr. 45",
+                "location": "Baubüro Chausseestr. 45",
                 "status": "completed",
                 "attendees": [
-                    {"name": "Klaus Weber", "company": "BWB", "status": "present"},
-                    {"name": "Hans Mueller", "company": "Hochtief", "status": "present"},
-                    {"name": "Louisa Hutton", "company": "SH Arch", "status": "present"},
+                    {"name": "Klaus Weber", "company": "VWB", "status": "present"},
+                    {"name": "Hans Mueller", "company": "Verdanko", "status": "present"},
+                    {"name": "Louisa Tannberg", "company": "RT Arch", "status": "present"},
                     {"name": "Thomas Hartmann", "company": "IB Hartmann", "status": "excused"},
                 ],
                 "agenda_items": [
@@ -6465,12 +7124,12 @@ async def _seed_module_data(
                 "meeting_type": "site",
                 "title": "Wochenbesprechung KW 16",
                 "meeting_date": (base + timedelta(days=7)).strftime("%Y-%m-%d"),
-                "location": "Baubuero Chausseestr. 45",
+                "location": "Baubüro Chausseestr. 45",
                 "status": "completed",
                 "attendees": [
-                    {"name": "Hans Mueller", "company": "Hochtief", "status": "present"},
-                    {"name": "Maria Schmidt", "company": "Sto", "status": "absent"},
-                    {"name": "Juergen Braun", "company": "Imtech", "status": "present"},
+                    {"name": "Hans Mueller", "company": "Verdanko", "status": "present"},
+                    {"name": "Maria Schmidt", "company": "Sanverth", "status": "absent"},
+                    {"name": "Juergen Braun", "company": "Norvent", "status": "present"},
                 ],
                 "agenda_items": [
                     {"number": "1", "topic": "Earthworks progress - 60% complete", "notes": "On programme"},
@@ -6489,11 +7148,11 @@ async def _seed_module_data(
                 "meeting_type": "design",
                 "title": "Fassadendetails Abstimmung",
                 "meeting_date": (base + timedelta(days=21)).strftime("%Y-%m-%d"),
-                "location": "Buero Sauerbruch Hutton",
+                "location": "Büro Rehwald Tannberg",
                 "status": "scheduled",
                 "attendees": [
-                    {"name": "Louisa Hutton", "company": "SH Arch", "status": "present"},
-                    {"name": "Maria Schmidt", "company": "Sto", "status": "present"},
+                    {"name": "Louisa Tannberg", "company": "RT Arch", "status": "present"},
+                    {"name": "Maria Schmidt", "company": "Sanverth", "status": "present"},
                 ],
                 "agenda_items": [
                     {"number": "1", "topic": "WDVS detail at window reveals"},
@@ -6508,13 +7167,13 @@ async def _seed_module_data(
                 "meeting_type": "design",
                 "title": "Stage 3 Design Coordination",
                 "meeting_date": (base - timedelta(days=14)).strftime("%Y-%m-%d"),
-                "location": "Arup London, 13 Fitzroy Street",
+                "location": "Endaby London, 40 Marchmont Row",
                 "status": "completed",
                 "attendees": [
-                    {"name": "James Harrison", "company": "Canary Properties", "status": "present"},
-                    {"name": "Anna Musterfrau", "company": "Arup", "status": "present"},
-                    {"name": "David Thompson", "company": "Hoare Lea", "status": "present"},
-                    {"name": "Emma Wallace", "company": "G&T", "status": "present"},
+                    {"name": "James Harrison", "company": "Vittram Properties", "status": "present"},
+                    {"name": "Anna Musterfrau", "company": "Endaby", "status": "present"},
+                    {"name": "David Thompson", "company": "Rensley", "status": "present"},
+                    {"name": "Emma Wallace", "company": "M&T", "status": "present"},
                 ],
                 "agenda_items": [
                     {"number": "1", "topic": "Structural steel tonnage update", "notes": "1285t confirmed"},
@@ -6543,9 +7202,9 @@ async def _seed_module_data(
                 "location": "Site office, E14",
                 "status": "completed",
                 "attendees": [
-                    {"name": "Mark Jones", "company": "Severfield", "status": "present"},
-                    {"name": "Andrea Rossi", "company": "Permasteelisa", "status": "present"},
-                    {"name": "Robert White", "company": "Crown House", "status": "present"},
+                    {"name": "Mark Jones", "company": "Varnsted", "status": "present"},
+                    {"name": "Andrea Rossi", "company": "Fennvale", "status": "present"},
+                    {"name": "Robert White", "company": "Cardwen", "status": "present"},
                 ],
                 "agenda_items": [
                     {"number": "1", "topic": "Construction programme review"},
@@ -6571,7 +7230,7 @@ async def _seed_module_data(
                 "status": "completed",
                 "attendees": [
                     {"name": "Patricia Martinez", "company": "DHS", "status": "present"},
-                    {"name": "Michael Brooks", "company": "HKS", "status": "present"},
+                    {"name": "Michael Brooks", "company": "Vandermere", "status": "present"},
                     {"name": "Dr. Sarah Kim", "company": "DHS Surgery", "status": "present"},
                 ],
                 "agenda_items": [
@@ -6605,8 +7264,8 @@ async def _seed_module_data(
                 "location": "Job trailer, site",
                 "status": "scheduled",
                 "attendees": [
-                    {"name": "Jennifer Davis", "company": "Turner", "status": "present"},
-                    {"name": "Richard Nguyen", "company": "Southland", "status": "present"},
+                    {"name": "Jennifer Davis", "company": "Brackwell", "status": "present"},
+                    {"name": "Richard Nguyen", "company": "Ardenmark", "status": "present"},
                 ],
                 "agenda_items": [
                     {"number": "1", "topic": "Foundation progress update"},
@@ -6625,8 +7284,8 @@ async def _seed_module_data(
                 "status": "completed",
                 "attendees": [
                     {"name": "Sophie Dupont", "company": "Mairie 20e", "status": "present"},
-                    {"name": "Pierre Moreau", "company": "Eiffage", "status": "present"},
-                    {"name": "Frederic Chartier", "company": "Chartier Dalix", "status": "present"},
+                    {"name": "Pierre Moreau", "company": "Tholmery", "status": "present"},
+                    {"name": "Frederic Vaissier", "company": "Vaissier Delonnay", "status": "present"},
                 ],
                 "agenda_items": [
                     {"number": "1", "topic": "Installation chantier - 90% complete", "notes": "Hoarding installed"},
@@ -6652,11 +7311,11 @@ async def _seed_module_data(
                 "meeting_type": "design",
                 "title": "Revue technique CLT - BET structure",
                 "meeting_date": (base + timedelta(days=14)).strftime("%Y-%m-%d"),
-                "location": "Agence Chartier Dalix",
+                "location": "Agence Vaissier Delonnay",
                 "status": "scheduled",
                 "attendees": [
-                    {"name": "Jean Lefebvre", "company": "Arbonis", "status": "present"},
-                    {"name": "Frederic Chartier", "company": "Chartier Dalix", "status": "present"},
+                    {"name": "Jean Lefebvre", "company": "Boisferme", "status": "present"},
+                    {"name": "Frederic Vaissier", "company": "Vaissier Delonnay", "status": "present"},
                 ],
                 "agenda_items": [
                     {"number": "1", "topic": "CLT panel shop drawing review"},
@@ -6671,13 +7330,13 @@ async def _seed_module_data(
                 "meeting_type": "site",
                 "title": "Project Kick-off Meeting",
                 "meeting_date": base.strftime("%Y-%m-%d"),
-                "location": "KEO office, Dubai Design District",
+                "location": "Meridiem Gulf office, Dubai Design District",
                 "status": "completed",
                 "attendees": [
-                    {"name": "Ahmed Al Maktoum", "company": "Al Futtaim", "status": "present"},
-                    {"name": "Ravi Sharma", "company": "KEO", "status": "present"},
-                    {"name": "Khalid Al Jaber", "company": "AJEC", "status": "present"},
-                    {"name": "George Palmer", "company": "RBG", "status": "present"},
+                    {"name": "Ahmed Al Nuraimi", "company": "Zafeer", "status": "present"},
+                    {"name": "Ravi Sharma", "company": "MGC", "status": "present"},
+                    {"name": "Khalid Al Marri", "company": "NKE", "status": "present"},
+                    {"name": "George Palmer", "company": "HFG", "status": "present"},
                 ],
                 "agenda_items": [
                     {"number": "1", "topic": "Programme overview - 12 months", "notes": "Handover March 2027"},
@@ -6707,8 +7366,8 @@ async def _seed_module_data(
                 "location": "Site office, Jebel Ali",
                 "status": "scheduled",
                 "attendees": [
-                    {"name": "Khalid Al Jaber", "company": "AJEC", "status": "present"},
-                    {"name": "Suresh Nair", "company": "Leminar", "status": "present"},
+                    {"name": "Khalid Al Marri", "company": "NKE", "status": "present"},
+                    {"name": "Suresh Nair", "company": "Zafran", "status": "present"},
                 ],
                 "agenda_items": [
                     {"number": "1", "topic": "Earthworks progress"},
@@ -6777,11 +7436,11 @@ async def _seed_module_data(
                 "title": "Minor hand injury - rebar handling",
                 "incident_date": (base + timedelta(days=35)).strftime("%Y-%m-%d"),
                 "location": "Foundation zone, Grid A-B / 1-3",
-                "incident_type": "first_aid",
+                "incident_type": "injury",
                 "severity": "minor",
                 "description": "Worker cut left hand while handling rebar ties. Cut treated on site with first aid.",
                 "treatment_type": "first_aid",
-                "injured_person_details": {"role": "Rebar fitter", "company": "Hochtief AG"},
+                "injured_person_details": {"role": "Rebar fitter", "company": "Verdanko Hochbau AG"},
                 "root_cause": "Worker removed gloves to tie wire, hand slipped on rebar end",
                 "corrective_actions": [
                     {
@@ -6801,7 +7460,7 @@ async def _seed_module_data(
                 "incident_date": (base + timedelta(days=60)).strftime("%Y-%m-%d"),
                 "location": "Level 5, perimeter zone",
                 "incident_type": "near_miss",
-                "severity": "serious",
+                "severity": "major",
                 "description": "M24 bolt dropped from Level 5 during steel erection. "
                 "Landed in exclusion zone - no one injured.",
                 "root_cause": "Tool tether not attached to impact wrench",
@@ -6828,7 +7487,7 @@ async def _seed_module_data(
                 "incident_date": (base + timedelta(days=45)).strftime("%Y-%m-%d"),
                 "location": "Level 2, Surgical Suite corridor",
                 "incident_type": "environmental",
-                "severity": "serious",
+                "severity": "major",
                 "description": "ICRA Class IV barrier was breached during ductwork installation. "
                 "Negative air pressure lost for 15 minutes in adjacent occupied area.",
                 "root_cause": "Subcontractor cut opening in barrier without notifying ICRA monitor",
@@ -6858,12 +7517,12 @@ async def _seed_module_data(
                 "title": "Slip and fall - wet concrete pour area",
                 "incident_date": (base + timedelta(days=25)).strftime("%Y-%m-%d"),
                 "location": "Level 1, ED wing foundation",
-                "incident_type": "recordable",
+                "incident_type": "injury",
                 "severity": "moderate",
                 "description": "Worker slipped on wet concrete near pour area. Bruised knee, "
                 "returned to work next day.",
                 "treatment_type": "first_aid",
-                "injured_person_details": {"role": "Laborer", "company": "Turner Construction"},
+                "injured_person_details": {"role": "Laborer", "company": "Brackwell Construction"},
                 "root_cause": "Inadequate housekeeping - water not channeled away from work path",
                 "corrective_actions": [
                     {
@@ -6883,7 +7542,7 @@ async def _seed_module_data(
                 "incident_date": (base + timedelta(days=50)).strftime("%Y-%m-%d"),
                 "location": "Zone de stockage, aire nord",
                 "incident_type": "near_miss",
-                "severity": "serious",
+                "severity": "major",
                 "description": "CLT panel slipped from storage rack due to improper bracing. "
                 "No injuries - area was cordoned off.",
                 "root_cause": "Storage rack not rated for CLT panel weight. Wind loading not considered.",
@@ -6909,12 +7568,12 @@ async def _seed_module_data(
                 "title": "Heat exhaustion - steel erector",
                 "incident_date": (base + timedelta(days=75)).strftime("%Y-%m-%d"),
                 "location": "Warehouse bay 3, roof level",
-                "incident_type": "recordable",
+                "incident_type": "injury",
                 "severity": "moderate",
                 "description": "Steel erector showed signs of heat exhaustion at 14:00 during "
                 "June operations. Temperature 48C. Worker evacuated and treated.",
                 "treatment_type": "medical_treatment",
-                "injured_person_details": {"role": "Steel erector", "company": "Al Jaber Engineering"},
+                "injured_person_details": {"role": "Steel erector", "company": "Nakheer Engineering"},
                 "root_cause": "Worker continued past midday ban period. Supervisor failed to enforce break.",
                 "corrective_actions": [
                     {
@@ -6937,7 +7596,7 @@ async def _seed_module_data(
                 "incident_date": (base + timedelta(days=30)).strftime("%Y-%m-%d"),
                 "location": "Eastern yard, crane pad area",
                 "incident_type": "near_miss",
-                "severity": "serious",
+                "severity": "major",
                 "description": "Mobile crane outrigger pad sank 150mm into soft ground during "
                 "steel beam lift. Crane immediately halted and load secured.",
                 "root_cause": "Ground bearing capacity not verified at crane position. "
@@ -7002,29 +7661,29 @@ async def _seed_module_data(
                 "likelihood": 3,
                 "immediate_action": "Area cordoned off until handrail installed",
                 "corrective_action": "Scaffolders to complete handrails before platform use",
-                "status": "resolved",
+                "status": "closed",
             },
             {
                 "observation_number": "OBS-002",
-                "observation_type": "unsafe_behavior",
+                "observation_type": "unsafe_act",
                 "description": "Two workers observed not wearing safety glasses during concrete cutting.",
                 "location": "Ground floor slab, Grid E/5",
                 "severity": 3,
                 "likelihood": 4,
                 "immediate_action": "Workers stopped and issued PPE",
                 "corrective_action": "Toolbox talk on mandatory eye protection for cutting works",
-                "status": "resolved",
+                "status": "closed",
             },
             {
                 "observation_number": "OBS-003",
-                "observation_type": "housekeeping",
+                "observation_type": "unsafe_condition",
                 "description": "Debris and loose materials blocking emergency exit route at level 1.",
                 "location": "Stairwell 2, Level 1",
                 "severity": 3,
                 "likelihood": 2,
                 "immediate_action": "Area cleared immediately",
                 "corrective_action": "Weekly housekeeping audit added to site inspection schedule",
-                "status": "resolved",
+                "status": "in_progress",
             },
         ],
         "office-london": [
@@ -7037,18 +7696,18 @@ async def _seed_module_data(
                 "likelihood": 2,
                 "immediate_action": "Barrier installed within 30 minutes",
                 "corrective_action": "Daily check of all temporary edge protection",
-                "status": "resolved",
+                "status": "closed",
             },
             {
                 "observation_number": "OBS-002",
-                "observation_type": "unsafe_behavior",
+                "observation_type": "unsafe_act",
                 "description": "Operative working at height without harness clip attached.",
                 "location": "Perimeter, Level 7",
                 "severity": 5,
                 "likelihood": 3,
                 "immediate_action": "Operative removed from site for remainder of day",
                 "corrective_action": "All operatives re-inducted on working at height procedures",
-                "status": "resolved",
+                "status": "closed",
             },
             {
                 "observation_number": "OBS-003",
@@ -7058,7 +7717,7 @@ async def _seed_module_data(
                 "location": "Basement Level -1",
                 "severity": 1,
                 "likelihood": 1,
-                "status": "closed",
+                "status": "in_progress",
             },
         ],
         "medical-us": [
@@ -7071,7 +7730,7 @@ async def _seed_module_data(
                 "likelihood": 4,
                 "immediate_action": "Filter replaced immediately, air quality test performed",
                 "corrective_action": "Filter change schedule posted on each machine with daily check log",
-                "status": "resolved",
+                "status": "closed",
             },
             {
                 "observation_number": "OBS-002",
@@ -7082,18 +7741,18 @@ async def _seed_module_data(
                 "likelihood": 3,
                 "immediate_action": "Temporary illuminated exit sign installed",
                 "corrective_action": "All fire exit signs checked weekly during construction phase",
-                "status": "resolved",
+                "status": "closed",
             },
             {
                 "observation_number": "OBS-003",
-                "observation_type": "housekeeping",
+                "observation_type": "unsafe_condition",
                 "description": "Sharp rebar ends protruding from slab edge not capped.",
                 "location": "Level 3 slab edge, grid D/7",
                 "severity": 4,
                 "likelihood": 3,
                 "immediate_action": "Mushroom caps installed on all exposed rebar",
                 "corrective_action": "Rebar capping added to daily checklist for concrete crew",
-                "status": "resolved",
+                "status": "closed",
             },
             {
                 "observation_number": "OBS-004",
@@ -7103,7 +7762,7 @@ async def _seed_module_data(
                 "location": "Level 1, radiology suite",
                 "severity": 1,
                 "likelihood": 1,
-                "status": "closed",
+                "status": "in_progress",
             },
         ],
         "school-paris": [
@@ -7117,11 +7776,11 @@ async def _seed_module_data(
                 "likelihood": 4,
                 "immediate_action": "Barriers and warning signs installed",
                 "corrective_action": "Daily perimeter check for public safety hazards",
-                "status": "resolved",
+                "status": "closed",
             },
             {
                 "observation_number": "OBS-002",
-                "observation_type": "noise",
+                "observation_type": "unsafe_condition",
                 "description": "Demolition noise exceeding 85 dB at property boundary at 07:30. "
                 "Mairie restriction is 08:00 start for noisy works.",
                 "location": "Boundary fence, rue de Belleville",
@@ -7129,18 +7788,18 @@ async def _seed_module_data(
                 "likelihood": 3,
                 "immediate_action": "Works stopped until 08:00, noise barrier repositioned",
                 "corrective_action": "Site manager to confirm noise levels before 08:00 start",
-                "status": "resolved",
+                "status": "closed",
             },
             {
                 "observation_number": "OBS-003",
-                "observation_type": "housekeeping",
+                "observation_type": "unsafe_condition",
                 "description": "Stockage CLT non bache - CLT panels stored without weather protection.",
                 "location": "Zone de stockage nord",
                 "severity": 3,
                 "likelihood": 4,
                 "immediate_action": "Panels covered with tarpaulin",
                 "corrective_action": "All CLT deliveries to be stored in covered area only",
-                "status": "resolved",
+                "status": "in_progress",
             },
         ],
         "warehouse-dubai": [
@@ -7153,7 +7812,7 @@ async def _seed_module_data(
                 "likelihood": 4,
                 "immediate_action": "Water replenished, additional cooler boxes provided",
                 "corrective_action": "Hourly water station checks during summer months",
-                "status": "resolved",
+                "status": "closed",
             },
             {
                 "observation_number": "OBS-002",
@@ -7164,18 +7823,18 @@ async def _seed_module_data(
                 "likelihood": 3,
                 "immediate_action": "All loose materials secured, lightweight items moved to warehouse",
                 "corrective_action": "Weather alert response procedure updated and drilled",
-                "status": "resolved",
+                "status": "closed",
             },
             {
                 "observation_number": "OBS-003",
-                "observation_type": "unsafe_behavior",
+                "observation_type": "unsafe_act",
                 "description": "Welding in progress without fire watch posted nearby.",
                 "location": "Bay 4, steel connection area",
                 "severity": 4,
                 "likelihood": 3,
                 "immediate_action": "Welding stopped, fire watch assigned",
                 "corrective_action": "Hot work permit must include fire watch name before issuance",
-                "status": "resolved",
+                "status": "closed",
             },
             {
                 "observation_number": "OBS-004",
@@ -7185,7 +7844,7 @@ async def _seed_module_data(
                 "location": "General site",
                 "severity": 1,
                 "likelihood": 1,
-                "status": "closed",
+                "status": "in_progress",
             },
         ],
     }
@@ -7292,7 +7951,7 @@ async def _seed_module_data(
             {
                 "inspection_number": "INS-003",
                 "inspection_type": "fire_stopping",
-                "title": "Brandschutz Durchfuehrungen - Fire Stopping",
+                "title": "Brandschutz Durchführungen - Fire Stopping",
                 "description": "Inspection of fire stopping at service penetrations Level 1-2",
                 "location": "Levels 1-2, all risers",
                 "status": "completed",
@@ -7684,7 +8343,7 @@ async def _seed_module_data(
                 "inspection_number": "I-01",
                 "inspection_type": "earthworks",
                 "title": "Abnahme Erdplanum mit Lastplattendruckversuchen (subgrade acceptance, plate load tests)",
-                "description": "Ev2 >= 45 MN/m2 nachgewiesen. Pruefberichte D22/D23. Durchgefuehrt durch S08.",
+                "description": "Ev2 >= 45 MN/m2 nachgewiesen. Prüfberichte D22/D23. Durchgeführt durch S08.",
                 "location": "Baufeld, Planum Bauwerk",
                 "status": "completed",
                 "result": "pass",
@@ -7692,7 +8351,7 @@ async def _seed_module_data(
                 "checklist_data": [
                     {
                         "id": "1",
-                        "category": "Tragfaehigkeit",
+                        "category": "Tragfähigkeit",
                         "question": "Ev2 >= 45 MN/m2 erreicht?",
                         "response": "yes",
                         "critical": True,
@@ -7707,7 +8366,7 @@ async def _seed_module_data(
                     {
                         "id": "3",
                         "category": "Dokumentation",
-                        "question": "Pruefbericht D22 erstellt?",
+                        "question": "Prüfbericht D22 erstellt?",
                         "response": "yes",
                     },
                 ],
@@ -7715,8 +8374,8 @@ async def _seed_module_data(
             {
                 "inspection_number": "I-02",
                 "inspection_type": "rebar",
-                "title": "Bewehrungsabnahme Bodenplatte durch Pruefstatiker (slab rebar inspection by checking engineer)",
-                "description": "Bestanden mit Auflage: Randbewehrung Feld A1 nachgelegt, erledigt 2026-04-16. Durchgefuehrt durch S05. Protokoll D24.",
+                "title": "Bewehrungsabnahme Bodenplatte durch Prüfstatiker (slab rebar inspection by checking engineer)",
+                "description": "Bestanden mit Auflage: Randbewehrung Feld A1 nachgelegt, erledigt 2026-04-16. Durchgeführt durch S05. Protokoll D24.",
                 "location": "Bodenplatte, Feld A1",
                 "status": "completed",
                 "result": "pass",
@@ -7732,7 +8391,7 @@ async def _seed_module_data(
                     {
                         "id": "2",
                         "category": "Randzonen",
-                        "question": "Randbewehrung Feld A1 vollstaendig?",
+                        "question": "Randbewehrung Feld A1 vollständig?",
                         "response": "no",
                         "notes": "Auflage: nachgelegt und erledigt 2026-04-16",
                     },
@@ -7747,8 +8406,8 @@ async def _seed_module_data(
             {
                 "inspection_number": "I-03",
                 "inspection_type": "drainage",
-                "title": "Dichtheitspruefung und Kamerabefahrung Grundleitungen DIN EN 1610 (drainage tightness test and CCTV)",
-                "description": "Teilweise bestanden, Mangel M-007 (Gefaelle 0,3 % statt 0,5 % Abschnitt S3-S4). Wiederholungspruefung geplant 2026-06-26. Pruefprotokoll D25 an S16.",
+                "title": "Dichtheitsprüfung und Kamerabefahrung Grundleitungen DIN EN 1610 (drainage tightness test and CCTV)",
+                "description": "Teilweise bestanden, Mangel M-007 (Gefälle 0,3 % statt 0,5 % Abschnitt S3-S4). Wiederholungsprüfung geplant 2026-06-26. Prüfprotokoll D25 an S16.",
                 "location": "Grundleitungen unter Bodenplatte, Anlieferzone",
                 "status": "completed",
                 "result": "fail",
@@ -7762,8 +8421,8 @@ async def _seed_module_data(
                     },
                     {
                         "id": "2",
-                        "category": "Gefaelle",
-                        "question": "Mindestgefaelle 0,5 % eingehalten?",
+                        "category": "Gefälle",
+                        "question": "Mindestgefälle 0,5 % eingehalten?",
                         "response": "no",
                         "critical": True,
                         "notes": "Abschnitt S3-S4 nur 0,3 %, siehe Mangel M-007",
@@ -7780,7 +8439,7 @@ async def _seed_module_data(
                 "inspection_number": "I-04",
                 "inspection_type": "safety",
                 "title": "SiGeKo-Baustellenbegehung Nr. 7 (H&S coordinator site walkthrough no. 7)",
-                "description": "3 Feststellungen: Absturzsicherung Dachrandarbeiten nachruesten, Verkehrsweg Fassadengeruest freihalten, Erste-Hilfe-Aushang aktualisieren. Frist 2026-06-16. Durchgefuehrt durch S10.",
+                "description": "3 Feststellungen: Absturzsicherung Dachrandarbeiten nachrüsten, Verkehrsweg Fassadengerüst freihalten, Erste-Hilfe-Aushang aktualisieren. Frist 2026-06-16. Durchgeführt durch S10.",
                 "location": "Gesamte Baustelle",
                 "status": "completed",
                 "result": None,
@@ -7791,12 +8450,12 @@ async def _seed_module_data(
                         "category": "Absturzsicherung",
                         "question": "Dachrandarbeiten gesichert?",
                         "response": "no",
-                        "notes": "Nachruesten bis 2026-06-16",
+                        "notes": "Nachrüsten bis 2026-06-16",
                     },
                     {
                         "id": "2",
                         "category": "Verkehrswege",
-                        "question": "Verkehrsweg am Fassadengeruest frei?",
+                        "question": "Verkehrsweg am Fassadengerüst frei?",
                         "response": "no",
                         "notes": "Freihalten",
                     },
@@ -7828,6 +8487,16 @@ async def _seed_module_data(
                     status=insp["status"],
                     result=insp.get("result"),
                     checklist_data=insp.get("checklist_data", []),
+                    # Who carried out the inspection. A seed row may name the
+                    # role itself; the default is the consulting engineer,
+                    # because a quality inspection on these projects is a
+                    # checking engineer's job and one of the curated German
+                    # rows says exactly that in its title. An authority
+                    # inspection would set "party" rather than be detected
+                    # from the wording, which reworders would break.
+                    inspector_id=_uuid_or_none(
+                        _seeded_party_id(contact_ids_by_type, insp.get("party") or "consultant")
+                    ),
                     created_by=owner_str,
                     metadata_={"demo_id": demo_id},
                 )
@@ -7846,7 +8515,7 @@ async def _seed_module_data(
                 "due_date": (base + timedelta(days=60)).strftime("%Y-%m-%d"),
                 "currency_code": "EUR",
                 "status": "paid",
-                "notes": "Hochtief - 1. Abschlagsrechnung Erdarbeiten",
+                "notes": "Verdanko - 1. Abschlagsrechnung Erdarbeiten",
                 "line_items": [
                     {
                         "description": "Aushub Baugrube 2500 m3",
@@ -7871,10 +8540,10 @@ async def _seed_module_data(
                 "due_date": (base + timedelta(days=90)).strftime("%Y-%m-%d"),
                 "currency_code": "EUR",
                 "status": "approved",
-                "notes": "Hochtief - 2. Abschlagsrechnung Gruendung",
+                "notes": "Verdanko - 2. Abschlagsrechnung Gründung",
                 "line_items": [
                     {
-                        "description": "Bohrpfaehle d=600mm 480 m",
+                        "description": "Bohrpfähle d=600mm 480 m",
                         "quantity": "480",
                         "unit": "m",
                         "unit_rate": "145.00",
@@ -7895,8 +8564,8 @@ async def _seed_module_data(
                 "invoice_date": (base + timedelta(days=90)).strftime("%Y-%m-%d"),
                 "due_date": (base + timedelta(days=120)).strftime("%Y-%m-%d"),
                 "currency_code": "EUR",
-                "status": "submitted",
-                "notes": "Sto SE - 1. Abschlagsrechnung Fassade WDVS",
+                "status": "sent",
+                "notes": "Sanverth - 1. Abschlagsrechnung Fassade WDVS",
                 "line_items": [
                     {
                         "description": "WDVS Mineralwolle 160mm 2400 m2",
@@ -7916,7 +8585,7 @@ async def _seed_module_data(
                 "due_date": (base + timedelta(days=75)).strftime("%Y-%m-%d"),
                 "currency_code": "GBP",
                 "status": "paid",
-                "notes": "Severfield - Valuation 1 - Steel erection Levels 1-3",
+                "notes": "Varnsted - Valuation 1 - Steel erection Levels 1-3",
                 "line_items": [
                     {
                         "description": "Structural steel columns 160t",
@@ -7941,7 +8610,7 @@ async def _seed_module_data(
                 "due_date": (base + timedelta(days=105)).strftime("%Y-%m-%d"),
                 "currency_code": "GBP",
                 "status": "approved",
-                "notes": "Permasteelisa - Advance payment for curtain wall fabrication",
+                "notes": "Fennvale - Advance payment for curtain wall fabrication",
                 "line_items": [
                     {
                         "description": "Curtain wall advance - 30% of contract",
@@ -7979,7 +8648,7 @@ async def _seed_module_data(
                 "due_date": (base + timedelta(days=60)).strftime("%Y-%m-%d"),
                 "currency_code": "USD",
                 "status": "paid",
-                "notes": "Turner - Pay application #1 - Foundation & site work",
+                "notes": "Brackwell - Pay application #1 - Foundation & site work",
                 "line_items": [
                     {
                         "description": "Site preparation and earthwork",
@@ -8004,7 +8673,7 @@ async def _seed_module_data(
                 "due_date": (base + timedelta(days=90)).strftime("%Y-%m-%d"),
                 "currency_code": "USD",
                 "status": "approved",
-                "notes": "Southland Industries - MEP rough-in progress billing",
+                "notes": "Ardenmark Mechanical - MEP rough-in progress billing",
                 "line_items": [
                     {
                         "description": "Underground utilities 60%",
@@ -8028,11 +8697,11 @@ async def _seed_module_data(
                 "invoice_date": (base + timedelta(days=90)).strftime("%Y-%m-%d"),
                 "due_date": (base + timedelta(days=120)).strftime("%Y-%m-%d"),
                 "currency_code": "USD",
-                "status": "submitted",
-                "notes": "Siemens Healthineers - 3T MRI equipment deposit",
+                "status": "sent",
+                "notes": "Corvale Medical Imaging - 3T MRI equipment deposit",
                 "line_items": [
                     {
-                        "description": "Siemens MAGNETOM Vida 3T - 50% deposit",
+                        "description": "Corvale Aurantis 3T - 50% deposit",
                         "quantity": "1",
                         "unit": "pcs",
                         "unit_rate": "1250000.00",
@@ -8049,7 +8718,7 @@ async def _seed_module_data(
                 "due_date": (base + timedelta(days=75)).strftime("%Y-%m-%d"),
                 "currency_code": "EUR",
                 "status": "paid",
-                "notes": "Eiffage - Situation 1 - Terrassement et fondations",
+                "notes": "Tholmery - Situation 1 - Terrassement et fondations",
                 "line_items": [
                     {
                         "description": "Terrassement general 1200 m3",
@@ -8074,7 +8743,7 @@ async def _seed_module_data(
                 "due_date": (base + timedelta(days=105)).strftime("%Y-%m-%d"),
                 "currency_code": "EUR",
                 "status": "approved",
-                "notes": "Arbonis - Acompte panneaux CLT",
+                "notes": "Boisferme - Acompte panneaux CLT",
                 "line_items": [
                     {
                         "description": "CLT panels - 40% advance on fabrication",
@@ -8094,7 +8763,7 @@ async def _seed_module_data(
                 "due_date": (base + timedelta(days=60)).strftime("%Y-%m-%d"),
                 "currency_code": "AED",
                 "status": "paid",
-                "notes": "Al Jaber - IPC 1 - Earthworks and foundations",
+                "notes": "Nakheer - IPC 1 - Earthworks and foundations",
                 "line_items": [
                     {
                         "description": "Earthworks and grading 45000 m2",
@@ -8119,7 +8788,7 @@ async def _seed_module_data(
                 "due_date": (base + timedelta(days=90)).strftime("%Y-%m-%d"),
                 "currency_code": "AED",
                 "status": "approved",
-                "notes": "Al Jaber - IPC 2 - Steel structure fabrication deposit",
+                "notes": "Nakheer - IPC 2 - Steel structure fabrication deposit",
                 "line_items": [
                     {
                         "description": "Portal frame steel - 40% fabrication advance",
@@ -8136,7 +8805,7 @@ async def _seed_module_data(
                 "invoice_date": (base + timedelta(days=90)).strftime("%Y-%m-%d"),
                 "due_date": (base + timedelta(days=120)).strftime("%Y-%m-%d"),
                 "currency_code": "AED",
-                "status": "submitted",
+                "status": "sent",
                 "notes": "EFFE - Fire protection system advance",
                 "line_items": [
                     {
@@ -8162,6 +8831,16 @@ async def _seed_module_data(
                 else (0.20 if template.currency == "GBP" else (0.05 if template.currency == "AED" else 0.0))
             )
             tax = round(subtotal * tax_rate, 2)
+            # Link the invoice to its counterparty: an explicit role reference
+            # ("contact_ref", used by the e-invoice showcase to bill the
+            # client) wins, else the company the row names. Both resolve to
+            # None when the contacts block did not run, which is the same
+            # fail-soft the rest of this seed lives by.
+            contact_ref = str(inv.get("contact_ref") or "").strip()
+            linked_contact_id = (contact_ids_by_type.get(contact_ref) or [None])[0] if contact_ref else None
+            if linked_contact_id is None:
+                linked_contact_id = contact_id_by_company.get(str(inv.get("counterparty_company") or "").strip())
+            extra_meta = inv.get("metadata") if isinstance(inv.get("metadata"), dict) else {}
             inv_obj = Invoice(
                 id=_id(),
                 project_id=project_id,
@@ -8176,8 +8855,9 @@ async def _seed_module_data(
                 amount_total=str(round(subtotal + tax, 2)),
                 status=inv["status"],
                 notes=inv.get("notes"),
+                contact_id=linked_contact_id,
                 created_by=owner_id,
-                metadata_={"demo_id": demo_id},
+                metadata_={**extra_meta, "demo_id": demo_id},
             )
             session.add(inv_obj)
             await session.flush()
@@ -8210,7 +8890,7 @@ async def _seed_module_data(
                 "forecast_final": "462000",
             },
             {
-                "category": "Gruendung",
+                "category": "Gründung",
                 "original_budget": "680000",
                 "revised_budget": "680000",
                 "committed": "650000",
@@ -8405,7 +9085,7 @@ async def _seed_module_data(
         # committed/actual/forecast.
         "retail-market-heilbronn": [
             {
-                "category": "KG 200 Vorbereitende Massnahmen / Erschliessung",
+                "category": "KG 200 Vorbereitende Massnahmen / Erschließung",
                 "original_budget": "280000.00",
                 "revised_budget": "280000.00",
                 "committed": "264500.00",
@@ -8429,7 +9109,7 @@ async def _seed_module_data(
                 "forecast_final": "2665000.00",
             },
             {
-                "category": "KG 500 Aussenanlagen und Freiflaechen",
+                "category": "KG 500 Außenanlagen und Freiflächen",
                 "original_budget": "1150000.00",
                 "revised_budget": "1150000.00",
                 "committed": "0.00",
@@ -8465,7 +9145,34 @@ async def _seed_module_data(
 
     try:
         budget_list = _BUDGETS.get(demo_id) or generated.get("finance_budgets", [])
+        # ProjectBudget.currency_code carries no DB default - the model
+        # requires the writer to supply it from the project context. Neither
+        # the hand-authored _BUDGETS dicts nor the generated ones carry one,
+        # so every seeded line landed with "" and the finance table rendered
+        # a column of em-dashes instead of money. The template currency is
+        # the same value that went into Project.currency.
+        budget_currency = (template.currency or "").strip()[:3].upper()
+        # Skip categories this project already carries. Without this the insert
+        # was unguarded, and the guards above it do not cover it: the callers of
+        # ``_seed_module_data`` gate on a *representative* module (an RFI row),
+        # so any run that reaches this block a second time - a first run that
+        # failed after the budgets were written, or a re-enrichment - wrote the
+        # category again. ``ProjectBudget`` is unique on
+        # (project_id, wbs_id, category) but ``wbs_id`` is NULL here, and
+        # PostgreSQL treats NULLs as distinct, so the constraint does not catch
+        # it: the estate silently grew a second "KG 300 Bauwerk" line and the
+        # finance rollup double-counted it. Checking explicitly is the only
+        # thing that actually holds.
+        existing_categories = set(
+            (await session.execute(select(ProjectBudget.category).where(ProjectBudget.project_id == project_id)))
+            .scalars()
+            .all()
+        )
+        added_budgets = 0
         for bl in budget_list:
+            if bl["category"][:100] in existing_categories:
+                continue
+            added_budgets += 1
             session.add(
                 ProjectBudget(
                     id=_id(),
@@ -8474,6 +9181,7 @@ async def _seed_module_data(
                     # section label would roll back the whole demo install, so
                     # clip it defensively here.
                     category=bl["category"][:100],
+                    currency_code=bl.get("currency_code") or budget_currency,
                     original_budget=bl["original_budget"],
                     revised_budget=bl["revised_budget"],
                     committed=bl["committed"],
@@ -8482,7 +9190,9 @@ async def _seed_module_data(
                     metadata_={"demo_id": demo_id},
                 )
             )
-        results["finance_budgets"] = len(budget_list)
+        # Report what was written, not what was offered. Reporting the input
+        # length made a fully skipped re-run look like a fully successful one.
+        results["finance_budgets"] = added_budgets
     except Exception:
         logger.debug("Finance budget not loaded, skipping")
 
@@ -8500,7 +9210,7 @@ async def _seed_module_data(
                 "location_y": 0.42,
             },
             {
-                "title": "WDVS Blasenbildung Suedseite OG2",
+                "title": "WDVS Blasenbildung Südseite OG2",
                 "description": "EIFS adhesive blistering on south facade Level 2, approx 2m2 area.",
                 "priority": "high",
                 "status": "open",
@@ -8519,7 +9229,7 @@ async def _seed_module_data(
                 "resolution_notes": "Fire collars ordered, installation scheduled for next week",
             },
             {
-                "title": "Fussbodenheizungsverteiler Wohnung 3.04 undicht",
+                "title": "Fußbodenheizungsverteiler Wohnung 3.04 undicht",
                 "description": "Minor leak at manifold connection in apartment 3.04.",
                 "priority": "medium",
                 "status": "resolved",
@@ -8679,8 +9389,8 @@ async def _seed_module_data(
         # (slab flatness) links to NCR-02. Severities map to punch priorities.
         "retail-market-heilbronn": [
             {
-                "title": "M-001 Betonabplatzung Fertigteilstuetze Achse C/4 (concrete spalling, precast column C/4)",
-                "description": "Abplatzung im Sichtbereich Verkaufsraum, Achse C/4. Aus der Rohbau-Zwischenbegehung D26. Faellig 2026-06-26.",
+                "title": "M-001 Betonabplatzung Fertigteilstütze Achse C/4 (concrete spalling, precast column C/4)",
+                "description": "Abplatzung im Sichtbereich Verkaufsraum, Achse C/4. Aus der Rohbau-Zwischenbegehung D26. Fällig 2026-06-26.",
                 "priority": "medium",
                 "status": "open",
                 "category": "structural",
@@ -8690,7 +9400,7 @@ async def _seed_module_data(
             },
             {
                 "title": "M-002 Dachbahn Attika Nord nicht verklebt (roof membrane at north parapet unbonded)",
-                "description": "Dachbahn auf 3 lfm an der Attika Nord nicht verklebt. Meldung Bauleitung GU. Faellig 2026-06-17.",
+                "description": "Dachbahn auf 3 lfm an der Attika Nord nicht verklebt. Meldung Bauleitung GU. Fällig 2026-06-17.",
                 "priority": "high",
                 "status": "in_progress",
                 "category": "roofing",
@@ -8700,7 +9410,7 @@ async def _seed_module_data(
             },
             {
                 "title": "M-003 Ebenheitsabweichung Bodenplatte Kassenzone (slab flatness deviation, checkout zone)",
-                "description": "4 mm/2 m, DIN 18202 Tab. 3 Z. 3 ueberschritten. Ausgleichsspachtelung vor Industrieboden T23. Linked to NCR-02. Faellig 2026-07-10.",
+                "description": "4 mm/2 m, DIN 18202 Tab. 3 Z. 3 überschritten. Ausgleichsspachtelung vor Industrieboden T23. Linked to NCR-02. Fällig 2026-07-10.",
                 "priority": "medium",
                 "status": "open",
                 "category": "structural",
@@ -8709,8 +9419,8 @@ async def _seed_module_data(
                 "location_y": 0.15,
             },
             {
-                "title": "M-004 Vergussdokumentation Koecherfundament B/7 unvollstaendig (grouting documentation incomplete)",
-                "description": "Nachweis Vergussmoertel-Charge fuer Koecherfundament B/7 nachreichen. Faellig 2026-06-19.",
+                "title": "M-004 Vergussdokumentation Köcherfundament B/7 unvollständig (grouting documentation incomplete)",
+                "description": "Nachweis Vergussmörtel-Charge für Köcherfundament B/7 nachreichen. Fällig 2026-06-19.",
                 "priority": "low",
                 "status": "open",
                 "category": "structural",
@@ -8719,8 +9429,8 @@ async def _seed_module_data(
                 "location_y": 0.60,
             },
             {
-                "title": "M-005 Transportkratzer an 2 Sandwichpaneelen Suedfassade (transport scratches, south facade)",
-                "description": "Entscheidung Austausch vs. Ausbesserung nach Bemusterung D21. Faellig 2026-07-03.",
+                "title": "M-005 Transportkratzer an 2 Sandwichpaneelen Südfassade (transport scratches, south facade)",
+                "description": "Entscheidung Austausch vs. Ausbesserung nach Bemusterung D21. Fällig 2026-07-03.",
                 "priority": "low",
                 "status": "open",
                 "category": "facade",
@@ -8729,28 +9439,28 @@ async def _seed_module_data(
                 "location_y": 0.05,
             },
             {
-                "title": "M-006 Tuer Technikraum ohne T30 geliefert (plant room door without required T30 rating)",
-                "description": "Brandschutztuer Technikraum EG ohne geforderte Qualitaet T30 geliefert. Feststellung Fachbauleitung Brandschutz S07. Faellig 2026-07-17.",
+                "title": "M-006 Tür Technikraum ohne T30 geliefert (plant room door without required T30 rating)",
+                "description": "Brandschutztür Technikraum EG ohne geforderte Qualität T30 geliefert. Feststellung Fachbauleitung Brandschutz S07. Fällig 2026-07-17.",
                 "priority": "high",
                 "status": "open",
                 "category": "fire_protection",
-                "trade": "Tueren (doors)",
+                "trade": "Türen (doors)",
                 "location_x": 0.72,
                 "location_y": 0.55,
             },
             {
-                "title": "M-007 Grundleitung DN150 Abschnitt S3-S4: Gefaelle 0,3 % statt 0,5 % (drain slope below spec)",
-                "description": "Teilstueck 8 m ausserhalb Bodenplatte neu verlegen, Wiederholungspruefung erforderlich. Aus Dichtheitspruefung D25, feeds repeat test I-03. Faellig 2026-06-24.",
+                "title": "M-007 Grundleitung DN150 Abschnitt S3-S4: Gefälle 0,3 % statt 0,5 % (drain slope below spec)",
+                "description": "Teilstück 8 m ausserhalb Bodenplatte neu verlegen, Wiederholungsprüfung erforderlich. Aus Dichtheitsprüfung D25, feeds repeat test I-03. Fällig 2026-06-24.",
                 "priority": "high",
                 "status": "in_progress",
                 "category": "mep",
-                "trade": "Sanitaer/Entwaesserung (drainage)",
+                "trade": "Sanitär/Entwässerung (drainage)",
                 "location_x": 0.85,
                 "location_y": 0.50,
             },
             {
-                "title": "M-008 Kollision Kabeltrasse mit Lueftungskanal Achse 5 (cable tray clashes with duct at axis 5)",
-                "description": "Umverlegung gem. Koordinationsplan S06 vom 2026-06-09, Lager Achse 5. Faellig 2026-06-22.",
+                "title": "M-008 Kollision Kabeltrasse mit Lüftungskanal Achse 5 (cable tray clashes with duct at axis 5)",
+                "description": "Umverlegung gem. Koordinationsplan S06 vom 2026-06-09, Lager Achse 5. Fällig 2026-06-22.",
                 "priority": "medium",
                 "status": "open",
                 "category": "mep",
@@ -8760,7 +9470,7 @@ async def _seed_module_data(
             },
             {
                 "title": "M-009 Anschlussblech RWA-Lichtkuppel Feld D3 fehlt (flashing for smoke vent rooflight, bay D3, missing)",
-                "description": "Anschlussblech der RWA-Lichtkuppel in Feld D3 fehlt. Faellig 2026-06-19.",
+                "description": "Anschlussblech der RWA-Lichtkuppel in Feld D3 fehlt. Fällig 2026-06-19.",
                 "priority": "medium",
                 "status": "open",
                 "category": "roofing",
@@ -8770,11 +9480,11 @@ async def _seed_module_data(
             },
             {
                 "title": "M-010 Anfahrschutz Rampe Anlieferung nicht montiert (impact protection at delivery ramp not installed)",
-                "description": "Anfahrschutz an der Anlieferrampe noch nicht montiert. Faellig 2026-08-14.",
+                "description": "Anfahrschutz an der Anlieferrampe noch nicht montiert. Fällig 2026-08-14.",
                 "priority": "low",
                 "status": "open",
                 "category": "general",
-                "trade": "Aussenanlagen (external works)",
+                "trade": "Außenanlagen (external works)",
                 "location_x": 0.90,
                 "location_y": 0.45,
             },
@@ -8797,6 +9507,21 @@ async def _seed_module_data(
                     location_x=p.get("location_x"),
                     location_y=p.get("location_y"),
                     resolution_notes=p.get("resolution_notes"),
+                    # The whole list read Unassigned on every row. It goes to
+                    # the main contractor, who allocates it onwards, which is
+                    # how a punch list actually works and is also the one
+                    # assignment that cannot contradict the row: there is a
+                    # single main contractor, whereas picking a trade firm
+                    # would sooner or later name a company whose trade is not
+                    # the trade in the row beside it.
+                    assigned_to=_seeded_party_id(contact_ids_by_type, p.get("party") or "contractor"),
+                    # A closed item was signed off by whoever checked it, and
+                    # an open one has not been checked by anybody yet.
+                    verified_by=(
+                        _seeded_party_id(contact_ids_by_type, "consultant")
+                        if p["status"] in ("closed", "verified")
+                        else None
+                    ),
                     created_by=owner_str,
                     metadata_={"demo_id": demo_id},
                 )
@@ -8819,7 +9544,11 @@ async def _seed_module_data(
                     {"trade": "Piling crew", "headcount": 8, "hours": "9"},
                     {"trade": "Excavation crew", "headcount": 6, "hours": "8"},
                 ],
-                "equipment_on_site": ["Liebherr LB 36 piling rig", "CAT 330 excavator", "Wellpoint dewatering system"],
+                "equipment_on_site": [
+                    "Korvex PB 36 piling rig",
+                    "Tramont T-330 excavator",
+                    "Wellpoint dewatering system",
+                ],
                 "status": "approved",
             },
             {
@@ -8883,7 +9612,7 @@ async def _seed_module_data(
                     {"trade": "Waste sorting", "headcount": 3, "hours": "8"},
                 ],
                 "equipment_on_site": [
-                    "Liebherr R 946 demolition excavator",
+                    "Korvex D 940 demolition excavator",
                     "Concrete crusher",
                     "Dust suppression system",
                 ],
@@ -8955,7 +9684,7 @@ async def _seed_module_data(
         "residential-berlin": [
             {
                 "submittal_number": "SUB-001",
-                "title": "WDVS Sto StoTherm Classic - product data",
+                "title": "WDVS Sanverth ThermFix Classic - product data",
                 "spec_section": "KG 330",
                 "submittal_type": "product_data",
                 "status": "approved",
@@ -8964,7 +9693,7 @@ async def _seed_module_data(
             },
             {
                 "submittal_number": "SUB-002",
-                "title": "Bohrpfahl Ausfuehrungsplan",
+                "title": "Bohrpfahl Ausführungsplan",
                 "spec_section": "KG 320",
                 "submittal_type": "shop_drawing",
                 "status": "approved",
@@ -8973,7 +9702,7 @@ async def _seed_module_data(
             },
             {
                 "submittal_number": "SUB-003",
-                "title": "Aufzug KONE MonoSpace - Werkplanung",
+                "title": "Aufzug Ascentia MonoLift - Werkplanung",
                 "spec_section": "KG 500",
                 "submittal_type": "shop_drawing",
                 "status": "under_review",
@@ -9113,7 +9842,7 @@ async def _seed_module_data(
         "residential-berlin": [
             {
                 "ncr_number": "NCR-001",
-                "title": "Brandschutz Durchfuehrungen fehlend",
+                "title": "Brandschutz Durchführungen fehlend",
                 "description": "3 fire stopping penetrations missing in riser R2 (identified in INS-003).",
                 "ncr_type": "workmanship",
                 "severity": "major",
@@ -9202,22 +9931,22 @@ async def _seed_module_data(
                 "severity": "major",
                 "root_cause": "Massabweichung aus der Werksproduktion der Auflagerkonsole",
                 "root_cause_category": "workmanship",
-                "corrective_action": "Sonderloesung Stahlauflagerplatte 250x250x20 mm gem. statischem Nachweis S04, geprueft und freigegeben durch S05 (Pruefbericht Nachtrag 1); Kosten zulasten Betonwerk.",
-                "preventive_action": "Werksabnahme der Auflagerkonsolen vor Lieferung verschaerft, Montagetoleranzkontrolle dokumentiert.",
+                "corrective_action": "Sonderlösung Stahlauflagerplatte 250x250x20 mm gem. statischem Nachweis S04, geprüft und freigegeben durch S05 (Prüfbericht Nachtrag 1); Kosten zulasten Betonwerk.",
+                "preventive_action": "Werksabnahme der Auflagerkonsolen vor Lieferung verschärft, Montagetoleranzkontrolle dokumentiert.",
                 "status": "closed",
                 "cost_impact": "6200",
                 "schedule_impact_days": 0,
             },
             {
                 "ncr_number": "NCR-02",
-                "title": "Betoncharge Bodenplatte 2026-04-21: Wuerfeldruckfestigkeit 28d unter Soll C25/30 (slab concrete batch below specified strength)",
-                "description": "Einzelwert 26,1 N/mm2 unter Soll C25/30. Erhoben durch S11 (Eigenueberwachung) gegen den Transportbetonlieferanten am 2026-05-22. Linked to punch item M-003.",
+                "title": "Betoncharge Bodenplatte 2026-04-21: Würfeldruckfestigkeit 28d unter Soll C25/30 (slab concrete batch below specified strength)",
+                "description": "Einzelwert 26,1 N/mm2 unter Soll C25/30. Erhoben durch S11 (Eigenüberwachung) gegen den Transportbetonlieferanten am 2026-05-22. Linked to punch item M-003.",
                 "ncr_type": "material",
                 "severity": "major",
-                "root_cause": "Betoncharge vom 2026-04-21 mit zu geringer Wuerfeldruckfestigkeit nach 28 Tagen",
+                "root_cause": "Betoncharge vom 2026-04-21 mit zu geringer Würfeldruckfestigkeit nach 28 Tagen",
                 "root_cause_category": "material_defect",
-                "corrective_action": "Bohrkernpruefung im Bereich Anlieferzone beauftragt (3 Kerne, Pruefbericht erwartet 2026-06-19); Freigabeentscheidung durch S04/S05; Rueckstellung 15.000 EUR im Forecast KG 300 beruecksichtigt.",
-                "preventive_action": "Erweiterte Eigenueberwachung der Transportbeton-Anlieferung, zusaetzliche Probekoerper je Charge.",
+                "corrective_action": "Bohrkernprüfung im Bereich Anlieferzone beauftragt (3 Kerne, Prüfbericht erwartet 2026-06-19); Freigabeentscheidung durch S04/S05; Rückstellung 15.000 EUR im Forecast KG 300 berücksichtigt.",
+                "preventive_action": "Erweiterte Eigenüberwachung der Transportbeton-Anlieferung, zusätzliche Probekörper je Charge.",
                 "status": "under_review",
                 "cost_impact": "15000",
                 "schedule_impact_days": 0,
@@ -9341,6 +10070,16 @@ async def _seed_module_data(
     try:
         corr_list = _CORRESPONDENCE.get(demo_id) or generated.get("correspondence", [])
         for c in corr_list:
+            # Which contact this letter is with. The seed names a role and the
+            # id is resolved here, because the ids are minted a few blocks up
+            # and the generator that writes the letters runs before any row
+            # exists. Where a role has several contacts the first one is used,
+            # which keeps both ends of an exchange with the same party. The
+            # hand-curated demos carry no role, so they seed no link and are
+            # left exactly as they were.
+            party_ids = contact_ids_by_type.get(c.get("party") or "") or []
+            party_id = party_ids[0] if party_ids else None
+            outgoing = c["direction"] == "outgoing"
             session.add(
                 Correspondence(
                     id=_id(),
@@ -9351,6 +10090,8 @@ async def _seed_module_data(
                     correspondence_type=c["correspondence_type"],
                     date_sent=c.get("date_sent"),
                     date_received=c.get("date_received"),
+                    from_contact_id=None if outgoing else party_id,
+                    to_contact_ids=[party_id] if outgoing and party_id else [],
                     notes=c.get("notes"),
                     created_by=owner_str,
                     metadata_={"demo_id": demo_id},
@@ -9373,6 +10114,14 @@ async def _seed_module_data(
 
         var_list = generated.get("variations", [])
         for v in var_list:
+            # Date the row by the day the order was agreed, so downstream
+            # readers of created_at (evidence packs, timelines) see the
+            # business chronology instead of the seeding minute.
+            agreed_dt = None
+            try:
+                agreed_dt = datetime.fromisoformat(str(v.get("agreed_at"))).replace(hour=11, tzinfo=UTC)
+            except (TypeError, ValueError):
+                agreed_dt = None
             session.add(
                 VariationOrder(
                     id=_id(),
@@ -9385,6 +10134,7 @@ async def _seed_module_data(
                     status=v.get("status", "issued"),
                     agreed_at=v.get("agreed_at"),
                     metadata_={"project_id": str(project_id), "demo_id": demo_id},
+                    **({"created_at": agreed_dt, "updated_at": agreed_dt} if agreed_dt else {}),
                 )
             )
         results["variations"] = len(var_list)
@@ -9395,7 +10145,13 @@ async def _seed_module_data(
     try:
         from app.modules.daily_diary.models import DailyDiary
 
-        dd_list = generated.get("daily_diary", [])
+        # The German showcase projects get their diaries from
+        # seed_daily_diary_showcase_de: German text, German working days,
+        # entries and photos, and a signed archive chain. These headers are
+        # English, calendar-blind and empty, and writing them here would both
+        # lose that register and collide with it on
+        # (project_id, diary_date), which is unique.
+        dd_list = [] if demo_id in GERMAN_SHOWCASE_DEMO_IDS else generated.get("daily_diary", [])
         for d in dd_list:
             session.add(
                 DailyDiary(
@@ -9465,6 +10221,9 @@ async def _seed_module_data(
                 amount_total=f"{round(subtotal, 2)}",
                 status=po.get("status", "draft"),
                 notes=po.get("notes"),
+                vendor_contact_id=_seeded_party_id(
+                    contact_ids_by_type, po.get("party"), int(po.get("party_index", 0) or 0)
+                ),
                 created_by=owner_id,
                 metadata_={"project_id": str(project_id), "demo_id": demo_id},
             )
@@ -9490,18 +10249,43 @@ async def _seed_module_data(
 
     # ── Contracts (main + trade subcontracts) ─────────────────────────
     try:
-        from app.modules.contracts.models import Contract
+        from app.modules.contracts.models import Contract, ContractParty
 
         contract_list = generated.get("contracts", [])
         for ct in contract_list:
+            counterparty_id = _seeded_party_id(contact_ids_by_type, ct.get("party"), int(ct.get("party_index", 0) or 0))
+            contract_pk = _id()
+            for pt in ct.get("parties", []):
+                session.add(
+                    ContractParty(
+                        id=_id(),
+                        contract_id=contract_pk,
+                        party_role=pt["party_role"],
+                        # party_type names the register party_id points into,
+                        # and every one of these is resolved out of the contact
+                        # register above.
+                        party_type="contact",
+                        party_id=_uuid_or_none(
+                            _seeded_party_id(
+                                contact_ids_by_type,
+                                pt.get("party"),
+                                int(pt.get("party_index", 0) or 0),
+                            )
+                        ),
+                        display_name=pt["display_name"],
+                        is_primary=bool(pt.get("is_primary", False)),
+                        metadata_={"demo_id": demo_id},
+                    )
+                )
             session.add(
                 Contract(
-                    id=_id(),
+                    id=contract_pk,
                     project_id=project_id,
                     code=ct["code"],
                     title=ct.get("title", ""),
                     contract_type=ct.get("contract_type", "lump_sum"),
                     counterparty_type=ct.get("counterparty_type", "client"),
+                    counterparty_id=_uuid_or_none(counterparty_id),
                     total_value=Decimal(str(ct.get("total_value", "0"))),
                     currency=ct.get("currency", ""),
                     status=ct.get("status", "draft"),
@@ -9655,34 +10439,11 @@ async def _seed_module_data(
     except Exception:
         logger.debug("Progress module not loaded, skipping demo progress")
 
-    # ── Takeoff measurements (so /takeoff is non-empty on every demo) ─────
-    try:
-        from app.modules.takeoff.models import TakeoffMeasurement
-
-        take_list = generated.get("takeoff", [])
-        for t in take_list:
-            mv = t.get("measurement_value")
-            session.add(
-                TakeoffMeasurement(
-                    id=_id(),
-                    project_id=project_id,
-                    document_id=None,
-                    page=t.get("page", 1),
-                    type=t["type"],
-                    group_name=t.get("group_name", "General"),
-                    group_color=t.get("group_color", "#3B82F6"),
-                    annotation=t.get("annotation"),
-                    points=[],
-                    measurement_value=(Decimal(str(mv)) if mv is not None else None),
-                    measurement_unit=t.get("measurement_unit", "m"),
-                    count_value=t.get("count_value"),
-                    created_by=owner_str,
-                    metadata_={"project_id": str(project_id), "demo_id": demo_id, "source": "boq_derived"},
-                )
-            )
-        results["takeoff"] = len(take_list)
-    except Exception:
-        logger.debug("Takeoff module not loaded, skipping demo takeoff measurements")
+    # Takeoff rows are intentionally NOT inserted per demo install: measurements
+    # without a document, points or scale cannot be shown on any sheet. The
+    # takeoff demo enrichment seeder (app.modules.takeoff.seed) creates real
+    # documents with geometry-backed measurements and prunes the legacy
+    # document-less rows earlier installs may have left behind.
 
     # Shared inputs for the gap-module blocks below: real trades / firms from
     # the template, the project's currency, and an approximate project value.
@@ -9698,9 +10459,24 @@ async def _seed_module_data(
                 continue
     if _proj_value <= 0:
         _proj_value = 1_000_000.0
-    # Deterministic id/code seed so a re-seed (force_reinstall / qa-reset)
-    # overwrites the same rows instead of duplicating.
+    # Kept only to recognise rows written before the codes below carried the
+    # demo slug. Nothing new is named after the project UUID any more.
     _pkey = str(project_id)[:8]
+    # Codes on globally-unique registries (assemblies, equipment) still need a
+    # per-demo discriminator, but they are printed on cards and read out loud,
+    # so the discriminator is the demo's own slug rather than eight characters
+    # of its project UUID. Capped because Equipment.code is String(50) and a
+    # pack is free to register a long demo_id.
+    _demo_slug = demo_id.upper()[:30]
+    # The same codes used to carry ``_pkey``. Re-seeding an install that still
+    # holds those rows has to clear them too, or the old ones survive with a
+    # code the new run never writes and never deletes.
+    _legacy_code_prefix = f"DEMO-{_pkey}-"
+    # These codes also used to open with ``DEMO-``. That prefix is the part the
+    # estimator actually read off the card, so it is gone from what we write.
+    # An install seeded before the rename still holds it, and the re-seed has
+    # to clear both shapes or those rows outlive the run that owns them.
+    _legacy_slug_prefix = f"DEMO-{_demo_slug}-"
 
     # ── Assemblies (project recipes so /assemblies is never empty) ─────
     try:
@@ -9741,8 +10517,16 @@ async def _seed_module_data(
                 ],
             ),
         ]
-        _asm_codes = [f"DEMO-{_pkey}-ASM{i + 1}" for i in range(len(_asm_specs))]
-        await session.execute(delete(Assembly).where(Assembly.code.in_(_asm_codes)))
+        _asm_codes = [f"{_demo_slug}-ASM{i + 1}" for i in range(len(_asm_specs))]
+        await session.execute(
+            delete(Assembly).where(
+                or_(
+                    Assembly.code.in_(_asm_codes),
+                    Assembly.code.like(f"{_legacy_code_prefix}ASM%"),
+                    Assembly.code.like(f"{_legacy_slug_prefix}ASM%"),
+                ),
+            ),
+        )
         await session.flush()
         asm_count = 0
         for a_idx, (a_name, a_unit, comps) in enumerate(_asm_specs):
@@ -9772,7 +10556,7 @@ async def _seed_module_data(
                 id=_id(),
                 code=_asm_codes[a_idx],
                 name=a_name,
-                description=f"Demo project assembly for {template.project_name}",
+                description=f"Assembly used on {template.project_name}",
                 unit=a_unit,
                 category="structure",
                 classification={},
@@ -9803,10 +10587,20 @@ async def _seed_module_data(
             ("Tower crane", "crane", 980.0, 140.0),
             ("Mobile excavator", "excavator", 420.0, 60.0),
         ]
-        _eq_codes = [f"DEMO-{_pkey}-EQ{i + 1}" for i in range(len(_eq_specs))]
+        _eq_codes = [f"{_demo_slug}-EQ{i + 1}" for i in range(len(_eq_specs))]
         # Equipment.code is globally unique; rentals cascade-delete with the
-        # equipment unit. Clear by code to keep the re-seed idempotent.
-        await session.execute(delete(Equipment).where(Equipment.code.in_(_eq_codes)))
+        # equipment unit. Clear by code to keep the re-seed idempotent, and
+        # clear the pre-slug codes too so an existing install does not keep a
+        # fleet unit this run will never write to again.
+        await session.execute(
+            delete(Equipment).where(
+                or_(
+                    Equipment.code.in_(_eq_codes),
+                    Equipment.code.like(f"{_legacy_code_prefix}EQ%"),
+                    Equipment.code.like(f"{_legacy_slug_prefix}EQ%"),
+                ),
+            ),
+        )
         await session.flush()
         rental_count = 0
         for e_idx, (e_name, e_type, day_rate, hour_rate) in enumerate(_eq_specs):
@@ -9857,13 +10651,24 @@ async def _seed_module_data(
         # Idempotent: drop any prior demo subcontractor for this project (the
         # agreement/work-package/payment rows cascade off the agreement, which
         # cascades off the project; the subcontractor itself is project-agnostic
-        # so we scope it by a deterministic metadata marker via legal_name).
-        _sub_marker = f"{sub_name} [demo {_pkey}]"
-        await session.execute(delete(Subcontractor).where(Subcontractor.legal_name == _sub_marker))
-        await session.flush()
+        # so we scope it by the demo_id already stamped into its metadata).
+        #
+        # That scope used to be a marker appended to legal_name, which put text
+        # like "[demo 1a2b3c4d]" into the column the subcontractor register
+        # prints as the company name. metadata_ is a JSON column whose
+        # nested-key query syntax differs between SQLite and PostgreSQL, so the
+        # tag is filtered in Python here, the same way
+        # purge_demo_tagged_global_rows reads it. Keying on demo_id rather than
+        # on the project id also cleans up after a force_reinstall, which mints
+        # a new project and used to leave the previous row behind.
+        _prior_subs = (await session.execute(select(Subcontractor))).scalars().all()
+        _stale_sub_ids = [s.id for s in _prior_subs if (s.metadata_ or {}).get("demo_id") == demo_id]
+        if _stale_sub_ids:
+            await session.execute(delete(Subcontractor).where(Subcontractor.id.in_(_stale_sub_ids)))
+            await session.flush()
         sub = Subcontractor(
             id=_id(),
-            legal_name=_sub_marker,
+            legal_name=sub_name,
             trade_name=sub_name,
             trade_categories=[sub_trade],
             prequalification_status="approved",
@@ -9976,7 +10781,7 @@ async def _seed_module_data(
                     forecast_method="cpi",
                     confidence_range_low=str((eac * Decimal("0.97")).quantize(Decimal("0.01"))),
                     confidence_range_high=str((eac * Decimal("1.05")).quantize(Decimal("0.01"))),
-                    notes="Demo baseline forecast",
+                    notes="Baseline forecast at award",
                     metadata_={"demo_id": demo_id, "is_demo": True},
                 )
             )
@@ -9984,6 +10789,22 @@ async def _seed_module_data(
         results["evm_forecasts"] = ev_count
     except Exception:
         logger.debug("Full EVM module not loaded, skipping demo forecasts", exc_info=True)
+
+    # ── Statutory payment clocks (Germany: § 16 VOB/B deadlines) ──────
+    # German projects only. The regimes elsewhere in the catalogue have no
+    # hand-authored demo chain yet, and a clock seeded under the wrong
+    # jurisdiction would state statutory dates that do not apply to the
+    # project. Dates are anchored to the installation day inside the seeder:
+    # a payment clock is about deadlines relative to now.
+    try:
+        if _country_code_for(template) == "DE":
+            from app.modules.payment_clock.demo import seed_demo_payment_clocks
+
+            clock_count = await seed_demo_payment_clocks(session, project_id=project_id, created_by=owner_str)
+            if clock_count:
+                results["payment_clock_applications"] = clock_count
+    except Exception:
+        logger.debug("Payment clock module not loaded, skipping demo clocks", exc_info=True)
 
     # ── Project photos ──────────────────────────────────────────────────
     # Real construction photos are seeded centrally by
@@ -10173,8 +10994,12 @@ async def install_demo_project(
     grand_total = _sum_positions(positions)
 
     # ── 4b. Second BOQ - Budget Estimate (section-level lump sums) ───
+    # The suffix has to keep the two BOQs distinguishable in a dropdown, and
+    # in the template's own language: a German cost plan gets "(Budgetstand)"
+    # rather than an English tail one dash away from its sibling's name.
     budget_boq_id = _id()
-    budget_boq_name = template.budget_boq_name or f"{template.boq_name} - Budget"
+    budget_suffix = "(Budgetstand)" if (template.locale or "").lower().startswith("de") else "- Budget"
+    budget_boq_name = template.budget_boq_name or f"{template.boq_name} {budget_suffix}"
     budget_boq = BOQ(
         id=budget_boq_id,
         project_id=project.id,
@@ -10274,6 +11099,8 @@ async def install_demo_project(
     session.add(schedule)
     await session.flush()
 
+    sched_now = datetime.now()
+
     if template.schedule_activities:
         # Explicit schedule activities defined in template
         prev_id = None
@@ -10281,7 +11108,14 @@ async def install_demo_project(
             s_start = datetime.strptime(act_start, "%Y-%m-%d")
             s_end = datetime.strptime(act_end, "%Y-%m-%d")
             dur = (s_end - s_start).days
-            prog = min(90, int((i / max(len(template.schedule_activities), 1)) * 75 + 10))
+            # Read off the phase's own dates, the same way the generated branch
+            # below does. Computing it from the row index instead put every
+            # phase between 10 and 90 percent regardless of when it ran, so a
+            # programme whose first phases finished last year still showed them
+            # part done, nothing was ever complete or yet to start, and the
+            # progress column climbed in an even ramp that reads as generated
+            # the moment anyone looks at two rows together.
+            prog, act_status = _phase_progress(s_start, s_end, sched_now)
 
             act = Activity(
                 id=_id(),
@@ -10297,7 +11131,7 @@ async def install_demo_project(
                 # type, so an int here raises "expected str, got int" on the
                 # PG quickstart path. Cast everywhere we set it.
                 progress_pct=str(prog),
-                status="in_progress" if prog > 0 else "planned",
+                status=act_status,
                 color="#ef4444" if i % 3 == 0 else "#0071e3",
                 dependencies=[str(prev_id)] if prev_id else [],
                 boq_position_ids=[],
@@ -10309,7 +11143,6 @@ async def install_demo_project(
         # Auto-generate schedule activities from BOQ sections
         current_start = start
         prev_id = None
-        sched_now = datetime.now()
 
         for i, sec in enumerate(sections_list):
             sec_items = [p for p in items_list if str(p.parent_id) == str(sec.id)]
@@ -10326,12 +11159,7 @@ async def install_demo_project(
             end_date = current_start + timedelta(days=dur)
             # Progress relative to the current date so finished phases read
             # complete and future ones planned (no false "delayed" badges).
-            if end_date <= sched_now:
-                prog = 100
-            elif current_start >= sched_now:
-                prog = 0
-            else:
-                prog = max(0, min(99, int((sched_now - current_start).days / max(dur, 1) * 100)))
+            prog, act_status = _phase_progress(current_start, end_date, sched_now)
 
             act = Activity(
                 id=_id(),
@@ -10343,7 +11171,7 @@ async def install_demo_project(
                 end_date=end_date.strftime("%Y-%m-%d"),
                 duration_days=dur,
                 progress_pct=str(prog),  # see note above - String(10), asyncpg-strict
-                status="completed" if prog >= 100 else "in_progress" if prog > 0 else "planned",
+                status=act_status,
                 color="#ef4444" if i % 3 == 0 else "#0071e3",
                 dependencies=[str(prev_id)] if prev_id else [],
                 boq_position_ids=[str(p.id) for p in sec_items],
@@ -10451,7 +11279,19 @@ async def install_demo_project(
     if template.tender_packages:
         # Multiple tender packages
         n_pkgs = len(template.tender_packages)
+        pkg_scopes = _tender_scopes(items_list, n_pkgs)
         for pkg_idx, (pkg_name, pkg_desc, pkg_status, pkg_companies) in enumerate(template.tender_packages):
+            # The package covers a slice of the priced lines, and each bidder
+            # quotes that slice line by line. Where there are no priced lines
+            # to quote, the bid keeps the old proportional share of the grand
+            # total so the package still shows a number.
+            #
+            # The slice is recorded on the package because both comparison
+            # screens read the package's BOQ, which is the whole bill. Without
+            # the record they would put three quarters of a four-package bill
+            # on the reference side of a quarter-sized bid and impute every
+            # line of it.
+            scope = pkg_scopes[pkg_idx] if pkg_idx < len(pkg_scopes) else []
             pkg = TenderPackage(
                 id=_id(),
                 project_id=project.id,
@@ -10460,15 +11300,19 @@ async def install_demo_project(
                 description=pkg_desc,
                 status=pkg_status,
                 deadline=(start - timedelta(days=30 + pkg_idx * 7)).strftime("%Y-%m-%d"),
-                metadata_={"package_index": pkg_idx + 1, "total_packages": n_pkgs},
+                metadata_={
+                    "package_index": pkg_idx + 1,
+                    "total_packages": n_pkgs,
+                    "scope_position_ids": [str(p.id) for p in scope],
+                },
             )
             session.add(pkg)
             await session.flush()
 
-            # Each package covers a proportional share of grand_total
             pkg_share = grand_total / n_pkgs
-            for co, email, factor in pkg_companies:
+            for bidder_idx, (co, email, factor) in enumerate(pkg_companies):
                 total = round(pkg_share * factor, 2)
+                lines = _bid_line_items(scope, bid_total=total, bidder_index=bidder_idx)
                 bid = TenderBid(
                     id=_id(),
                     package_id=pkg.id,
@@ -10479,7 +11323,7 @@ async def install_demo_project(
                     submitted_at=datetime.now(UTC).isoformat(),
                     status="submitted",
                     notes=f"Tender - {co} - {pkg_name}",
-                    line_items=[],
+                    line_items=lines,
                     metadata_={},
                 )
                 session.add(bid)
@@ -10498,8 +11342,9 @@ async def install_demo_project(
         session.add(pkg)
         await session.flush()
 
-        for co, email, factor in template.tender_companies:
+        for bidder_idx, (co, email, factor) in enumerate(template.tender_companies):
             total = round(grand_total * factor, 2)
+            lines = _bid_line_items(items_list, bid_total=total, bidder_index=bidder_idx)
             bid = TenderBid(
                 id=_id(),
                 package_id=pkg.id,
@@ -10510,7 +11355,7 @@ async def install_demo_project(
                 submitted_at=datetime.now(UTC).isoformat(),
                 status="submitted",
                 notes=f"Tender - {co}",
-                line_items=[],
+                line_items=lines,
                 metadata_={},
             )
             session.add(bid)
@@ -10742,7 +11587,7 @@ async def install_demo_project(
             (
                 "R-001",
                 "Ground: non-bearing fill in northern building area",
-                "Nicht tragfaehige Auffuellungen Baufeld Nord; Bodenaustausch ausgefuehrt, Nachtrag N-01 beauftragt, Puffer in P03 verbraucht.",
+                "Nicht tragfähige Auffüllungen Baufeld Nord; Bodenaustausch ausgeführt, Nachtrag N-01 beauftragt, Puffer in P03 verbraucht.",
                 "technical",
                 1.0,
                 86400,
@@ -10754,7 +11599,7 @@ async def install_demo_project(
             (
                 "R-002",
                 "Lead time CO2 refrigeration rack over 24 weeks",
-                "Lieferzeit CO2-Kaelteverbundanlage; Fruehvergabe VP-07, Anzahlung geleistet, woechentliches Lieferanten-Tracking, Liefertermin KW 33 bestaetigt.",
+                "Lieferzeit CO2-Kälteverbundanlage; Frühvergabe VP-07, Anzahlung geleistet, wöchentliches Lieferanten-Tracking, Liefertermin KW 33 bestätigt.",
                 "procurement",
                 0.8,
                 0,
@@ -10766,7 +11611,7 @@ async def install_demo_project(
             (
                 "R-003",
                 "Winter working: frost during foundations and slab",
-                "Frostperioden waehrend Gruendung/Bodenplatte; Winterbaumassnahmen im GU-Vertrag eingepreist, nur 3 Ausfalltage.",
+                "Frostperioden während Gründung/Bodenplatte; Winterbaumassnahmen im GU-Vertrag eingepreist, nur 3 Ausfalltage.",
                 "environmental",
                 0.6,
                 12500,
@@ -10778,7 +11623,7 @@ async def install_demo_project(
             (
                 "R-004",
                 "External works tender above budget",
-                "Vergabeergebnis Aussenanlagen ueber Budget; 3 Bieter, Submission 2026-06-18, Einsparoptionen vorbereitet, Forecast KG 500 mit Risikozuschlag.",
+                "Vergabeergebnis Außenanlagen über Budget; 3 Bieter, Submission 2026-06-18, Einsparoptionen vorbereitet, Forecast KG 500 mit Risikozuschlag.",
                 "procurement",
                 0.6,
                 35000,
@@ -10790,7 +11635,7 @@ async def install_demo_project(
             (
                 "R-005",
                 "Grid connection and transformer: DSO delay",
-                "Verzug Netzbetreiber; Anmeldung 2025-11 erfolgt, Eskalationsgespraech 2026-06-04, Rueckfallebene Baustrom-Provisorium 250 kVA.",
+                "Verzug Netzbetreiber; Anmeldung 2025-11 erfolgt, Eskalationsgespräch 2026-06-04, Rückfallebene Baustrom-Provisorium 250 kVA.",
                 "schedule",
                 0.8,
                 18000,
@@ -10802,7 +11647,7 @@ async def install_demo_project(
             (
                 "R-006",
                 "PV feed-in approval delayed (grid compatibility check)",
-                "Netzvertraeglichkeitspruefung laeuft; Eroeffnung nicht PV-abhaengig, ggf. Einspeisebegrenzung 70 %, Batteriespeicher erhoeht Eigenverbrauch.",
+                "Netzverträglichkeitsprüfung läuft; Eröffnung nicht PV-abhängig, ggf. Einspeisebegrenzung 70 %, Batteriespeicher erhöht Eigenverbrauch.",
                 "regulatory",
                 0.6,
                 9500,
@@ -10814,7 +11659,7 @@ async def install_demo_project(
             (
                 "R-007",
                 "Capacity bottleneck industrial flooring contractor",
-                "Kapazitaetsengpass Fachfirma Industrieboden; verbindliche NU-Terminbestaetigung KW 24, Ersatzfirma angefragt, Vertragsstrafe im NU-Vertrag.",
+                "Kapazitätsengpass Fachfirma Industrieboden; verbindliche NU-Terminbestätigung KW 24, Ersatzfirma angefragt, Vertragsstrafe im NU-Vertrag.",
                 "procurement",
                 0.6,
                 0,
@@ -10826,7 +11671,7 @@ async def install_demo_project(
             (
                 "R-008",
                 "Heavy rain: waterlogging of subgrade before slab",
-                "Vernaessung Baugrube/Planum vor Bodenplatte; offene Wasserhaltung und Pumpensumpf vorgehalten, einmalig genutzt KW 12.",
+                "Vernässung Baugrube/Planum vor Bodenplatte; offene Wasserhaltung und Pumpensumpf vorgehalten, einmalig genutzt KW 12.",
                 "environmental",
                 0.4,
                 4800,
@@ -10850,7 +11695,7 @@ async def install_demo_project(
             (
                 "R-010",
                 "Permit conditions: delivery noise limits at night",
-                "Schallschutz Anlieferung (TA Laerm); Anlieferzeiten 06-22 Uhr im Betriebskonzept, eingehauste Rampe, optional Laermschutzwand 18 m.",
+                "Schallschutz Anlieferung (TA Lärm); Anlieferzeiten 06-22 Uhr im Betriebskonzept, eingehauste Rampe, optional Lärmschutzwand 18 m.",
                 "regulatory",
                 0.6,
                 28000,
@@ -10862,7 +11707,7 @@ async def install_demo_project(
             (
                 "R-011",
                 "Contamination or archaeology in commercial zone",
-                "Historische Recherche und Beprobung im Baugrundgutachten unauffaellig; Erdbau ohne Funde abgeschlossen.",
+                "Historische Recherche und Beprobung im Baugrundgutachten unauffällig; Erdbau ohne Funde abgeschlossen.",
                 "regulatory",
                 0.2,
                 0,
@@ -10874,7 +11719,7 @@ async def install_demo_project(
             (
                 "R-012",
                 "Quality and dimension deviations of precast elements",
-                "Massabweichungen Fertigteile; Werksabnahme vor Lieferung, Montagetoleranzkontrolle, ein Abweichungsfall als NCR-01 dokumentiert und geloest.",
+                "Massabweichungen Fertigteile; Werksabnahme vor Lieferung, Montagetoleranzkontrolle, ein Abweichungsfall als NCR-01 dokumentiert und gelöst.",
                 "technical",
                 0.6,
                 6200,
@@ -10886,7 +11731,7 @@ async def install_demo_project(
             (
                 "R-013",
                 "Fixed pre-Christmas opening: refrigeration to fit-out to stocking cascade",
-                "Fixtermin Eroeffnung; 1 Woche Puffer vor M8, Taktplanung P08 mit S14/S15 abgestimmt, 14-taegige Terminkonferenz, Eskalationsplan Wochenendarbeit.",
+                "Fixtermin Eröffnung; 1 Woche Puffer vor M8, Taktplanung P08 mit S14/S15 abgestimmt, 14-tägige Terminkonferenz, Eskalationsplan Wochenendarbeit.",
                 "schedule",
                 0.6,
                 120000,
@@ -10917,6 +11762,13 @@ async def install_demo_project(
             status=r_status,
             mitigation_strategy=r_mitig,
             contingency_plan="",
+            # Known defect, left in place deliberately rather than papered
+            # over. Every seeded risk carries this one string, which reads as
+            # accountable when nobody has been named. Varying it needs people,
+            # and there are none in scope here: the roster is ``_CONTACTS``,
+            # local to ``_seed_module_data``, which this function does not call
+            # until well after these rows are written. Fixing it properly means
+            # moving the roster or the risk block, not editing this line.
             owner_name="Project Manager",
             response_cost="0",
             currency=template.currency,
@@ -10987,7 +11839,7 @@ async def install_demo_project(
                 "Enhanced security lobby",
                 "Revised security requirements post-design freeze",
                 "regulatory",
-                "pending",
+                "submitted",
                 125000,
                 8,
                 [
@@ -11018,7 +11870,7 @@ async def install_demo_project(
                 "Emergency department expansion",
                 "County health board required 4 additional ED bays",
                 "regulatory",
-                "pending",
+                "submitted",
                 520000,
                 30,
                 [
@@ -11090,7 +11942,7 @@ async def install_demo_project(
                 "Solar panel installation",
                 "Client added rooftop PV system for sustainability",
                 "client_request",
-                "pending",
+                "submitted",
                 285000,
                 10,
                 [
@@ -11105,15 +11957,15 @@ async def install_demo_project(
         "retail-market-heilbronn": [
             (
                 "N-01",
-                "Soil replacement for fill, northern building area",
-                "Baugrundnachtrag D05: organische Auffuellungen unter Gruendungsniveau, von der GU-Pauschale nicht erfasst (1.450 m3 Mehrmengen Bodenaustausch). Linked to risk R01 and activity T05.",
+                "Bodenaustausch Auffüllungen Baufeld Nord",
+                "Baugrundnachtrag D05: organische Auffüllungen unter Gründungsniveau, von der GU-Pauschale nicht erfasst (1.450 m3 Mehrmengen Bodenaustausch). Linked to risk R01 and activity T05.",
                 "unforeseen",
                 "approved",
                 86400,
                 7,
                 [
                     (
-                        "Bodenaustausch Auffuellungen Baufeld Nord, lagenweise verdichtet (soil replacement, compacted in layers)",
+                        "Bodenaustausch Auffüllungen Baufeld Nord, lagenweise verdichtet (soil replacement, compacted in layers)",
                         "added",
                         "0",
                         "1450",
@@ -11125,15 +11977,15 @@ async def install_demo_project(
             ),
             (
                 "N-02",
-                "Relocation of transformer station, longer MV route",
-                "Netzbetreiber-Vorgabe: Stationsstandort an die oeffentliche Zuwegung verschoben, laengere Mittelspannungstrasse. Linked to risk R05 and activity T21.",
+                "Umverlegung Trafostation, längere Mittelspannungstrasse",
+                "Netzbetreiber-Vorgabe: Stationsstandort an die öffentliche Zuwegung verschoben, längere Mittelspannungstrasse. Linked to risk R05 and activity T21.",
                 "regulatory",
                 "approved",
                 24800,
                 0,
                 [
                     (
-                        "Umverlegung Trafostation und Mehrlaenge Mittelspannungstrasse (transformer relocation and extra MV trench)",
+                        "Umverlegung Trafostation und Mehrlänge Mittelspannungstrasse (transformer relocation and extra MV trench)",
                         "added",
                         "0",
                         "1",
@@ -11145,15 +11997,15 @@ async def install_demo_project(
             ),
             (
                 "N-03",
-                "Additional 60 m3 retention trench per drainage permit condition",
-                "Auflage aus D04/D06: Drosselabfluss 12 l/s, urspruenglicher Versickerungsnachweis nicht ausreichend. Linked to risk R04 and activity T27 (to be ordered with VP-09).",
+                "Zusätzliche Retentionsrigole 60 m3 gemäß Entwässerungsauflage",
+                "Auflage aus D04/D06: Drosselabfluss 12 l/s, ursprünglicher Versickerungsnachweis nicht ausreichend. Linked to risk R04 and activity T27 (to be ordered with VP-09).",
                 "regulatory",
                 "submitted",
                 41200,
                 0,
                 [
                     (
-                        "Zusaetzliche Retentionsrigole 60 m3, DWA-A 138 (additional 60 m3 retention trench)",
+                        "Zusätzliche Retentionsrigole 60 m3, DWA-A 138 (additional 60 m3 retention trench)",
                         "added",
                         "0",
                         "60",
@@ -11165,8 +12017,8 @@ async def install_demo_project(
             ),
             (
                 "N-04",
-                "Deposit-return room redesign and bake-off extension (tenant request)",
-                "Betreiberstandard aktualisiert: 2. Ruecknahmeautomat, groesserer Backofenblock; Planindex D der LP5 in Arbeit (D14). Linked to activity T31.",
+                "Umplanung Pfandraum und Erweiterung Backstation (Mieterwunsch)",
+                "Betreiberstandard aktualisiert: 2. Rücknahmeautomat, größerer Backofenblock; Planindex D der LP5 in Arbeit (D14). Linked to activity T31.",
                 "client_request",
                 "approved",
                 18900,
@@ -11188,7 +12040,22 @@ async def install_demo_project(
 
     co_count = 0
     co_data = _DEMO_CHANGE_ORDERS.get(demo_id) or _generated.get("change_orders", [])
-    for co_code, co_title, co_desc, co_reason, co_status, co_cost, co_days, co_items_data in co_data:
+    for co_idx, (co_code, co_title, co_desc, co_reason, co_status, co_cost, co_days, co_items_data) in enumerate(
+        co_data
+    ):
+        # Spread the change orders along the programme instead of stamping
+        # them all with the seeding minute: submitted a few weeks apart from
+        # the schedule start, approval a review period later, never in the
+        # future. Before this, every order showed today's date and its
+        # approval matched its submission to the microsecond, so the register
+        # had no history to tell.
+        co_now = datetime.now(UTC)
+        co_submitted = datetime(start.year, start.month, start.day, 10, 30, tzinfo=UTC) + timedelta(
+            days=38 + co_idx * 16
+        )
+        co_submitted = min(co_submitted, co_now - timedelta(days=1))
+        co_approved = min(co_submitted + timedelta(days=12), co_now - timedelta(hours=1))
+        is_approved = co_status in ("approved", "executed")
         co = ChangeOrder(
             id=_id(),
             project_id=project.id,
@@ -11198,13 +12065,17 @@ async def install_demo_project(
             reason_category=co_reason,
             status=co_status,
             submitted_by=str(owner_id),
-            approved_by=str(owner_id) if co_status == "approved" else None,
-            submitted_at=datetime.now(UTC).isoformat(),
-            approved_at=datetime.now(UTC).isoformat() if co_status == "approved" else None,
+            approved_by=str(owner_id) if is_approved else None,
+            submitted_at=co_submitted.isoformat(),
+            approved_at=co_approved.isoformat() if is_approved else None,
             cost_impact=str(round(co_cost, 2)),
             schedule_impact_days=co_days,
             currency=template.currency,
             metadata_={},
+            # Backdated so evidence packs date the order by its business day,
+            # not by the minute the demo estate was written.
+            created_at=co_submitted,
+            updated_at=co_approved if is_approved else co_submitted,
         )
         session.add(co)
         await session.flush()
@@ -11422,12 +12293,12 @@ async def install_demo_project(
                 ["gutachten", "baugrund", "S08", "N-01"],
             ),
             (
-                "D06_EWG-2025-77_Entwaesserungsgesuch.pdf",
+                "D06_EWG-2025-77_Entwässerungsgesuch.pdf",
                 "Drainage permit application with infiltration and retention verification per DWA-A 138 (issuer S06, granted 2025-11-28)",
                 "permit",
                 "application/pdf",
                 5_300_000,
-                ["genehmigung", "entwaesserung", "DWA-A138", "S06"],
+                ["genehmigung", "entwässerung", "DWA-A138", "S06"],
             ),
             (
                 "D07_ST-2025-041_Statische_Berechnung.pdf",
@@ -11438,12 +12309,12 @@ async def install_demo_project(
                 ["planung", "statik", "fertigteile", "S04"],
             ),
             (
-                "D08_PB-ST-2025-203_Pruefbericht_Standsicherheit.pdf",
+                "D08_PB-ST-2025-203_Prüfbericht_Standsicherheit.pdf",
                 "Independent structural check report (issuer S05, released)",
                 "engineering",
                 "application/pdf",
                 3_400_000,
-                ["pruefung", "standsicherheit", "S05"],
+                ["prüfung", "standsicherheit", "S05"],
             ),
             (
                 "D09_BSK-2025-19_Brandschutzkonzept.pdf",
@@ -11463,11 +12334,11 @@ async def install_demo_project(
             ),
             (
                 "D11_SIP-2025-88_Schallimmissionsprognose.pdf",
-                "Noise emission forecast per TA Laerm: delivery, refrigeration units, parking traffic (external acoustics consultant)",
+                "Noise emission forecast per TA Lärm: delivery, refrigeration units, parking traffic (external acoustics consultant)",
                 "engineering",
                 "application/pdf",
                 3_600_000,
-                ["gutachten", "schallschutz", "TA-Laerm"],
+                ["gutachten", "schallschutz", "TA-Lärm"],
             ),
             (
                 "D12_SIGE-2026-04_SiGe-Plan.pdf",
@@ -11486,36 +12357,36 @@ async def install_demo_project(
                 ["vermessung", "absteckung", "S09"],
             ),
             (
-                "D14_AP-100-148_Ausfuehrungsplaene_Architektur.pdf",
+                "D14_AP-100-148_Ausführungspläne_Architektur.pdf",
                 "Architectural execution drawings work stage 5, index C valid, index D in progress for deposit room (N-04) (issuer S03)",
                 "drawing",
                 "application/pdf",
                 28_700_000,
-                ["planung", "ausfuehrungsplaene", "architektur", "index-C", "S03"],
+                ["planung", "ausführungspläne", "architektur", "index-C", "S03"],
             ),
             (
-                "D15_TGA-200-261_Ausfuehrungsplaene_HLSK_ELT.pdf",
+                "D15_TGA-200-261_Ausführungspläne_HLSK_ELT.pdf",
                 "MEP execution drawings, mechanical and electrical (issuer S06, valid)",
                 "drawing",
                 "application/pdf",
                 24_500_000,
-                ["planung", "ausfuehrungsplaene", "TGA", "S06"],
+                ["planung", "ausführungspläne", "TGA", "S06"],
             ),
             (
-                "D16_FT-001-074_Werkplaene_Fertigteile.pdf",
+                "D16_FT-001-074_Werkpläne_Fertigteile.pdf",
                 "Precast shop and erection drawings, checked (issuer S12, released)",
                 "drawing",
                 "application/pdf",
                 19_200_000,
-                ["planung", "werkplaene", "fertigteile", "S12"],
+                ["planung", "werkpläne", "fertigteile", "S12"],
             ),
             (
-                "D17_KS-2026-12_Anlagenschema_CO2-Kaelte.pdf",
+                "D17_KS-2026-12_Anlagenschema_CO2-Kälte.pdf",
                 "CO2 refrigeration system schematic with heat recovery (issuer S14, under review by S06)",
                 "drawing",
                 "application/pdf",
                 5_100_000,
-                ["planung", "kaelte", "CO2", "S14"],
+                ["planung", "kälte", "CO2", "S14"],
             ),
             (
                 "D18_BE-2026-01_BE-Plan_Kranstellplan.pdf",
@@ -11523,7 +12394,7 @@ async def install_demo_project(
                 "drawing",
                 "application/pdf",
                 4_600_000,
-                ["ausfuehrung", "BE-plan", "kran", "S11"],
+                ["ausführung", "BE-plan", "kran", "S11"],
             ),
             (
                 "D19_GV-2025-09_Bauvertrag_Generalunternehmer.pdf",
@@ -11534,7 +12405,7 @@ async def install_demo_project(
                 ["vertrag", "bauvertrag", "VOB", "S01"],
             ),
             (
-                "D20_LV-VP07_Kaeltetechnik_GAEB-X83.pdf",
+                "D20_LV-VP07_Kältetechnik_GAEB-X83.pdf",
                 "BoQ refrigeration and cabinets in GAEB X83 (issuer S06, awarded 2026-04-24)",
                 "contract",
                 "application/pdf",
@@ -11547,15 +12418,15 @@ async def install_demo_project(
                 "specification",
                 "application/pdf",
                 3_900_000,
-                ["qualitaet", "bemusterung", "S03"],
+                ["qualität", "bemusterung", "S03"],
             ),
             (
-                "D22_PB-EB-2026-03_Pruefbericht_Erdbau.pdf",
+                "D22_PB-EB-2026-03_Prüfbericht_Erdbau.pdf",
                 "Earthworks test report: plate load tests Ev2 >= 45 MN/m2 (issuer S08, passed)",
                 "specification",
                 "application/pdf",
                 1_800_000,
-                ["qualitaet", "erdbau", "plattendruck", "S08"],
+                ["qualität", "erdbau", "plattendruck", "S08"],
             ),
             (
                 "D23_AN-2026-01_Abnahmeprotokoll_Erdplanum.pdf",
@@ -11574,20 +12445,20 @@ async def install_demo_project(
                 ["abnahme", "bewehrung", "bodenplatte", "S05"],
             ),
             (
-                "D25_AN-2026-03_Dichtheitspruefung_Grundleitungen.pdf",
+                "D25_AN-2026-03_Dichtheitsprüfung_Grundleitungen.pdf",
                 "Drainage tightness test per DIN EN 1610 with CCTV (issuer S11, partly passed, defect M-007 open)",
                 "specification",
                 "application/pdf",
                 2_100_000,
-                ["abnahme", "dichtheitspruefung", "M-007", "S11"],
+                ["abnahme", "dichtheitsprüfung", "M-007", "S11"],
             ),
             (
-                "D26_ML-2026-01_Maengelliste_Rohbau.pdf",
+                "D26_ML-2026-01_Mängelliste_Rohbau.pdf",
                 "Defect list from the interim shell walkthrough (issuer S03, being worked off, see punch list)",
                 "specification",
                 "application/pdf",
                 1_900_000,
-                ["qualitaet", "maengelliste", "rohbau", "S03"],
+                ["qualität", "mängelliste", "rohbau", "S03"],
             ),
             (
                 "D27_BSD-2026_Brandschottungsdokumentation.pdf",
@@ -11595,7 +12466,7 @@ async def install_demo_project(
                 "specification",
                 "application/pdf",
                 2_700_000,
-                ["qualitaet", "brandschottung", "S11"],
+                ["qualität", "brandschottung", "S11"],
             ),
             (
                 "D28_NAB-2026-1142_Netzanschlussbegehren_PV.pdf",
@@ -11622,7 +12493,7 @@ async def install_demo_project(
                 ["dokumentation", "revision", "as-built", "S11"],
             ),
             (
-                "D31_WV-2026-01-04_Wartungsvertraege.pdf",
+                "D31_WV-2026-01-04_Wartungsverträge.pdf",
                 "Maintenance contracts refrigeration, HVAC, doors and gates, smoke vents (issuer S02, draft, to be concluded before opening)",
                 "contract",
                 "application/pdf",

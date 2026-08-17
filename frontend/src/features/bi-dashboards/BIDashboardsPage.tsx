@@ -84,6 +84,7 @@ import {
 } from './api';
 import { biDashboardsGuide } from './biDashboardsGuide';
 import { useDashboardFilters } from '@/stores/useDashboardFilters';
+import { fmtPercent } from '@/shared/lib/formatters';
 
 type Tab = 'dashboards' | 'kpis' | 'reports' | 'schedules' | 'alerts';
 
@@ -924,7 +925,7 @@ function DeltaChip({ delta }: { delta: number }) {
       <span className="flex items-center gap-1">
         <Icon size={10} />
         {sign}
-        {delta.toFixed(1)}%
+        {fmtPercent(delta)}
       </span>
     </Badge>
   );
@@ -1015,7 +1016,7 @@ function ReportList({
             <tr>
               <th className="px-4 py-2.5 text-left">{t('bi.code', { defaultValue: 'Code' })}</th>
               <th className="px-4 py-2.5 text-left">{t('bi.name', { defaultValue: 'Name' })}</th>
-              <th className="px-4 py-2.5 text-left">{t('bi.scope', { defaultValue: 'Scope' })}</th>
+              <th className="px-4 py-2.5 text-left">{t('bi.scope', { defaultValue: 'Visibility scope' })}</th>
               <th className="px-4 py-2.5 text-left">{t('common.format')}</th>
               <th className="px-4 py-2.5 text-right">{t('common.actions')}</th>
             </tr>

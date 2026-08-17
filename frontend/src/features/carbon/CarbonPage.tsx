@@ -50,8 +50,9 @@ import { useConfirm } from '@/shared/hooks/useConfirm';
 import { useDisplayQuantity } from '@/shared/hooks/useDisplayQuantity';
 import { DateDisplay } from '@/shared/ui/DateDisplay';
 import { useToastStore } from '@/stores/useToastStore';
-import { useProjectContextStore } from '@/stores/useProjectContextStore';
+import { useActiveProjectId } from '@/shared/hooks/useActiveProjectId';
 import { apiGet, getErrorMessage } from '@/shared/lib/api';
+import { onlyChangedFields } from '@/shared/lib/apiHelpers';
 import {
   listInventories,
   getInventory,
@@ -106,6 +107,7 @@ import {
   type Scope3Entry,
   type MaterialCarbonFactor,
 } from './api';
+import { fmtPercent } from '@/shared/lib/formatters';
 
 type Tab = 'inventory' | 'wholelife' | 'epds' | 'targets' | 'reports';
 
@@ -134,6 +136,74 @@ function formatKg(kg: number): string {
   return `${kg.toFixed(0)} kg`;
 }
 
+type TFn = ReturnType<typeof useTranslation>['t'];
+
+/** The api module declares the scope union inline on the record. */
+type InventoryScope = CarbonInventory['scope'];
+type CarbonFramework = SustainabilityReport['framework'];
+
+/* ─── Enum labels ───
+ * Inventory scope/status and target status are storage tokens. They are
+ * translated before they reach the screen; the raw token is never rendered.
+ */
+
+const INVENTORY_SCOPE_EN: Record<InventoryScope, string> = {
+  cradle_to_gate: 'Cradle to gate',
+  cradle_to_grave: 'Cradle to grave',
+  operational: 'Operational',
+};
+
+const INVENTORY_STATUS_EN: Record<InventoryStatus, string> = {
+  draft: 'Draft',
+  baseline: 'Baseline',
+  current: 'Current',
+  archived: 'Archived',
+};
+
+const TARGET_STATUS_EN: Record<TargetStatus, string> = {
+  active: 'Active',
+  met: 'Met',
+  missed: 'Missed',
+  abandoned: 'Abandoned',
+};
+
+function scopeLabel(s: InventoryScope, t: TFn): string {
+  return t(`carbon.scope_${s}`, { defaultValue: INVENTORY_SCOPE_EN[s] });
+}
+
+function inventoryStatusLabel(s: InventoryStatus, t: TFn): string {
+  return t(`carbon.inventory_status_${s}`, { defaultValue: INVENTORY_STATUS_EN[s] });
+}
+
+function targetStatusLabel(s: TargetStatus, t: TFn): string {
+  return t(`carbon.target_status_${s}`, { defaultValue: TARGET_STATUS_EN[s] });
+}
+
+const FRAMEWORK_EN: Record<CarbonFramework, string> = {
+  ghg_protocol: 'GHG Protocol',
+  gri: 'GRI',
+  issb: 'ISSB',
+  custom: 'Custom',
+};
+
+function frameworkLabel(f: CarbonFramework, t: TFn): string {
+  return t(`carbon.framework_${f}`, { defaultValue: FRAMEWORK_EN[f] });
+}
+
+// Fuel type is a free string on the API, so the label falls back to the
+// stored value if the backend ever grows a kind the UI does not know.
+const FUEL_TYPE_EN: Record<string, string> = {
+  diesel: 'Diesel',
+  petrol: 'Petrol',
+  lpg: 'LPG',
+  natural_gas: 'Natural gas',
+  other: 'Other',
+};
+
+function fuelTypeLabel(f: string, t: TFn): string {
+  return t(`carbon.fuel_type_${f}`, { defaultValue: FUEL_TYPE_EN[f] ?? f });
+}
+
 function todayIso(offsetDays = 0): string {
   const d = new Date();
   d.setDate(d.getDate() + offsetDays);
@@ -157,7 +227,7 @@ export function CarbonPage() {
   const { t } = useTranslation();
   const navigate = useNavigate();
   const [tab, setTab] = useState<Tab>('inventory');
-  const activeProjectId = useProjectContextStore((s) => s.activeProjectId);
+  const activeProjectId = useActiveProjectId();
   const [inventoryDrawerId, setInventoryDrawerId] = useState<string | null>(null);
   const [createInvOpen, setCreateInvOpen] = useState(false);
   const [createTargetOpen, setCreateTargetOpen] = useState(false);
@@ -576,7 +646,9 @@ function InventoryTable({
                 className="border-t border-border-light hover:bg-surface-secondary cursor-pointer"
               >
                 <td className="px-4 py-2 font-medium text-content-primary">{r.name}</td>
-                <td className="px-4 py-2 text-xs text-content-secondary">{r.scope}</td>
+                <td className="px-4 py-2 text-xs text-content-secondary">
+                  {scopeLabel(r.scope, t)}
+                </td>
                 <td className="px-4 py-2">
                   <Badge
                     variant={
@@ -591,7 +663,7 @@ function InventoryTable({
                     dot
                     size="sm"
                   >
-                    {r.status}
+                    {inventoryStatusLabel(r.status, t)}
                   </Badge>
                 </td>
                 <td className="px-4 py-2 text-xs text-content-secondary">
@@ -931,7 +1003,7 @@ function TargetRow({
             dot
             size="sm"
           >
-            {target.status}
+            {targetStatusLabel(target.status, t)}
           </Badge>
           <RowActions onEdit={onEdit} onDelete={onDelete} />
         </div>
@@ -972,7 +1044,7 @@ function TargetRow({
         />
       </div>
       <p className="mt-1 text-xs text-content-tertiary tabular-nums">
-        {pct.toFixed(0)}%
+        {fmtPercent(pct, 0)}
         {met && (
           <span className="ms-1 inline-flex items-center gap-0.5 text-semantic-success">
             <CheckCircle2 size={11} />
@@ -1101,7 +1173,7 @@ function ReportTable({
                 </td>
                 <td className="px-4 py-2">
                   <Badge variant="blue" size="sm">
-                    {r.framework}
+                    {frameworkLabel(r.framework, t)}
                   </Badge>
                 </td>
                 <td className="px-4 py-2 text-xs text-content-secondary">
@@ -1718,7 +1790,7 @@ function TopEmitterRow({
                   >
                     {toNum(opt.savings_kg) > 0 ? '−' : ''}
                     {formatKg(Math.abs(toNum(opt.savings_kg)))}{' '}
-                    ({Number(opt.savings_pct).toFixed(0)}%)
+                    ({fmtPercent(Number(opt.savings_pct), 0)})
                   </span>
                 </li>
               ))}
@@ -1792,7 +1864,7 @@ function ScopeKpi({
         </span>
       </div>
       <p className="mt-0.5 text-sm font-medium tabular-nums">{formatKg(kg)}</p>
-      <p className="text-xs text-content-tertiary tabular-nums">{pct.toFixed(0)}%</p>
+      <p className="text-xs text-content-tertiary tabular-nums">{fmtPercent(pct, 0)}</p>
     </div>
   );
 }
@@ -1844,6 +1916,23 @@ function EmbodiedProvenance({ entry }: { entry: EmbodiedEntry }) {
 
 /* ─── Modals ─── */
 
+/**
+ * Seed for the inventory form. Also serves as the baseline an edit diffs
+ * against, so the two can never drift apart.
+ */
+function inventoryFormBase(inventory?: CarbonInventory) {
+  return {
+    name: inventory?.name ?? 'Baseline inventory',
+    scope: (inventory?.scope ?? 'cradle_to_gate') as
+      | 'cradle_to_gate'
+      | 'cradle_to_grave'
+      | 'operational',
+    as_of_date: inventory?.as_of_date ?? todayIso(),
+    status: (inventory?.status ?? 'draft') as InventoryStatus,
+    notes: inventory?.notes ?? '',
+  };
+}
+
 function CreateInventoryModal({
   projectId,
   inventory,
@@ -1858,28 +1947,33 @@ function CreateInventoryModal({
   const addToast = useToastStore((s) => s.addToast);
   const isEdit = !!inventory;
   const [busy, setBusy] = useState(false);
-  const [form, setForm] = useState({
-    name: inventory?.name ?? 'Baseline inventory',
-    scope: (inventory?.scope ?? 'cradle_to_gate') as
-      | 'cradle_to_gate'
-      | 'cradle_to_grave'
-      | 'operational',
-    as_of_date: inventory?.as_of_date ?? todayIso(),
-    status: (inventory?.status ?? 'draft') as InventoryStatus,
-    notes: inventory?.notes ?? '',
-  });
+  const [form, setForm] = useState(() => inventoryFormBase(inventory));
 
   async function submit() {
     setBusy(true);
     try {
       if (isEdit && inventory) {
-        await updateInventory(inventory.id, {
-          name: form.name,
-          scope: form.scope,
-          as_of_date: form.as_of_date || null,
-          status: form.status,
-          notes: form.notes || null,
-        });
+        // Only what the user actually edited goes back. Sending the whole form
+        // rewrote every field with the inventory as it stood when this modal
+        // opened, so a colleague's concurrent edit to a field nobody touched
+        // here was silently reverted. The update route dumps with
+        // `exclude_unset=True`, so an omitted field is left alone. The
+        // baseline comes from the same function that seeded the form, so the
+        // two cannot drift apart.
+        await updateInventory(
+          inventory.id,
+          onlyChangedFields(
+            {
+              name: form.name,
+              scope: form.scope,
+              as_of_date: form.as_of_date || null,
+              status: form.status,
+              notes: form.notes || null,
+            },
+            form,
+            inventoryFormBase(inventory),
+          ),
+        );
         addToast({
           type: 'success',
           title: t('carbon.inv_updated', { defaultValue: 'Inventory updated' }),
@@ -1944,9 +2038,9 @@ function CreateInventoryModal({
             }
             className={inputCls}
           >
-            <option value="cradle_to_gate">cradle_to_gate</option>
-            <option value="cradle_to_grave">cradle_to_grave</option>
-            <option value="operational">operational</option>
+            <option value="cradle_to_gate">{scopeLabel('cradle_to_gate', t)}</option>
+            <option value="cradle_to_grave">{scopeLabel('cradle_to_grave', t)}</option>
+            <option value="operational">{scopeLabel('operational', t)}</option>
           </select>
         </div>
         <div className="grid grid-cols-2 gap-3">
@@ -1961,10 +2055,10 @@ function CreateInventoryModal({
               }
               className={inputCls}
             >
-              <option value="draft">draft</option>
-              <option value="baseline">baseline</option>
-              <option value="current">current</option>
-              <option value="archived">archived</option>
+              <option value="draft">{inventoryStatusLabel('draft', t)}</option>
+              <option value="baseline">{inventoryStatusLabel('baseline', t)}</option>
+              <option value="current">{inventoryStatusLabel('current', t)}</option>
+              <option value="archived">{inventoryStatusLabel('archived', t)}</option>
             </select>
           </div>
           <div>
@@ -2010,6 +2104,24 @@ function CreateInventoryModal({
   );
 }
 
+/**
+ * Seed for the target form, and the baseline an edit diffs against.
+ */
+function targetFormBase(target?: CarbonTarget) {
+  return {
+    name: target?.name ?? '',
+    target_type: (target?.target_type ?? 'absolute') as
+      | 'absolute'
+      | 'intensity_per_m2'
+      | 'intensity_per_unit',
+    baseline_value: String(target?.baseline_value ?? '0'),
+    target_value: String(target?.target_value ?? '0'),
+    baseline_year: target?.baseline_year ?? 2020,
+    target_year: target?.target_year ?? 2030,
+    status: (target?.status ?? 'active') as TargetStatus,
+  };
+}
+
 function CreateTargetModal({
   projectId,
   target,
@@ -2024,29 +2136,28 @@ function CreateTargetModal({
   const addToast = useToastStore((s) => s.addToast);
   const isEdit = !!target;
   const [busy, setBusy] = useState(false);
-  const [form, setForm] = useState({
-    name: target?.name ?? '',
-    target_type: (target?.target_type ?? 'absolute') as
-      | 'absolute'
-      | 'intensity_per_m2'
-      | 'intensity_per_unit',
-    baseline_value: String(target?.baseline_value ?? '0'),
-    target_value: String(target?.target_value ?? '0'),
-    baseline_year: target?.baseline_year ?? 2020,
-    target_year: target?.target_year ?? 2030,
-    status: (target?.status ?? 'active') as TargetStatus,
-  });
+  const [form, setForm] = useState(() => targetFormBase(target));
 
   async function submit() {
     setBusy(true);
     try {
       if (isEdit && target) {
-        await updateTarget(target.id, {
-          name: form.name,
-          baseline_value: Number(form.baseline_value) || 0,
-          target_value: Number(form.target_value) || 0,
-          status: form.status,
-        });
+        // Only the fields the user moved. Resending all four overwrote a
+        // colleague's concurrent edit to any of them with the values this
+        // modal happened to load. The route dumps with `exclude_unset=True`.
+        await updateTarget(
+          target.id,
+          onlyChangedFields(
+            {
+              name: form.name,
+              baseline_value: Number(form.baseline_value) || 0,
+              target_value: Number(form.target_value) || 0,
+              status: form.status,
+            },
+            form,
+            targetFormBase(target),
+          ),
+        );
         addToast({
           type: 'success',
           title: t('carbon.target_updated', { defaultValue: 'Target updated' }),
@@ -2185,10 +2296,10 @@ function CreateTargetModal({
               }
               className={inputCls}
             >
-              <option value="active">active</option>
-              <option value="met">met</option>
-              <option value="missed">missed</option>
-              <option value="abandoned">abandoned</option>
+              <option value="active">{targetStatusLabel('active', t)}</option>
+              <option value="met">{targetStatusLabel('met', t)}</option>
+              <option value="missed">{targetStatusLabel('missed', t)}</option>
+              <option value="abandoned">{targetStatusLabel('abandoned', t)}</option>
             </select>
           </div>
         )}
@@ -2299,10 +2410,10 @@ function GenerateReportModal({
             }
             className={inputCls}
           >
-            <option value="ghg_protocol">GHG Protocol</option>
-            <option value="gri">GRI</option>
-            <option value="issb">ISSB</option>
-            <option value="custom">custom</option>
+            <option value="ghg_protocol">{frameworkLabel('ghg_protocol', t)}</option>
+            <option value="gri">{frameworkLabel('gri', t)}</option>
+            <option value="issb">{frameworkLabel('issb', t)}</option>
+            <option value="custom">{frameworkLabel('custom', t)}</option>
           </select>
         </div>
         <div className="grid grid-cols-2 gap-3">
@@ -2361,6 +2472,21 @@ function GenerateReportModal({
   );
 }
 
+/**
+ * Seed for the embodied-entry form, and the baseline an edit diffs against.
+ */
+function embodiedFormBase(entry?: EmbodiedEntry) {
+  return {
+    description: entry?.description ?? '',
+    element_ref: entry?.element_ref ?? '',
+    quantity: String(entry?.quantity ?? '0'),
+    unit: entry?.unit ?? 'kg',
+    factor_value_used: String(entry?.factor_value_used ?? '0'),
+    carbon_kg: String(entry?.carbon_kg ?? '0'),
+    stage: (entry?.stage ?? 'a1a3') as Stage,
+  };
+}
+
 function EmbodiedEntryModal({
   inventoryId,
   entry,
@@ -2376,15 +2502,7 @@ function EmbodiedEntryModal({
   const addToast = useToastStore((s) => s.addToast);
   const isEdit = !!entry;
   const [busy, setBusy] = useState(false);
-  const [form, setForm] = useState({
-    description: entry?.description ?? '',
-    element_ref: entry?.element_ref ?? '',
-    quantity: String(entry?.quantity ?? '0'),
-    unit: entry?.unit ?? 'kg',
-    factor_value_used: String(entry?.factor_value_used ?? '0'),
-    carbon_kg: String(entry?.carbon_kg ?? '0'),
-    stage: (entry?.stage ?? 'a1a3') as Stage,
-  });
+  const [form, setForm] = useState(() => embodiedFormBase(entry));
 
   // Auto-suggest carbon = quantity × factor when not manually overridden.
   const autoCarbon =
@@ -2398,15 +2516,33 @@ function EmbodiedEntryModal({
           ? autoCarbon
           : Number(form.carbon_kg);
       if (isEdit && entry) {
-        await updateEmbodiedEntry(entry.id, {
-          description: form.description,
-          element_ref: form.element_ref || null,
-          quantity: Number(form.quantity) || 0,
-          unit: form.unit,
-          factor_value_used: Number(form.factor_value_used) || 0,
-          carbon_kg: carbon,
-          stage: form.stage,
-        });
+        // Only what the user moved. Resending the whole entry overwrote a
+        // colleague's concurrent edit to any untouched field with the values
+        // this modal loaded. The route dumps with `exclude_unset=True`.
+        // carbon_kg is derived from quantity and factor when the field is left
+        // blank, so it has to travel whenever either of those two moved, not
+        // only when the carbon input itself was typed into.
+        const base = embodiedFormBase(entry);
+        const patch = onlyChangedFields(
+          {
+            description: form.description,
+            element_ref: form.element_ref || null,
+            quantity: Number(form.quantity) || 0,
+            unit: form.unit,
+            factor_value_used: Number(form.factor_value_used) || 0,
+            stage: form.stage,
+          },
+          form,
+          base,
+        ) as Parameters<typeof updateEmbodiedEntry>[1];
+        if (
+          form.carbon_kg !== base.carbon_kg ||
+          form.quantity !== base.quantity ||
+          form.factor_value_used !== base.factor_value_used
+        ) {
+          patch.carbon_kg = carbon;
+        }
+        await updateEmbodiedEntry(entry.id, patch);
         addToast({
           type: 'success',
           title: t('carbon.entry_updated', { defaultValue: 'Entry updated' }),
@@ -3377,11 +3513,11 @@ function ScopeEntryModal({
                 }
                 className={inputCls}
               >
-                <option value="diesel">diesel</option>
-                <option value="petrol">petrol</option>
-                <option value="lpg">lpg</option>
-                <option value="natural_gas">natural_gas</option>
-                <option value="other">other</option>
+                <option value="diesel">{fuelTypeLabel('diesel', t)}</option>
+                <option value="petrol">{fuelTypeLabel('petrol', t)}</option>
+                <option value="lpg">{fuelTypeLabel('lpg', t)}</option>
+                <option value="natural_gas">{fuelTypeLabel('natural_gas', t)}</option>
+                <option value="other">{fuelTypeLabel('other', t)}</option>
               </select>
             </div>
             <div className="grid grid-cols-2 gap-3">
@@ -3607,19 +3743,11 @@ function ScopeEntryModal({
   );
 }
 
-function EPDModal({
-  epd,
-  onClose,
-}: {
-  epd?: EPDRecord;
-  onClose: () => void;
-}) {
-  const { t } = useTranslation();
-  const qc = useQueryClient();
-  const addToast = useToastStore((s) => s.addToast);
-  const isEdit = !!epd;
-  const [busy, setBusy] = useState(false);
-  const [form, setForm] = useState({
+/**
+ * Seed for the EPD form, and the baseline an edit diffs against.
+ */
+function epdFormBase(epd?: EPDRecord) {
+  return {
     epd_id: epd?.epd_id ?? '',
     source: (epd?.source ?? 'custom') as EPDSource,
     material_class: epd?.material_class ?? '',
@@ -3634,7 +3762,22 @@ function EPDModal({
     gwp_d_credits: epd?.gwp_d_credits != null ? String(epd.gwp_d_credits) : '',
     validity_until: epd?.validity_until ?? '',
     document_url: epd?.document_url ?? '',
-  });
+  };
+}
+
+function EPDModal({
+  epd,
+  onClose,
+}: {
+  epd?: EPDRecord;
+  onClose: () => void;
+}) {
+  const { t } = useTranslation();
+  const qc = useQueryClient();
+  const addToast = useToastStore((s) => s.addToast);
+  const isEdit = !!epd;
+  const [busy, setBusy] = useState(false);
+  const [form, setForm] = useState(() => epdFormBase(epd));
 
   function num(v: string): number | null {
     if (v.trim() === '') return null;
@@ -3655,21 +3798,34 @@ function EPDModal({
     setBusy(true);
     try {
       if (isEdit && epd) {
-        await updateEPD(epd.id, {
-          source: form.source,
-          material_class: form.material_class,
-          product_name: form.product_name,
-          manufacturer: form.manufacturer || null,
-          region: form.region,
-          declared_unit: form.declared_unit,
-          gwp_a1a3: Number(form.gwp_a1a3) || 0,
-          gwp_a4: num(form.gwp_a4),
-          gwp_a5: num(form.gwp_a5),
-          gwp_c_total: num(form.gwp_c_total),
-          gwp_d_credits: num(form.gwp_d_credits),
-          validity_until: form.validity_until || null,
-          document_url: form.document_url || null,
-        });
+        // Only what the user moved. An EPD record is shared across projects,
+        // so resending all thirteen fields was the widest instance of this:
+        // one person correcting a typo in the product name rewrote every other
+        // field with whatever this modal had loaded. The route dumps with
+        // `exclude_unset=True`, and the baseline comes from the same function
+        // that seeded the form.
+        await updateEPD(
+          epd.id,
+          onlyChangedFields(
+            {
+              source: form.source,
+              material_class: form.material_class,
+              product_name: form.product_name,
+              manufacturer: form.manufacturer || null,
+              region: form.region,
+              declared_unit: form.declared_unit,
+              gwp_a1a3: Number(form.gwp_a1a3) || 0,
+              gwp_a4: num(form.gwp_a4),
+              gwp_a5: num(form.gwp_a5),
+              gwp_c_total: num(form.gwp_c_total),
+              gwp_d_credits: num(form.gwp_d_credits),
+              validity_until: form.validity_until || null,
+              document_url: form.document_url || null,
+            },
+            form,
+            epdFormBase(epd),
+          ),
+        );
         addToast({
           type: 'success',
           title: t('carbon.epd_updated', { defaultValue: 'EPD updated' }),

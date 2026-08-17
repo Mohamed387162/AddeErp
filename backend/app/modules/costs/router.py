@@ -57,7 +57,6 @@ from app.dependencies import (
     verify_project_access,
 )
 from app.modules.costs import base_registry
-from app.modules.costs.cwicr_v3_catalogue import CWICR_V3_CATALOGUES
 from app.modules.costs.intelligence import (
     CostCertaintyService,
     CostUsageRecorder,
@@ -69,6 +68,7 @@ from app.modules.costs.matcher import (
     match_cwicr_items,
 )
 from app.modules.costs.models import CostItem
+from app.modules.costs.region_currency import REGION_CURRENCY
 from app.modules.costs.repository import synonym_text_predicate  # noqa: F401
 from app.modules.costs.resource_pricing import ResourcePriceService
 from app.modules.costs.schemas import (
@@ -172,57 +172,12 @@ class UsageCountsRequest(BaseModel):
 # time (so rates persist with their true currency) AND lazily on read for
 # legacy rows that landed with ``currency = ''`` before this map existed.
 #
-# Single source of truth: the v3 catalogue registry
-# (:data:`CWICR_V3_CATALOGUES`) already declares the ISO currency of every
-# region DDC ships. Deriving the map from it means new catalogue rows are
-# covered automatically and the two can never drift - the old hand-kept
-# literal omitted ~18 live regions (KES/GHS/KRW/THB/VND/…) and silently
-# mislabeled their rates as EUR.
-#
-# Legacy / alias keys that are NOT in the v3 registry (older parquet
-# ``db_id`` tags the importer still accepts) are merged on top so they keep
-# resolving. Keys follow the parquet ``db_id`` / ``region`` convention
-# (UPPERCASE, country prefix).
-_REGION_CURRENCY_LEGACY: dict[str, str] = {
-    "DE_HAMBURG": "EUR",
-    "BE_BRUSSELS": "EUR",
-    "IE_DUBLIN": "EUR",
-    "USA_NEWYORK": "USD",
-    "SA_RIYADH": "SAR",
-    # China authentic base (Beijing 2012 + Bortala 2022, prefixed rate_codes).
-    # Loaded from our own work-items parquet, not a DDC v3 snapshot, so it lives
-    # in the legacy overlay rather than the v3 registry.
-    "ZH_CHINA": "CNY",
-    # Turkey authentic national base (CSB analyses), separate from the legacy
-    # metro id used by DDC snapshots.
-    "TR_NATIONAL": "TRY",
-    # Authentic national / regional bases loaded from our own work-items
-    # parquet (official government sources), not DDC v3 snapshots, so they sit
-    # in the legacy overlay. The parquet also carries a per-row currency column
-    # that _resolve_currency prefers; these entries are the read-path fallback.
-    "BR_NATIONAL": "BRL",
-    "ES_ANDALUCIA": "EUR",
-    "IT_TOSCANA": "EUR",
-    "VN_NATIONAL": "VND",
-    "ID_NATIONAL": "IDR",
-    "GR_NATIONAL": "EUR",
-    # NOTE: ``PT_SAOPAULO`` is intentionally NOT registered - it was a
-    # mislabeled tag (São Paulo is Brazil; canonical key is ``BR_SAOPAULO``,
-    # supplied by the v3 registry). A stray ``PT_SAOPAULO`` row should hit
-    # the unknown-region path, not silently resolve.
-}
-
-
-def _build_region_currency_map() -> dict[str, str]:
-    """Derive ``{region: ISO currency}`` from the v3 catalogue + legacy aliases."""
-    out: dict[str, str] = {cat.region: cat.currency for cat in CWICR_V3_CATALOGUES if cat.currency}
-    # Legacy/alias keys only fill gaps - never override a canonical v3 entry.
-    for region, currency in _REGION_CURRENCY_LEGACY.items():
-        out.setdefault(region, currency)
-    return out
-
-
-_REGION_CURRENCY: dict[str, str] = _build_region_currency_map()
+# The table lives in :mod:`app.modules.costs.region_currency` and is built
+# from the base registry the importer itself reads, so every base that can
+# be loaded can be priced. See that module for why: a currency table that
+# covered fewer regions than the loader accepted is what let one import
+# write 55 718 rows with no currency on them.
+_REGION_CURRENCY: dict[str, str] = REGION_CURRENCY
 
 
 # CWICR region tags follow the convention ``<2-letter country>_<UPPERCASE city>``
@@ -981,6 +936,9 @@ async def list_loaded_regions(
         .where(CostItem.is_active.is_(True))
         .where(CostItem.region.isnot(None))
         .where(CostItem.region != "")
+        # transient language-swap staging regions (an interrupted swap can leave
+        # them behind); they are internal and must never show up as a real region
+        .where(~CostItem.region.startswith("__xlate_", autoescape=True))
     )
     regions = sorted(row[0] for row in result.all())
     _region_cache["regions"] = regions
@@ -1266,6 +1224,14 @@ async def load_base_market(
     # Ensure the base parquet is loaded before repricing it (idempotent).
     await load_cwicr_region(base_region, session)
 
+    # Switch the base's work-item TEXT to the market's language before repricing.
+    # A national base ships one English parquet plus a translated parquet per app
+    # language; the market card picks the language (its ``lang_code``). Text
+    # follows the language, price follows the market - the two are orthogonal, so
+    # the text swap runs first and the reprice below preserves the translated
+    # component names. No-op for English/untranslated markets.
+    await _ensure_region_text_language(base_region, base_registry.market_lang_code(market_token), session)
+
     from app.modules.catalog.router import fetch_market_catalog_rows
 
     try:
@@ -1483,9 +1449,9 @@ async def vector_v3_status(
                 payload["status_band"] = "ready"
         else:
             payload["status_band"] = "missing"
-    except Exception as exc:
-        logger.debug("Qdrant v3 status probe failed", exc_info=True)
-        payload["error"] = str(exc)
+    except Exception:
+        logger.warning("Qdrant v3 status probe failed", exc_info=True)
+        payload["error"] = "Qdrant status probe failed"
         payload["status_band"] = "disconnected"
 
     return payload
@@ -1768,13 +1734,12 @@ async def vectorize_region(
     # Quick check: can we even import the vector module?
     try:
         from app.core.vector import encode_texts, get_embedder, vector_index
-    except Exception as exc:
-        logger.warning("Vector module import failed: %s", exc)
+    except Exception:
+        logger.warning("Vector module import failed", exc_info=True)
         return JSONResponse(
             content={
                 "indexed": 0,
                 "message": "Vector indexing is not available: vector module failed to load.",
-                "error": str(exc),
             },
             status_code=503,
         )
@@ -1802,12 +1767,12 @@ async def vectorize_region(
             },
             status_code=503,
         )
-    except Exception as exc:
-        logger.warning("Embedding model check failed: %s", exc)
+    except Exception:
+        logger.warning("Embedding model check failed", exc_info=True)
         return JSONResponse(
             content={
                 "indexed": 0,
-                "message": f"Vector indexing is not available: {exc}",
+                "message": "Vector indexing is not available: embedding model failed to load.",
             },
             status_code=503,
         )
@@ -2826,7 +2791,7 @@ async def list_loaded_databases(
 
 # ── User cost catalogs ─────────────────────────────────────────────────────
 #
-# A catalog is the user's own named "справочник работ и расценок": a
+# A catalog is the user's own named work-and-rate reference book: a
 # first-class container with a REQUIRED currency that imported / manually
 # created items belong to. Routes are registered BEFORE the ``/{item_id}``
 # wildcard below so ``/catalogs/...`` never gets swallowed by it.
@@ -4145,6 +4110,25 @@ _GITHUB_CWICR_BASE_URL = "https://github.com/datadrivenconstruction/OpenConstruc
 _GITHUB_CWICR_FILES: dict[str, str] = base_registry.github_workitems_files()
 _GITHUB_CWICR_FILES.setdefault("CA_TORONTO", _GITHUB_CWICR_FILES["ENG_TORONTO"])
 
+# Per-language work-item parquets of the national bases, keyed by the
+# ``<region>_<lang>`` pseudo-region (e.g. ``ZH_CHINA_ru``). Kept separate from
+# ``_GITHUB_CWICR_FILES`` so these translations are downloadable for a market
+# language swap but never surface in the ``/available-databases`` region list.
+_GITHUB_CWICR_LANG_FILES: dict[str, str] = base_registry.national_language_workitems_files()
+
+# Which app language each already-loaded national base currently renders its
+# work-item text in. Process-local fast path for the market-switch language swap
+# (see ``_ensure_region_text_language``): re-selecting a market of the same
+# language becomes a no-op. The swap itself is idempotent, so a cold process
+# simply re-runs it once on the first switch. Cleared whenever a region is loaded
+# fresh (it reverts to the home English text at that point).
+_REGION_ACTIVE_LANG: dict[str, str] = {}
+
+# CostItem columns the language swap rewrites - the text-bearing ones only.
+# Deliberately excludes ``rate``/``currency`` (the market reprice owns those),
+# ``descriptions`` (the separate multilang map) and the identity columns.
+_TRANSLATED_TEXT_COLS: tuple[str, ...] = ("description", "unit", "classification", "components", "tags")
+
 CWICR_SEARCH_PATHS = [
     "../../DDC_Toolkit/pricing/data/excel",
     "../DDC_Toolkit/pricing/data/excel",
@@ -4227,7 +4211,7 @@ def _download_cwicr_from_github_sync(db_id: str) -> Path | None:
     HTTPException emitted upstream can surface it instead of a generic
     "not found" message.
     """
-    github_path = _GITHUB_CWICR_FILES.get(db_id)
+    github_path = _GITHUB_CWICR_FILES.get(db_id) or _GITHUB_CWICR_LANG_FILES.get(db_id)
     if not github_path:
         _LAST_DOWNLOAD_ERROR[db_id] = (
             f"backend has no GitHub mapping for '{db_id}'. Upgrade with "
@@ -4497,6 +4481,10 @@ async def load_cwicr_region(db_id: str, session: AsyncSession) -> dict:
             "duration_seconds": duration,
         }
 
+    # A fresh (re)load repopulates the region from its home English parquet, so
+    # forget any language the market-switch swap had recorded for it.
+    _REGION_ACTIVE_LANG.pop(db_id, None)
+
     # Find the file (async - GitHub download runs in thread pool)
     cwicr_path = await _find_cwicr_file(db_id)
     if not cwicr_path:
@@ -4606,6 +4594,14 @@ async def load_cwicr_region(db_id: str, session: AsyncSession) -> dict:
     # shape is preserved so existing UIs that read ``error`` still work.
     if result_data.get("error") == "no rate_code column":
         return JSONResponse(content=result_data, status_code=422)
+
+    # A national base's home parquet holds English work-item text, so a freshly
+    # loaded base reads in English until a market card swaps the language. Open
+    # it in its own language instead (China in Chinese, Brazil in Portuguese).
+    # No-op for the global markets and for a base whose language has no parquet.
+    if result_data.get("imported", 0) > 0:
+        await _ensure_region_text_language(db_id, base_registry.home_language_code(db_id), session)
+
     return result_data
 
 
@@ -4717,6 +4713,145 @@ def _pg_bulk_insert_cost_rows(sync_url: str, rows: list[tuple]) -> int:
     return inserted
 
 
+def _swap_region_text_sync(sync_url: str, lang_parquet: str, base_region: str, staging_region: str) -> int:
+    """Copy a translated parquet's work-item text onto ``base_region`` in place.
+
+    The national bases ship one English work-item parquet plus a translated
+    parquet per app language. To render a base in another language WITHOUT
+    deleting its cost items (their ids are referenced by user element->cost
+    matches, assemblies and the usage ledger via FK, so a delete+reinsert would
+    cascade those away), this:
+
+    1. imports the language parquet into a transient ``staging_region`` with the
+       same canonical parquet->rows transform (:func:`_process_and_insert_cwicr`),
+    2. copies the translated text columns (:data:`_TRANSLATED_TEXT_COLS`) onto the
+       live ``base_region`` rows, joined on ``code`` so every id is preserved, and
+    3. drops the staging region.
+
+    Prices are untouched here - the caller reprices afterwards, and
+    :meth:`reprice_region` keeps each component's (now translated) name. Runs in a
+    thread (sync DB work). Idempotent: pre-cleans and drops the staging region so a
+    retry starts clean and leaves nothing behind. Returns the number of live rows
+    updated.
+    """
+    import os as _os
+
+    from sqlalchemy import create_engine, text
+
+    if not sync_url:
+        sync_url = _os.environ.get("DATABASE_SYNC_URL", "")
+
+    table = CostItem.__table__.name  # oe_costs_item
+    set_clause = ", ".join(f"{c} = s.{c}" for c in _TRANSLATED_TEXT_COLS)
+
+    engine = create_engine(sync_url)
+    try:
+        # Clear any staging rows a previous interrupted run may have left.
+        with engine.begin() as conn:
+            conn.execute(text(f"DELETE FROM {table} WHERE region = :r"), {"r": staging_region})  # noqa: S608
+        # Reuse the canonical parquet->rows transform, targeting staging. Same
+        # dedup-by-rate_code, so staging carries one row per ``code`` exactly like
+        # the live region - the join below is 1:1.
+        _process_and_insert_cwicr(lang_parquet, staging_region, sync_url)
+        # Overlay translated text onto the live region (ids and prices preserved),
+        # then drop staging. A single set-based UPDATE ... FROM self-join.
+        with engine.begin() as conn:
+            updated = conn.execute(
+                text(  # noqa: S608
+                    f"UPDATE {table} AS t SET {set_clause} FROM {table} AS s "
+                    f"WHERE t.region = :base AND s.region = :stage AND t.code = s.code"
+                ),
+                {"base": base_region, "stage": staging_region},
+            ).rowcount
+            conn.execute(text(f"DELETE FROM {table} WHERE region = :r"), {"r": staging_region})  # noqa: S608
+        return int(updated or 0)
+    finally:
+        engine.dispose()
+
+
+async def _ensure_region_text_language(base_region: str, lang_code: str | None, session: AsyncSession) -> None:
+    """Ensure an already-loaded national base renders its work items in ``lang_code``.
+
+    Swaps the region's text in place (see :func:`_swap_region_text_sync`). No-op
+    for a non-national base, a language we do not translate (e.g. ``en`` markets,
+    which keep the home English text), an unavailable translation parquet, or a
+    region already showing that language. Locales served by another language's
+    parquet, such as ``es-MX``, resolve through
+    :func:`~app.modules.costs.base_registry.normalize_lang_code` first.
+    """
+    if not lang_code:
+        return
+    lang_region = base_registry.national_language_region(base_region, lang_code)
+    if lang_region is None:
+        return
+    if _REGION_ACTIVE_LANG.get(base_region) == lang_code:
+        return
+
+    parquet = await _find_cwicr_file(lang_region)
+    if not parquet:
+        logger.info(
+            "No %s translation parquet for base %s; keeping current work-item text",
+            lang_code,
+            base_region,
+        )
+        return
+
+    import asyncio
+    import os as _os
+
+    from app.config import get_settings
+
+    target = _os.environ.get("DATABASE_SYNC_URL") or get_settings().database_sync_url
+    staging_region = f"__xlate_{base_region}_{lang_code}"
+    try:
+        updated = await asyncio.to_thread(_swap_region_text_sync, target, str(parquet), base_region, staging_region)
+    except Exception:
+        logger.exception("Language swap to %s failed for %s (keeping current text)", lang_code, base_region)
+        return
+
+    _REGION_ACTIVE_LANG[base_region] = lang_code
+    _invalidate_cost_cache()
+    logger.info("Swapped %s work-item text to %s (%d items updated)", base_region, lang_code, updated)
+
+
+def _join_work_name_columns(
+    orig: pd.Series,  # noqa: F821
+    final: pd.Series,  # noqa: F821
+    *,
+    join: bool = True,
+) -> pd.Series:  # noqa: F821
+    """Build one display description from the two CWICR work-name columns.
+
+    The two columns mean different things depending on which base produced them,
+    and that is why ``join`` has to be decided by the caller rather than inferred
+    from the data:
+
+    * The classic CIS parquets split ONE sentence across the columns, a parent
+      description in ``rate_original_name`` and the variant that distinguishes it
+      in ``rate_final_name`` ("Soil excavation ... with a bucket capacity of:" +
+      "15 m3, soil group 1"), both already in the reader's language. Those must be
+      concatenated or every variant loses either its context or its specificity.
+    * The national bases carry two parallel FULL descriptions of the same item,
+      because the translation pipeline rendered each column separately. Joining
+      them prints the item twice ("Demolition of the Catalan vault, including
+      manual loading Demolition of the vault to the flat arch, including manual
+      loading"), so those keep a single copy.
+
+    Divergence between the columns cannot tell the two apart: it is ~100% in both
+    cases. Only the base type can, hence ``join`` and
+    :func:`~app.modules.costs.base_registry.is_national_region`.
+
+    With ``join=False`` the description is ``final``, falling back to ``orig``
+    only where ``final`` is empty. Nothing is discarded from the parquet itself.
+    Both inputs must already be NaN-filled, stringified and stripped.
+    """
+    single = final.where(final != "", orig)
+    if not join:
+        return single
+    joined = (orig + " " + final).str.strip()
+    return joined.where((orig != final) & (orig != "") & (final != ""), single)
+
+
 def _process_and_insert_cwicr(parquet_path: str, db_id: str, db_file: str) -> dict[str, Any]:
     """Process CWICR parquet + insert into PostgreSQL. Runs in a thread.
 
@@ -4746,9 +4881,11 @@ def _process_and_insert_cwicr(parquet_path: str, db_id: str, db_file: str) -> di
 
     # 2. Vectorized processing - use groupby.first() instead of iterrows
     if "rate_original_name" in df.columns and "rate_final_name" in df.columns:
-        df["_desc"] = (
-            df["rate_original_name"].fillna("").astype(str) + " " + df["rate_final_name"].fillna("").astype(str)
-        ).str.strip()
+        df["_desc"] = _join_work_name_columns(
+            df["rate_original_name"].fillna("").astype(str).str.strip(),
+            df["rate_final_name"].fillna("").astype(str).str.strip(),
+            join=not base_registry.is_national_region(db_id),
+        )
     elif "rate_original_name" in df.columns:
         df["_desc"] = df["rate_original_name"].fillna("").astype(str)
     else:
@@ -5309,9 +5446,11 @@ def _build_cwicr_items(df: pd.DataFrame, db_id: str) -> list[dict[str, Any]]:  #
 
     # Build description column
     if "rate_original_name" in df.columns and "rate_final_name" in df.columns:
-        df.loc[:, "_full_desc"] = (
-            df["rate_original_name"].fillna("").astype(str) + " " + df["rate_final_name"].fillna("").astype(str)
-        ).str.strip()
+        df.loc[:, "_full_desc"] = _join_work_name_columns(
+            df["rate_original_name"].fillna("").astype(str).str.strip(),
+            df["rate_final_name"].fillna("").astype(str).str.strip(),
+            join=not base_registry.is_national_region(db_id),
+        )
 
     if "rate_code" not in df.columns:
         return []

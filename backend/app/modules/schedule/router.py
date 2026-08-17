@@ -45,6 +45,7 @@ from app.dependencies import CurrentUserId, CurrentUserPayload, RequirePermissio
 from app.modules.schedule.schemas import (
     ActivityBimLinkRequest,
     ActivityCreate,
+    ActivityListResponse,
     ActivityResponse,
     ActivityUpdate,
     BaselineCreate,
@@ -71,6 +72,7 @@ from app.modules.schedule.schemas import (
     ScheduleCreate,
     ScheduleDiffRequest,
     ScheduleDiffResponse,
+    ScheduleListResponse,
     ScheduleResponse,
     ScheduleStatsResponse,
     ScheduleUpdate,
@@ -246,9 +248,9 @@ async def create_schedule(
 
 @router.get(
     "/schedules/",
-    response_model=list[ScheduleResponse],
+    response_model=ScheduleListResponse,
     summary="List schedules",
-    description="List all schedules for a project. Requires project_id query parameter.",
+    description="List schedules for a project. Requires project_id. Returns one page plus the total.",
     dependencies=[Depends(RequirePermission("schedule.read"))],
 )
 async def list_schedules(
@@ -259,11 +261,21 @@ async def list_schedules(
     offset: int = Query(default=0, ge=0),
     limit: int = Query(default=50, ge=1, le=100),
     service: ScheduleService = Depends(_get_service),
-) -> list[ScheduleResponse]:
-    """List all schedules for a given project."""
+) -> ScheduleListResponse:
+    """List schedules for a given project, one page at a time.
+
+    The repository already counts the full set to build the page; this
+    returns that count instead of discarding it, so a caller can tell a
+    complete list from a truncated one.
+    """
     await _verify_schedule_project_owner(session, project_id, _user_id, payload)
-    schedules, _ = await service.list_schedules_for_project(project_id, offset=offset, limit=limit)
-    return [ScheduleResponse.model_validate(s) for s in schedules]
+    schedules, total = await service.list_schedules_for_project(project_id, offset=offset, limit=limit)
+    return ScheduleListResponse(
+        items=[ScheduleResponse.model_validate(s) for s in schedules],
+        total=total,
+        offset=offset,
+        limit=limit,
+    )
 
 
 @router.get(
@@ -354,7 +366,7 @@ async def create_activity(
 
 @router.get(
     "/schedules/{schedule_id}/activities/",
-    response_model=list[ActivityResponse],
+    response_model=ActivityListResponse,
     summary="List activities",
     dependencies=[Depends(RequirePermission("schedule.read"))],
 )
@@ -366,15 +378,24 @@ async def list_activities(
     offset: int = Query(default=0, ge=0),
     limit: int = Query(default=1000, ge=1, le=5000),
     service: ScheduleService = Depends(_get_service),
-) -> list[ActivityResponse]:
-    """List all activities for a schedule, ordered by sort_order.
+) -> ActivityListResponse:
+    """List activities for a schedule, ordered by sort_order, one page at a time.
 
     Verifies the caller owns the parent project (admins bypass) so a user
     cannot enumerate activities of a schedule they do not have access to.
+
+    Returns the schedule's full activity count alongside the page. A Gantt
+    or 4D viewer that draws ``items`` without checking ``total`` renders a
+    programme that is missing work and looks finished.
     """
     await _verify_schedule_owner(service, session, schedule_id, _user_id, payload)
-    activities, _ = await service.list_activities_for_schedule(schedule_id, offset=offset, limit=limit)
-    return [_activity_to_response(a) for a in activities]
+    activities, total = await service.list_activities_for_schedule(schedule_id, offset=offset, limit=limit)
+    return ActivityListResponse(
+        items=[_activity_to_response(a) for a in activities],
+        total=total,
+        offset=offset,
+        limit=limit,
+    )
 
 
 @router.delete(
@@ -902,11 +923,10 @@ async def create_relationship(
         session.add(rel)
         await session.flush()
 
-    # Snapshot the response BEFORE rebuilding the mirror. ``update_fields``
-    # calls ``session.expire_all()``, which expires ``rel``; serialising an
-    # expired ORM row afterwards would trigger an implicit async refresh that
-    # Pydantic cannot await from sync attribute access (MissingGreenlet). Build
-    # the detached response model now, while ``rel`` is still populated.
+    # Build the detached response model now, while ``rel`` holds exactly what
+    # was created, so the payload describes the new relationship and not the
+    # successor's derived-JSON rebuild below - and so serialising it never
+    # lazy-loads, which raises MissingGreenlet.
     response = RelationshipResponse.model_validate(rel)
 
     # Rebuild the successor activity's derived ``dependencies`` JSON mirror from
@@ -1062,9 +1082,9 @@ async def update_relationship(
         lag_days=merged_lag,
     )
     # Reflect the persisted values on the in-memory row, then snapshot the
-    # response BEFORE the mirror rebuild's expire_all(): serialising an expired
-    # ORM row afterwards would trigger a sync async-refresh (the MissingGreenlet
-    # trap the create route documents).
+    # response before the mirror rebuild so the payload describes the
+    # relationship itself rather than the successor's derived JSON, and never
+    # lazy-loads while serialising (MissingGreenlet).
     rel.relationship_type = merged_type
     rel.lag_days = merged_lag
     response = RelationshipResponse.model_validate(rel)

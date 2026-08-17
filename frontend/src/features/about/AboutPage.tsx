@@ -12,9 +12,11 @@ import {
   Briefcase, Globe, ExternalLink,
   Linkedin, Youtube, Star, Coffee, Rocket, ArrowRight, Handshake,
   Github, MessageCircle, Heart, HandCoins, ChevronDown, Sparkles,
+  MessageSquareQuote,
 } from 'lucide-react';
 import clsx from 'clsx';
 import { Card, Button, Badge, Breadcrumb, DismissibleInfo, IntroRichText } from '@/shared/ui';
+import { SUPPORTED_LANGUAGES } from '@/app/i18n';
 import { PageHeader } from '@/shared/ui/PageHeader';
 import { APP_VERSION } from '@/shared/lib/version';
 import { UpdateNotification } from '@/shared/ui/UpdateChecker';
@@ -22,6 +24,8 @@ import { Changelog, getRecentReleases } from './Changelog';
 import { CONTRIBUTORS, SPONSORS, acknowledgedUrl, type Acknowledged } from './acknowledgments';
 
 const REPO_URL = 'https://github.com/datadrivenconstruction/OpenConstructionERP';
+// Clean product URL - "?source=search" is G2's search-result tracking.
+const G2_REVIEWS_URL = 'https://www.g2.com/products/openconstructionerp/reviews';
 const PAYPAL_DONATE_URL = 'https://www.paypal.com/donate/?hosted_button_id=DWBCLNLY2VWAA';
 const GITHUB_SPONSORS_URL = 'https://github.com/sponsors/datadrivenconstruction';
 
@@ -294,11 +298,11 @@ export function AboutPage() {
           <div className="grid grid-cols-3 sm:grid-cols-6 gap-2.5">
             {[
               { value: '120K+', label: t('about.stat_costs', { defaultValue: 'Cost Items' }) },
-              { value: '27', label: t('about.stat_langs', { defaultValue: 'Languages' }) },
-              { value: '48', label: t('about.stat_regions', { defaultValue: 'Regional Databases' }) },
+              { value: String(SUPPORTED_LANGUAGES.length), label: t('about.stat_langs', { defaultValue: 'Languages' }) },
+              { value: '47', label: t('about.stat_regions', { defaultValue: 'Countries covered' }) },
               { value: '6', label: t('about.stat_cad_formats', { defaultValue: 'CAD/BIM formats supported' }) },
-              { value: '161', label: t('about.stat_modules', { defaultValue: 'Backend modules' }) },
-              { value: '12', label: t('about.stat_sections', { defaultValue: 'Menu sections' }) },
+              { value: '180+', label: t('about.stat_modules', { defaultValue: 'Backend modules' }) },
+              { value: '28', label: t('about.stat_sections', { defaultValue: 'Menu sections' }) },
             ].map((s, i) => (
               <div key={i} className="text-center rounded-xl bg-surface-secondary/50 px-2 py-3">
                 <div className="text-xl font-bold text-content-primary leading-none">{s.value}</div>
@@ -416,6 +420,33 @@ export function AboutPage() {
                   </div>
                 </a>
               </div>
+
+              {/* Review on G2 — a review from a real user helps other teams
+                  find and trust the project. Full-width row like Telegram. */}
+              <a
+                href={G2_REVIEWS_URL}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="group flex items-center gap-3 rounded-lg border border-[#FF492C]/25 bg-[#FF492C]/[0.04] px-3.5 py-3 hover:border-[#FF492C]/50 hover:bg-[#FF492C]/[0.08] transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-oe-blue focus-visible:ring-offset-1"
+              >
+                <span className="shrink-0 h-10 w-10 rounded-lg bg-[#FF492C]/15 text-[#FF492C] flex items-center justify-center">
+                  <MessageSquareQuote size={18} />
+                </span>
+                <div className="min-w-0 flex-1">
+                  <div className="flex items-center gap-2">
+                    <p className="text-sm font-semibold text-content-primary leading-tight">
+                      {t('about.community_g2_title', { defaultValue: 'Review us on G2' })}
+                    </p>
+                    <span className="inline-flex items-center rounded-md bg-[#FF492C]/15 text-[#FF492C] text-2xs font-semibold px-1.5 py-0.5">
+                      {t('about.community_g2_badge', { defaultValue: 'Means a lot' })}
+                    </span>
+                  </div>
+                  <p className="text-xs text-content-secondary mt-0.5 leading-snug">
+                    {t('about.community_g2_desc', { defaultValue: 'We would be grateful if you rate us or write a short review - it helps other construction teams find and trust the platform.' })}
+                  </p>
+                </div>
+                <ExternalLink size={13} className="text-content-quaternary group-hover:text-[#FF492C] shrink-0" />
+              </a>
             </div>
 
             <p className="mt-auto pt-4 text-[11px] text-content-tertiary text-center">
@@ -484,7 +515,7 @@ export function AboutPage() {
                 <p>
                   <Trans
                     i18nKey="about.founder_bio_p3"
-                    defaults='Two other problems kept me busy. One was helping non-developers get into proprietary file formats that were never meant to be opened. The other was finding a cleaner way to describe construction work through a resource model. Both produced free tools: the <cad>DDC CAD/BIM converters</cad> (Revit, IFC, DWG, DGN → structured data) <gh>on GitHub</gh>, and <cwicr>CWICR</cwicr>, a multilingual database of construction works and resources - over 55,000 items in 11 languages, published as <cwicr>OpenConstructionEstimate-DDC-CWICR</cwicr>.'
+                    defaults='Two other problems kept me busy. One was helping non-developers get into proprietary file formats that were never meant to be opened. The other was finding a cleaner way to describe construction work through a resource model. Both produced free tools: the <cad>DDC CAD/BIM converters</cad> (Revit®, IFC, DWG, DGN → structured data) <gh>on GitHub</gh>, and <cwicr>CWICR</cwicr>, a multilingual database of construction works and resources - over 55,000 items in 11 languages, published as <cwicr>OpenConstructionEstimate-DDC-CWICR</cwicr>.'
                     components={{
                       cad: (
                         <a
@@ -586,7 +617,7 @@ export function AboutPage() {
               {[
                 { href: 'https://datadrivenconstruction.io', label: 'DataDrivenConstruction', desc: t('about.ddc_link_lab', { defaultValue: 'Lab homepage - research & consulting' }) },
                 { href: 'https://datadrivenconstruction.io/books/', label: 'DDC Guidebook', desc: t('about.ddc_link_book', { defaultValue: 'Reference reading, free, 16 languages' }) },
-                { href: 'https://github.com/datadrivenconstruction/cad2data-Revit-IFC-DWG-DGN-pipeline-with-conversion-validation-qto', label: 'CAD-BIM Converter', desc: t('about.ddc_link_cad', { defaultValue: 'Pipeline: Revit · IFC · DWG · DGN → data' }) },
+                { href: 'https://github.com/datadrivenconstruction/cad2data-Revit-IFC-DWG-DGN-pipeline-with-conversion-validation-qto', label: 'CAD-BIM Converter', desc: t('about.ddc_link_cad', { defaultValue: 'Pipeline: Revit® · IFC · DWG · DGN → data' }) },
                 { href: 'https://datadrivenconstruction.io/excel-plugin/', label: 'DDC Excel Plugin', desc: t('about.ddc_link_excel', { defaultValue: 'Spreadsheet bridge - pull live data into Excel' }) },
               ].map(item => (
                 <li key={item.href}>
@@ -616,7 +647,7 @@ export function AboutPage() {
             </p>
             <ul className="mb-6 grid grid-cols-1 sm:grid-cols-2 gap-2.5">
               {[
-                { href: 'https://github.com/datadrivenconstruction/cad2data-Revit-IFC-DWG-DGN-pipeline-with-conversion-validation-qto', label: 'cad2data Pipeline', desc: t('about.ddc_gh_cad2data', { defaultValue: 'Revit · IFC · DWG · DGN → structured quantities' }) },
+                { href: 'https://github.com/datadrivenconstruction/cad2data-Revit-IFC-DWG-DGN-pipeline-with-conversion-validation-qto', label: 'cad2data Pipeline', desc: t('about.ddc_gh_cad2data', { defaultValue: 'Revit® · IFC · DWG · DGN → structured quantities' }) },
                 { href: 'https://github.com/datadrivenconstruction/OpenConstructionEstimate-DDC-CWICR', label: 'OpenConstructionEstimate', desc: t('about.ddc_gh_cwicr', { defaultValue: '55,000+ cost items · 27 languages · 48 regions' }) },
                 { href: 'https://github.com/datadrivenconstruction', label: 'DDC Skills for AI Agents', desc: t('about.ddc_gh_skills', { defaultValue: 'Tool definitions & prompts for LLM agents' }) },
               ].map(item => (
@@ -951,9 +982,9 @@ export function AboutPage() {
               </p>
               <div className="grid grid-cols-2 gap-2.5 mb-4">
                 {[
-                  { value: '27', label: t('about.support_kpi_langs', { defaultValue: 'Languages translated' }) },
-                  { value: '48', label: t('about.support_kpi_regions', { defaultValue: 'Regional cost packs' }) },
-                  { value: '161', label: t('about.support_kpi_modules', { defaultValue: 'Backend modules' }) },
+                  { value: String(SUPPORTED_LANGUAGES.length), label: t('about.support_kpi_langs', { defaultValue: 'Languages translated' }) },
+                  { value: '47', label: t('about.support_kpi_regions', { defaultValue: 'Countries covered' }) },
+                  { value: '180+', label: t('about.support_kpi_modules', { defaultValue: 'Backend modules' }) },
                   { value: '55K+', label: t('about.support_kpi_cwicr', { defaultValue: 'CWICR positions' }) },
                 ].map((kpi, i) => (
                   <div key={i} className="rounded-lg bg-surface-primary/60 backdrop-blur-sm border border-border-light px-3 py-2.5">

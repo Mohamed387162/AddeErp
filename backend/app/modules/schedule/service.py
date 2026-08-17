@@ -56,6 +56,7 @@ def _normalize_deps(deps: list | None) -> list[dict]:
 
 
 from app.modules.schedule.models import Activity, Schedule, ScheduleRelationship, WorkOrder
+from app.modules.schedule.ordering import activity_order_terms
 from app.modules.schedule.repository import (
     ActivityRepository,
     RelationshipRepository,
@@ -1112,9 +1113,9 @@ class ScheduleService:
         """
         activity = await self.get_activity(activity_id)
 
-        # Capture schedule_id before update_fields() calls expire_all(),
-        # which would invalidate the ORM object and trigger a sync lazy-load
-        # (MissingGreenlet) when accessing activity.schedule_id afterwards.
+        # Capture the pre-update values the transition checks and the event
+        # below compare against, so neither reloads the activity afterwards
+        # (MissingGreenlet on the async session).
         schedule_id = activity.schedule_id
         schedule_id_str = str(schedule_id)
         current_progress = _str_to_float(activity.progress_pct)
@@ -1496,7 +1497,7 @@ class ScheduleService:
                 noload(Activity.children),
                 noload(Activity.work_orders),
             )
-            .order_by(Activity.sort_order, Activity.wbs_code)
+            .order_by(*activity_order_terms())
         )
         result = await self.session.execute(stmt)
         candidates = list(result.scalars().all())
@@ -1629,8 +1630,9 @@ class ScheduleService:
             )
 
         if fields:
-            # Snapshot published attributes before update_fields expires the instance
-            # (bulk UPDATE + expire_all would force a sync lazy reload -> MissingGreenlet on asyncpg)
+            # Snapshot the linked activity id before the update so the event
+            # below carries it without re-reading the work order, where a
+            # reload raises MissingGreenlet
             activity_id = work_order.activity_id
 
             await self.work_order_repo.update_fields(work_order_id, **fields)
@@ -2270,7 +2272,7 @@ class ScheduleService:
                 metadata_={"source": "boq_generation", "boq_id": str(boq_id)},
             )
             summary = await self.activity_repo.create(summary)
-            summary_id = summary.id  # Save ID before any expire_all
+            summary_id = summary.id  # Stable once the create above has flushed
             created_activities.append(
                 {
                     "activity_type": "summary",
@@ -2571,7 +2573,9 @@ class ScheduleService:
                 detail="Schedule has no activities",
             )
 
-        # Snapshot all activity data to avoid MissingGreenlet after expire_all
+        # Snapshot all activity data before the bulk write: ``bulk_update_fields``
+        # still ends in ``session.expire_all()``, so reading an activity back
+        # afterwards raises MissingGreenlet on the async session
         act_data: list[dict] = []
         for a in activities:
             act_data.append(

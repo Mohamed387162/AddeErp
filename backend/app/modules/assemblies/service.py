@@ -32,6 +32,12 @@ from app.modules.assemblies.formula_engine import (
     synthesize_factor,
 )
 from app.modules.assemblies.models import Assembly, Component
+from app.modules.assemblies.parametric import (
+    ParamError,
+    expand_assembly,
+    resolve_parameters,
+    validate_parameter_graph,
+)
 from app.modules.assemblies.repository import AssemblyRepository, ComponentRepository
 from app.modules.assemblies.schemas import (
     ApplyToBOQRequest,
@@ -43,6 +49,15 @@ from app.modules.assemblies.schemas import (
     ComponentCreate,
     ComponentResponse,
     ComponentUpdate,
+    ExpandLine,
+    ExpandPreviewResponse,
+    ParameterValidationResponse,
+)
+from app.modules.boq.quantity_formula import (
+    FormulaError,
+    FormulaSyntaxError,
+    evaluate_formula,
+    validate_formula,
 )
 
 _logger_ev = logging.getLogger(__name__ + ".events")
@@ -98,10 +113,17 @@ def _check_assembly_depth(
     return visited | {assembly_id}
 
 
-def _compute_component_total(factor: float, quantity: float, unit_cost: float) -> str:
+def _compute_component_total(factor: float, quantity: float, unit_cost: float | Decimal) -> str:
     """Compute component total as string: factor * quantity * unit_cost.
 
     Uses Decimal for precision, returns string for SQLite-safe storage.
+
+    This is the one boundary where a float quantity meets Decimal money. Callers
+    pass ``unit_cost`` as a Decimal (``ComponentCreate.get_unit_cost``); the
+    annotation admits both because ``Decimal(str(...))`` round-trips either
+    exactly. It deliberately does not say ``float`` alone - that reads as an
+    invitation to wrap the money in ``float()`` at the call site, which is the
+    one conversion here that would silently lose precision.
     """
     try:
         f = Decimal(str(factor))
@@ -117,7 +139,7 @@ def _compute_typed_total(
     resource_type: str | None,
     factor: float,
     quantity: float,
-    unit_cost: float,
+    unit_cost: float | Decimal,
     metadata: dict | None,
 ) -> str:
     """Compute a component total using a type-aware formula.
@@ -443,6 +465,59 @@ def _compute_assembly_total(components: list[Component], bid_factor: str) -> str
         return "0"
 
 
+# ── Parametric assembly helpers (Issue #365) ────────────────────────────────
+
+
+def _params_to_json(parameters: Sequence[object]) -> list[dict]:
+    """Serialise AssemblyParameter models (or plain dicts) to JSON-safe dicts.
+
+    ``Assembly.parameters`` is a JSON column, so a parameter's Decimal ``value``
+    must be stored as a string (the schema's ``field_serializer`` does that in
+    ``mode="json"``). Plain dicts - the shape the import path already hands us -
+    pass through unchanged.
+    """
+    out: list[dict] = []
+    for param in parameters or []:
+        if hasattr(param, "model_dump"):
+            out.append(param.model_dump(mode="json"))
+        elif isinstance(param, dict):
+            out.append(param)
+    return out
+
+
+def _validate_parametric(
+    parameters: list[dict],
+    *,
+    component_formulas: Sequence[tuple[str, str | None]] = (),
+) -> list[ParamError]:
+    """Collect every structural problem in the parameter graph + component formulas.
+
+    Runs :func:`validate_parameter_graph` over the parameters (unique names,
+    resolvable references, no cycles) and syntax-checks each non-empty
+    ``component_formulas`` entry with the shared #347 engine. Cross-parameter
+    references inside a component formula are resolved at expand / apply time,
+    not here. One helper so assembly create/update and component add/update all
+    raise the same structured 422.
+    """
+    errors = list(validate_parameter_graph(parameters))
+    for ref, formula in component_formulas:
+        if formula and str(formula).strip():
+            try:
+                validate_formula(str(formula))
+            except FormulaSyntaxError as exc:
+                errors.append(ParamError("component", ref, "syntax", str(exc)))
+    return errors
+
+
+def _raise_param_errors(errors: list[ParamError]) -> None:
+    """Raise a structured HTTP 422 from a list of ParamError (no-op when empty)."""
+    if errors:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=[e.as_dict() for e in errors],
+        )
+
+
 class AssemblyService:
     """Business logic for Assembly and Component operations."""
 
@@ -473,6 +548,10 @@ class AssemblyService:
                 detail=f"Assembly with code '{data.code}' already exists",
             )
 
+        # Issue #365 - validate the parameter graph before persisting.
+        parameters_json = _params_to_json(data.parameters)
+        _raise_param_errors(_validate_parametric(parameters_json))
+
         assembly = Assembly(
             code=data.code,
             name=data.name,
@@ -484,6 +563,7 @@ class AssemblyService:
             currency=data.currency,
             bid_factor=str(data.bid_factor),
             regional_factors=data.regional_factors,
+            parameters=parameters_json,
             is_template=data.is_template,
             project_id=data.project_id,
             owner_id=uuid.UUID(owner_id) if owner_id else None,
@@ -584,6 +664,14 @@ class AssemblyService:
         if "bid_factor" in fields:
             fields["bid_factor"] = str(fields["bid_factor"])
 
+        # Issue #365 - a supplied ``parameters`` REPLACES the whole set; the
+        # graph is re-validated and JSON-serialised before it is persisted
+        # (``model_dump`` above leaves the Decimal values un-JSON-safe).
+        if "parameters" in fields:
+            parameters_json = _params_to_json(data.parameters or [])
+            _raise_param_errors(_validate_parametric(parameters_json))
+            fields["parameters"] = parameters_json
+
         # NEW-ASM-106 - verify the caller owns the *new* project before
         # re-parenting. Without this, an authenticated owner of assembly
         # X could PATCH ``{"project_id": "<other-tenant's-project-id>"}``
@@ -670,11 +758,21 @@ class AssemblyService:
         Raises:
             HTTPException 404 if assembly not found.
         """
-        await self.get_assembly(assembly_id)
+        assembly = await self.get_assembly(assembly_id)
 
         # Resolve aliased fields: name→description, unit_rate→unit_cost
         description = data.get_description()
         unit_cost = data.get_unit_cost()
+
+        # Issue #365 - a component quantity_formula is syntax-checked against
+        # the shared engine, and the assembly's parameter graph is re-validated
+        # so a formula can only be attached to a coherent parameter set.
+        _raise_param_errors(
+            _validate_parametric(
+                list(assembly.parameters or []),
+                component_formulas=[(description or "component", data.quantity_formula)],
+            )
+        )
 
         # Merge any FE-supplied metadata (waste_pct / burden_pct / crew /
         # rental_days / fuel_cost / vendor / productivity) before total
@@ -705,6 +803,7 @@ class AssemblyService:
             resource_type=data.resource_type,
             factor=str(data.factor),
             quantity=str(data.quantity),
+            quantity_formula=data.quantity_formula,
             unit=data.unit,
             unit_cost=str(unit_cost),
             total=total,
@@ -716,7 +815,8 @@ class AssemblyService:
         # Recalculate assembly total
         await self._recalculate_total(assembly_id)
 
-        # Re-fetch component to avoid MissingGreenlet after expire_all
+        # Re-fetch the component: reading the recalculated totals back off the
+        # stale instance would reload them and raise MissingGreenlet here
         refreshed = await self.component_repo.get_by_id(component.id)
         if refreshed is not None:
             component = refreshed
@@ -765,6 +865,20 @@ class AssemblyService:
             fields["quantity"] = str(fields["quantity"])
         if "unit_cost" in fields:
             fields["unit_cost"] = str(fields["unit_cost"])
+
+        # Issue #365 - a changed quantity_formula is normalised (empty ->
+        # NULL, i.e. back to the static quantity) then syntax-checked against
+        # the shared engine and the assembly's parameter graph.
+        if "quantity_formula" in fields:
+            normalised = (fields.get("quantity_formula") or "").strip() or None
+            fields["quantity_formula"] = normalised
+            parent = await self.get_assembly(assembly_id)
+            _raise_param_errors(
+                _validate_parametric(
+                    list(parent.parameters or []),
+                    component_formulas=[(component.description or "component", normalised)],
+                )
+            )
 
         # Map 'metadata' key to the model's 'metadata_' column
         if "metadata" in fields:
@@ -868,6 +982,7 @@ class AssemblyService:
                     resource_type=comp.resource_type,
                     factor=_str_to_float(comp.factor),
                     quantity=_str_to_float(comp.quantity),
+                    quantity_formula=comp.quantity_formula,
                     unit=comp.unit,
                     # v3 §10 - money as Decimal; Pydantic coerces str→Decimal
                     unit_cost=Decimal(str(comp.unit_cost or "0")),
@@ -895,6 +1010,7 @@ class AssemblyService:
             currency=assembly.currency,
             bid_factor=_str_to_float(assembly.bid_factor),
             regional_factors=assembly.regional_factors,
+            parameters=assembly.parameters or [],
             is_template=assembly.is_template,
             project_id=assembly.project_id,
             owner_id=assembly.owner_id,
@@ -921,6 +1037,124 @@ class AssemblyService:
         new_total = _compute_assembly_total(components, assembly.bid_factor)
 
         await self.assembly_repo.update_fields(assembly_id, total_rate=new_total)
+
+    # ── Parametric operations (Issue #365) ─────────────────────────────────
+
+    async def validate_parameters(self, assembly_id: uuid.UUID) -> ParameterValidationResponse:
+        """Validate an assembly's parameter graph and resolve it at defaults.
+
+        Runs the structural checks (unique names, resolvable references, no
+        cycles) plus a resolve pass at the stored defaults, so the editor can
+        surface both graph problems and the resulting values in one call.
+        ``ok`` is True only when nothing failed.
+        """
+        assembly = await self.get_assembly(assembly_id)
+        parameters = list(assembly.parameters or [])
+
+        graph_errors = validate_parameter_graph(parameters)
+        resolved, resolve_errors = resolve_parameters(parameters, None)
+
+        # ``resolve_parameters`` re-runs the same structural analysis, so its
+        # error list overlaps the graph pass; merge unique by (scope,name,code).
+        seen: set[tuple[str, str, str]] = set()
+        merged: list[ParamError] = []
+        for err in (*graph_errors, *resolve_errors):
+            key = (err.scope, err.name, err.code)
+            if key not in seen:
+                seen.add(key)
+                merged.append(err)
+
+        return ParameterValidationResponse(
+            ok=not merged,
+            errors=[e.as_dict() for e in merged],
+            resolved={name: format(value, "f") for name, value in resolved.items()},
+        )
+
+    async def expand_preview(
+        self,
+        assembly_id: uuid.UUID,
+        parameter_values: dict[str, float] | None = None,
+    ) -> ExpandPreviewResponse:
+        """Preview an assembly expansion at the supplied parameter values.
+
+        Resolves the parameter graph, computes each component's quantity (its
+        formula result, or its static quantity), and prices every line with the
+        same typed-total helper the persisted totals use. Returns before
+        (static) / after (computed) quantities plus the rolled-up rate so the
+        editor can show the effect of the inputs without persisting anything.
+        """
+        assembly = await self.get_assembly(assembly_id)
+        components = await self.component_repo.list_for_assembly(assembly_id)
+        parameters = list(assembly.parameters or [])
+
+        comp_dicts = [
+            {
+                "id": str(comp.id),
+                "description": comp.description,
+                "quantity_formula": comp.quantity_formula,
+                "quantity": comp.quantity,
+            }
+            for comp in components
+        ]
+        expansion = expand_assembly(parameters, comp_dicts, dict(parameter_values or {}))
+        comp_by_id = {str(comp.id): comp for comp in components}
+
+        lines: list[ExpandLine] = []
+        subtotal = Decimal("0")
+        for line in expansion.lines:
+            comp = comp_by_id.get(line.component_id or "")
+            unit = comp.unit if comp is not None else ""
+            resource_type = comp.resource_type if comp is not None else None
+            unit_cost_str = str(comp.unit_cost or "0") if comp is not None else "0"
+            unit_cost = _str_to_float(comp.unit_cost) if comp is not None else 0.0
+            factor = _str_to_float(comp.factor) if comp is not None else 1.0
+            metadata = comp.metadata_ if comp is not None else None
+            # Price the line at its COMPUTED quantity via the same typed-total
+            # helper the stored component total uses.
+            total_str = _compute_typed_total(
+                resource_type=resource_type,
+                factor=factor,
+                quantity=float(line.computed_quantity),
+                unit_cost=unit_cost,
+                metadata=metadata if isinstance(metadata, dict) else {},
+            )
+            try:
+                line_total = Decimal(total_str)
+                if line_total.is_finite():
+                    subtotal += line_total
+            except (InvalidOperation, ValueError):
+                pass
+            lines.append(
+                ExpandLine(
+                    component_id=line.component_id,
+                    description=line.description,
+                    unit=unit,
+                    resource_type=resource_type,
+                    static_quantity=format(line.static_quantity, "f"),
+                    computed_quantity=format(line.computed_quantity, "f"),
+                    unit_cost=unit_cost_str,
+                    total=total_str,
+                )
+            )
+
+        # Roll up to the assembly's base rate (subtotal * bid_factor), matching
+        # ``_compute_assembly_total``'s finite-guarded contract.
+        try:
+            bid = Decimal(str(assembly.bid_factor))
+            if not bid.is_finite():
+                bid = Decimal("1")
+            total_rate = subtotal * bid
+            if not total_rate.is_finite():
+                total_rate = Decimal("0")
+        except (InvalidOperation, ValueError):
+            total_rate = Decimal("0")
+
+        return ExpandPreviewResponse(
+            resolved_parameters={name: format(value, "f") for name, value in expansion.resolved_parameters.items()},
+            lines=lines,
+            total_rate=format(total_rate, "f"),
+            errors=[e.as_dict() for e in expansion.errors],
+        )
 
     async def apply_to_boq(self, assembly_id: uuid.UUID, data: ApplyToBOQRequest) -> object:
         """Apply an assembly to a BOQ by creating a new position.
@@ -951,10 +1185,11 @@ class AssemblyService:
         # every foreign-currency assembly impossible to place, even when
         # the project HAD an FX rate configured for that currency. We now
         # mirror how foreign-currency *resources* already behave: convert
-        # via the project's ``fx_rates`` when a rate exists; otherwise let
-        # it through with a visible, non-blocking ``currency_mismatch``
-        # flag - never silent corruption, never a dead end for the user.
-        from app.modules.boq.service import _project_fx_map
+        # through ``fx_bridge`` (the project's own ``fx_rates`` first, then
+        # the ``oe_fx`` register) when any rate resolves; otherwise let it
+        # through with a visible, non-blocking ``currency_mismatch`` flag -
+        # never silent corruption, never a dead end for the user.
+        from app.modules.assemblies.fx_bridge import load_fx_context
 
         currency_warning: dict | None = None
         currency_converted: dict | None = None
@@ -977,49 +1212,53 @@ class AssemblyService:
             project_currency = ""
 
         if asm_currency and project_currency and asm_currency != project_currency:
-            # Project ``fx_rates`` projected to {CODE: "<base units per 1
-            # unit of foreign currency>"} - same convention the BOQ
-            # resource rollup uses, so foreign→base is multiplication.
-            fx_map = _project_fx_map(project)
-            raw_rate = fx_map.get(asm_currency)
-            conv_rate: Decimal | None = None
-            if raw_rate is not None:
-                try:
-                    candidate = Decimal(str(raw_rate))
-                    if candidate.is_finite() and candidate > 0:
-                        conv_rate = candidate
-                except (InvalidOperation, ValueError):
-                    conv_rate = None
+            # Rate resolution order lives in ``fx_bridge``: the project's own
+            # ``fx_rates`` first, because a contractually fixed project rate
+            # must outrank any market feed, then the ``oe_fx`` register, which
+            # answers with provenance saying whether the number came from a
+            # stored rate set, the legacy cache or the bundled seed.
+            #
+            # The register step is new. Before it, ``fx_rates`` was the only
+            # source and it is empty on a default project, so the un-converted
+            # branch below was the common case rather than the rare one.
+            fx_context = await load_fx_context(self.session, project)
+            conv_rate, fx_provenance = fx_context.rate(asm_currency, project_currency)
 
             if conv_rate is not None:
                 # Convert the whole assembly into the project's currency.
                 fx_multiplier = conv_rate
+                as_of = fx_provenance.get("fx_as_of")
                 currency_converted = {
                     "type": "currency_converted",
                     "from": asm_currency,
                     "to": project_currency,
                     "rate": str(conv_rate),
+                    "provenance": fx_provenance,
                     "message": (
                         f"Assembly priced in {asm_currency} was converted "
                         f"to {project_currency} at {conv_rate} "
-                        f"({asm_currency}->{project_currency})."
+                        f"({asm_currency}->{project_currency})" + (f", rates as of {as_of}." if as_of else ".")
                     ),
                 }
             else:
-                # No FX rate configured for this currency - proceed
-                # anyway. The legacy hard 409 trapped the user with no
-                # UI escape hatch (Issue #128). Flag it loudly so the
-                # un-converted foreign value is visible, not silent.
+                # Neither the project's own rates nor the register can price
+                # this pair - proceed anyway. The legacy hard 409 trapped the
+                # user with no UI escape hatch (Issue #128), and the value is
+                # not disguised: the position metadata below records
+                # ``currency`` as the assembly's own code, which
+                # ``boq.service._position_currency`` treats as authoritative,
+                # so the money stays labelled with the currency it is in.
                 currency_warning = {
                     "type": "currency_mismatch",
                     "assembly_currency": asm_currency,
                     "project_currency": project_currency,
                     "message": (
                         f"Unit rate is in {asm_currency} but the project "
-                        f"is {project_currency}, and no FX rate is "
-                        f"configured for {asm_currency}; the value was "
-                        f"kept in {asm_currency} (no conversion). Add an "
-                        f"FX rate in Project Settings to convert it."
+                        f"is {project_currency}, and no FX rate is available "
+                        f"for {asm_currency} from either Project Settings or "
+                        f"the FX register; the value was kept in "
+                        f"{asm_currency} (no conversion). Add an FX rate in "
+                        f"Project Settings to convert it."
                     ),
                 }
 
@@ -1082,6 +1321,89 @@ class AssemblyService:
         # Fetch components separately to avoid MissingGreenlet (noload on get_assembly)
         components = await self.component_repo.list_for_assembly(assembly_id)
 
+        # ── Parametric expansion (Issue #365) ───────────────────────────
+        # When the assembly carries parameters or any component has a
+        # quantity_formula, resolve the parameter graph at the supplied values
+        # and compute each formula line's quantity. A structural parameter
+        # problem (cycle / bad reference / syntax / divide-by-zero) is a clean
+        # 422 rather than a silently wrong quantity. ``computed_quantities``
+        # maps a component id to its Decimal quantity; a line without a formula
+        # (or whose stale formula fails to evaluate) keeps its static quantity.
+        assembly_parameters = list(assembly.parameters or [])
+        parameter_values = dict(getattr(data, "parameter_values", None) or {})
+        computed_quantities: dict[str, Decimal] = {}
+        has_component_formula = any((c.quantity_formula or "").strip() for c in components)
+        if assembly_parameters or has_component_formula:
+            resolved_scope, param_errors = resolve_parameters(assembly_parameters, parameter_values)
+            _raise_param_errors(param_errors)
+            for comp in components:
+                formula = (comp.quantity_formula or "").strip()
+                if not formula:
+                    continue
+                try:
+                    computed_quantities[str(comp.id)] = evaluate_formula(formula, resolved_scope)
+                except FormulaError:
+                    # A stale component formula (e.g. a since-removed parameter)
+                    # falls back to the static quantity rather than blocking the
+                    # whole apply.
+                    continue
+
+        # ── Parametric pricing (Issue #365) ─────────────────────────────
+        # A formula line's stored ``total`` reflects its STATIC quantity (the
+        # formula can only be evaluated once parameter values are supplied at
+        # apply time), so pricing a parametric assembly off the stored
+        # ``total`` / ``total_rate`` silently ignores the formula. Recompute
+        # each formula line's total at its COMPUTED quantity via the very same
+        # typed-total helper ``expand_preview`` uses, so the applied price is
+        # byte-for-byte identical to the server-authoritative preview. A static
+        # line (no formula, or a stale formula that failed to evaluate) keeps
+        # its stored total, so a non-parametric assembly is completely
+        # unchanged.
+        def _effective_component_total(comp: Component) -> Decimal:
+            override = computed_quantities.get(str(comp.id))
+            if override is None:
+                try:
+                    stored = Decimal(str(comp.total or "0"))
+                except (InvalidOperation, ValueError):
+                    return Decimal("0")
+                return stored if stored.is_finite() else Decimal("0")
+            total_str = _compute_typed_total(
+                resource_type=comp.resource_type,
+                factor=_str_to_float(comp.factor),
+                quantity=float(override),
+                unit_cost=_str_to_float(comp.unit_cost),
+                metadata=comp.metadata_ if isinstance(comp.metadata_, dict) else {},
+            )
+            try:
+                computed_total = Decimal(total_str)
+            except (InvalidOperation, ValueError):
+                return Decimal("0")
+            return computed_total if computed_total.is_finite() else Decimal("0")
+
+        comp_effective_totals: dict[str, Decimal] = {
+            str(comp.id): _effective_component_total(comp) for comp in components
+        }
+
+        if computed_quantities:
+            # Rebuild the position base rate from the formula-computed totals
+            # (sum * bid_factor), then re-apply the SAME regional + FX premium
+            # the static path used above. This keeps the position unit_rate and
+            # the per-resource rollup below consistent with each other and with
+            # the preview.
+            eff_subtotal = sum(comp_effective_totals.values(), Decimal("0"))
+            try:
+                bid_for_base = Decimal(str(assembly.bid_factor))
+            except (InvalidOperation, ValueError):
+                bid_for_base = Decimal("1")
+            if not bid_for_base.is_finite() or bid_for_base < 0:
+                bid_for_base = Decimal("1")
+            base_rate = eff_subtotal * bid_for_base
+            if not base_rate.is_finite() or base_rate < 0:
+                base_rate = Decimal("0")
+            effective_rate = base_rate * regional_mult * fx_multiplier
+            if not effective_rate.is_finite() or effective_rate < 0:
+                effective_rate = Decimal("0")
+
         # Build resource list from assembly components.
         # Trust the new ``resource_type`` column; only fall back to
         # description heuristics for legacy rows that the v2940
@@ -1131,9 +1453,12 @@ class AssemblyService:
         for comp in components:
             res_type = comp.resource_type or _infer_legacy(comp.description or "")
             # The component's adjusted contribution (factor*quantity*unit_cost
-            # plus typed uplift), scaled by the assembly-level uplift.
+            # plus typed uplift), scaled by the assembly-level uplift. Issue
+            # #365 - a formula line's contribution is its total at the COMPUTED
+            # quantity (see ``comp_effective_totals`` above); a static line's is
+            # its stored total, so this is unchanged for a non-parametric line.
             try:
-                comp_total_dec = Decimal(str(comp.total or "0")) * resource_uplift
+                comp_total_dec = comp_effective_totals[str(comp.id)] * resource_uplift
             except (InvalidOperation, ValueError):
                 comp_total_dec = Decimal("0")
             if not comp_total_dec.is_finite():
@@ -1144,7 +1469,10 @@ class AssemblyService:
             # unit_rate so that quantity*unit_rate == comp_total. When the
             # quantity is zero (lump-sum row) collapse to quantity=1 so the
             # product still carries the full contribution rather than 0.
-            comp_qty = _str_to_float(comp.quantity)
+            # Issue #365 - a formula line uses its parameter-computed quantity
+            # here instead of the static one; a static line is unchanged.
+            comp_qty_override = computed_quantities.get(str(comp.id))
+            comp_qty = float(comp_qty_override) if comp_qty_override is not None else _str_to_float(comp.quantity)
             if comp_qty > 0:
                 res_quantity = comp_qty
                 res_unit_rate = comp_total / comp_qty
@@ -1210,6 +1538,11 @@ class AssemblyService:
                 # non-blocking ``currency_mismatch`` flag (Issue #128).
                 **({"currency_converted": currency_converted} if currency_converted else {}),
                 **({"currency_mismatch": currency_warning} if currency_warning else {}),
+                # Issue #365 provenance - the parameter definitions and the
+                # input values used to expand this position (present only for a
+                # parametric assembly / when values were supplied).
+                **({"parameters": assembly_parameters} if assembly_parameters else {}),
+                **({"parameter_values": parameter_values} if parameter_values else {}),
             },
         )
 
@@ -1278,6 +1611,8 @@ class AssemblyService:
             currency=source.currency,
             bid_factor=source.bid_factor,
             regional_factors=(dict(source.regional_factors) if source.regional_factors else {}),
+            # Issue #365 - a cloned parametric recipe stays parametric.
+            parameters=(list(source.parameters) if source.parameters else []),
             is_template=source.is_template,
             project_id=data.project_id if data.project_id else source.project_id,
             owner_id=uuid.UUID(owner_id) if owner_id else source.owner_id,
@@ -1296,6 +1631,7 @@ class AssemblyService:
                 resource_type=comp.resource_type,
                 factor=comp.factor,
                 quantity=comp.quantity,
+                quantity_formula=comp.quantity_formula,
                 unit=comp.unit,
                 unit_cost=comp.unit_cost,
                 total=comp.total,
@@ -1551,6 +1887,9 @@ class AssemblyService:
                     "resource_type": comp.resource_type,
                     "factor": _str_to_float(comp.factor),
                     "quantity": _str_to_float(comp.quantity),
+                    # Issue #365 - carry the per-component formula so the
+                    # export/import round-trip keeps a parametric recipe intact.
+                    "quantity_formula": comp.quantity_formula,
                     "unit": comp.unit,
                     "unit_cost": _str_to_float(comp.unit_cost),
                     "sort_order": comp.sort_order,
@@ -1568,6 +1907,8 @@ class AssemblyService:
             "currency": assembly.currency,
             "bid_factor": _str_to_float(assembly.bid_factor),
             "regional_factors": assembly.regional_factors or {},
+            # Issue #365 - the parameter definitions travel with the recipe.
+            "parameters": list(assembly.parameters) if assembly.parameters else [],
             "tags": tags,
             "components": export_components,
         }
@@ -1609,18 +1950,35 @@ class AssemblyService:
             res_type = str(res_type_raw).lower() if isinstance(res_type_raw, str) and res_type_raw else None
             comp_meta = comp_data.get("metadata") if isinstance(comp_data.get("metadata"), dict) else {}
             sort_raw = comp_data.get("sort_order", idx)
+            # Issue #365 - carry the per-component quantity formula (empty -> NULL).
+            qf_raw = comp_data.get("quantity_formula")
+            quantity_formula = str(qf_raw).strip() if isinstance(qf_raw, str) and qf_raw.strip() else None
             parsed_components.append(
                 {
                     "description": str(comp_data.get("description", "") or ""),
                     "resource_type": res_type,
                     "factor": factor_dec,
                     "quantity": quantity_dec,
+                    "quantity_formula": quantity_formula,
                     "unit_cost": unit_cost_dec,
                     "unit": str(comp_data.get("unit", data.unit) or data.unit),
                     "metadata": comp_meta,
                     "sort_order": sort_raw if isinstance(sort_raw, int) else idx,
                 }
             )
+
+        # Issue #365 - validate the imported parameter graph + component
+        # formulas before creating any row, so a malformed parametric recipe is
+        # a clean 422 rather than a half-written assembly.
+        import_parameters = list(data.parameters or [])
+        _raise_param_errors(
+            _validate_parametric(
+                import_parameters,
+                component_formulas=[
+                    (pc["description"] or "component", pc["quantity_formula"]) for pc in parsed_components
+                ],
+            )
+        )
 
         # Ensure unique code
         code = data.code
@@ -1647,6 +2005,7 @@ class AssemblyService:
             currency=data.currency,
             bid_factor=str(data.bid_factor),
             regional_factors=data.regional_factors,
+            parameters=import_parameters,
             is_template=True,
             owner_id=uuid.UUID(owner_id) if owner_id else None,
             metadata_=metadata,
@@ -1669,6 +2028,7 @@ class AssemblyService:
                     resource_type=pc["resource_type"],
                     factor=str(pc["factor"]),
                     quantity=str(pc["quantity"]),
+                    quantity_formula=pc["quantity_formula"],
                     unit=pc["unit"],
                     unit_cost=str(pc["unit_cost"]),
                     total=total,

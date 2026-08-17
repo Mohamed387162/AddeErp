@@ -12,6 +12,8 @@ Usage:
 import sys
 from pathlib import Path
 
+from PyInstaller.utils.hooks import collect_submodules
+
 block_cipher = None
 
 # Paths
@@ -78,6 +80,17 @@ hidden_imports = [
     "lazrs",  # laspy's LAZ/COPC decompression backend (dynamic import)
     "pypdf",  # PDF stamping / merge (pdf_stamp, property_dev exports)
 ]
+
+# The CWICR vector-store client, in the lock since the [semantic-clients] extra
+# landed. It is imported inside a function body (qdrant_adapter._get_client) so
+# the static graph never sees it, and naming the top-level package alone is not
+# enough: the submodules the code reaches for are themselves lazy
+# (qdrant_client.http.models, qdrant_client.local for the embedded on-disk
+# store). collect_submodules walks the whole package so the frozen sidecar
+# carries the same client the wheel does. Without this the lock would ship the
+# wheel into the build and PyInstaller would drop it again, leaving the desktop
+# channel on the broken behaviour the extra just fixed.
+hidden_imports += collect_submodules("qdrant_client")
 
 # Auto-discover modules
 if modules_dir.is_dir():
@@ -154,6 +167,39 @@ a = Analysis(
 
 pyz = PYZ(a.pure, cipher=block_cipher)
 
+# Ad-hoc sign every Mach-O collected into the archive, not only the executable
+# wrapped around it. macOS only; PyInstaller ignores the option elsewhere, and
+# naming it unconditionally would be a lie about what the build does on Windows.
+#
+# An ad-hoc signature carries no Team ID, so two ad-hoc binaries can never
+# mismatch. The binaries collected into the archive are a different matter: the
+# Python framework installed by the build machine is signed by whoever built
+# that Python, and PyInstaller packs it verbatim. At launch the onefile
+# bootloader extracts the archive to a temporary directory and dlopens the
+# framework from there, and dyld compares the two signatures:
+#
+#   code signature in '.../_MEIxxxxxx/Python.framework/Versions/3.12/Python'
+#   not valid for use in process: mapping process and mapped file
+#   (non-platform) have different Team IDs
+#
+# The process is ad-hoc with no Team ID, the framework has a real one, and the
+# load is refused. The app reaches "Starting the application server" and stops
+# there, on a machine that is otherwise fine. Reported against 14.4.0 on macOS
+# 26, Apple Silicon, by a user who had already cleared Gatekeeper by hand.
+#
+# The fix is to make the payload's identity match the process's rather than to
+# grant the process permission to ignore the mismatch. That needs no
+# entitlement and no hardened runtime, so Entitlements.plist stays out of this
+# and the ad-hoc rule in docs/desktop/MACOS_NOTARIZATION.md still holds: on the
+# ad-hoc path, sign with "-" and no timestamp.
+#
+# This is also a prerequisite for notarization rather than a stopgap. The notary
+# service sees a onefile sidecar as one Mach-O and never inspects the archive
+# appended to it, so a notarized build made without this would sign the wrapper,
+# pass review and still fail to start, with the mismatch now against a real Team
+# ID instead of none.
+codesign_identity = "-" if sys.platform == "darwin" else None
+
 # Build a SINGLE self-contained executable (onefile), not a onedir folder.
 # Tauri ships the sidecar as an externalBin, which must be one standalone file;
 # a onedir build (exe + a separate _internal/ folder) cannot be used that way,
@@ -180,6 +226,6 @@ exe = EXE(
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,
-    codesign_identity=None,
+    codesign_identity=codesign_identity,
     entitlements_file=None,
 )

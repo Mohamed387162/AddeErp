@@ -21,6 +21,8 @@ import re
 from pathlib import Path
 from typing import Any
 
+from app.modules.dwg_takeoff.extents import extents_from_stored_entities
+
 logger = logging.getLogger(__name__)
 
 # ACI (AutoCAD Color Index) → hex color
@@ -126,6 +128,98 @@ def _safe_float(val: Any) -> float | None:
         return float(val)
     except (ValueError, TypeError):
         return None
+
+
+# Block-table record names the DWG object model reserves for the model and
+# the sheets. Everything else in ``BlockId`` is a block definition or an owner
+# we do not recognise.
+_LAYOUT_BLOCK_PREFIXES = ("*model_space", "*paper_space")
+
+
+def _is_layout_block_id(block_id: str) -> bool:
+    """True when a DWG ``BlockId`` names a layout rather than a block definition.
+
+    ``*Model_Space`` and ``*Paper_Space``/``*Paper_Space0``/``*Paper_Space1``
+    are what AutoCAD calls the block-table records behind the model and each
+    sheet. Case is normalised because exporter builds disagree about it.
+    """
+    lowered = block_id.strip().lower()
+    return any(lowered.startswith(prefix) for prefix in _LAYOUT_BLOCK_PREFIXES)
+
+
+def _is_model_space_block_id(block_id: str) -> bool:
+    """True when a DWG ``BlockId`` names model space specifically."""
+    return block_id.strip().lower() == "*model_space"
+
+
+def _is_anonymous_block_id(block_id: str) -> bool:
+    """True when a ``BlockId`` names a block-table record AutoCAD wrote itself.
+
+    AutoCAD reserves the ``*`` prefix for records it creates without being
+    asked: ``*D`` per dimension, ``*X`` per hatch, ``*U`` for an unnamed
+    group. Callers must rule out the layouts first - they are ``*`` names too.
+    """
+    return block_id.strip().startswith("*")
+
+
+def _owner_is_block_definition(
+    block_id: str,
+    referenced_blocks: set[str],
+    block_table: dict[str, bool] | None = None,
+) -> bool:
+    """Decide whether a row's owner is a block definition rather than a sheet.
+
+    ``BlockId`` carries the owning block-table record, and in the DWG object
+    model that is ``*Model_Space``, ``*Paper_Space*`` **and one entry per block
+    definition**. Filing all three as layouts is what put every door and window
+    block in the sheet picker as if it were a drawable sheet.
+
+    The export answers this itself when it can. Its ``<AcDbBlockTableRecord>``
+    rows are the drawing's block table, and each carries a ``Layout`` flag that
+    is true for exactly the records AutoCAD built a sheet around. On a real
+    17 MB export 809 records came through with ``Layout`` true for two of them,
+    ``*Model_Space`` and ``*Paper_Space``, and false for the other 807. Nothing
+    needs guessing when that table is present.
+
+    The three heuristics below are for exports that carry no block table, and
+    they run in order. A ``*`` name that is not a layout is one of AutoCAD's own
+    anonymous records and is never a sheet. Otherwise the evidence has to be
+    positive: a name some block reference actually places is a block
+    definition, whatever it happens to be called. That last test holds whether
+    the export writes block names or numeric object ids in ``BlockId``; a real
+    DwgExporter build was since confirmed to write names, with 577 of the 579
+    referenced names appearing there as owners.
+
+    The reference test alone was not enough, which is why the other two exist.
+    A dimension owns its ``*D`` record implicitly rather than placing it
+    through an ``<AcDbBlockReference>`` row, and an unplaced definition is
+    referenced by nothing at all, so both were offered as sheets: one real
+    export listed 1108 of them against a single drawing.
+
+    Anything every test leaves undecided is treated as a sheet. That is the
+    conservative direction: misfiling a sheet as a block hides its geometry
+    entirely, while misfiling a block as a sheet only puts back the spurious
+    entry this function exists to remove.
+
+    Args:
+        block_id: The row's ``BlockId`` cell.
+        referenced_blocks: Names placed by an ``<AcDbBlockReference>`` row.
+        block_table: Record name → whether that record is a layout, read from
+            the export's own block table. Empty or ``None`` when the export
+            carries no such rows.
+
+    Returns:
+        True when the owner is a block definition.
+    """
+    if block_table:
+        is_layout = block_table.get(block_id)
+        if is_layout is not None:
+            return not is_layout
+    if _is_layout_block_id(block_id):
+        return False
+    if _is_anonymous_block_id(block_id):
+        return True
+    return block_id in referenced_blocks
 
 
 # Threshold (in raw drawing units) above which a drawing is almost
@@ -411,10 +505,22 @@ def parse_ddc_dwg_excel(excel_path: str | Path) -> dict[str, Any]:
                 )
                 text_style_fonts[style_name] = str(font or "").strip()
 
-    # ── Pass 2: collect polyline parents ───────────────────────────────
+    # ── Pass 2: collect polyline parents + the blocks a reference places ──
     polyline_meta: dict[str, dict] = {}  # ID → {layer, color, closed, ...}
+    # Every block definition some AcDbBlockReference actually places. Pass 4
+    # uses this to tell a block definition from a sheet - see
+    # ``_owner_is_block_definition`` for why the evidence has to be positive.
+    referenced_blocks: set[str] = set()
+    # The export's own block table: name → whether that record is a layout.
+    # This is the authoritative answer to "block definition or sheet?", and
+    # the heuristics only run for exports that carry no such rows.
+    block_table: dict[str, bool] = {}
     for row in all_rows[1:]:
         desc = str(get(row, "Description") or "")
+        if desc == "<AcDbBlockTableRecord>":
+            name = str(get(row, "Name") or "").strip()
+            if name:
+                block_table[name] = str(get(row, "Layout") or "").strip().lower() == "true"
         if desc == "<AcDbPolyline>":
             eid = str(get(row, "ID") or "")
             layer = str(get(row, "Layer") or "0")
@@ -425,6 +531,19 @@ def parse_ddc_dwg_excel(excel_path: str | Path) -> dict[str, Any]:
                 "color_index": ci,
                 "closed": closed,
             }
+        elif desc == "<AcDbBlockReference>":
+            placed = get(row, "BlockTableRecord") or get(row, "Name")
+            if placed:
+                referenced_blocks.add(str(placed))
+
+    # A block table that flags nothing as a layout is not a block table we can
+    # read - either the build writes no ``Layout`` column or it spells the flag
+    # some way this does not recognise. Trusting it then would classify every
+    # owner in the drawing as a block definition and leave no sheet at all, so
+    # it is dropped and the heuristics decide instead. A real drawing always
+    # has model space.
+    if not any(block_table.values()):
+        block_table = {}
 
     # ── Pass 3: collect vertices grouped by ParentID ──────────────────
     #
@@ -446,6 +565,10 @@ def parse_ddc_dwg_excel(excel_path: str | Path) -> dict[str, Any]:
     # are reconstructed as the next vertex's Start. Closed polylines
     # are handled by ``polyline_meta[eid].closed`` downstream.
     polyline_vertices: dict[str, list[tuple[float, float]]] = {}
+    # Each polyline's terminal End Point, taken on the way past. The post-pass
+    # below used to recover this by re-reading the whole export once per
+    # polyline, which is the whole of the "conversion never finishes" defect.
+    polyline_terminal_ends: dict[str, tuple[float, float]] = {}
     for row in all_rows[1:]:
         desc = str(get(row, "Description") or "")
         if desc != "<AcDbVertex>":
@@ -462,29 +585,31 @@ def parse_ddc_dwg_excel(excel_path: str | Path) -> dict[str, Any]:
         coord = sp or pt or ep
         if coord is None:
             continue
+        # Last vertex row of this polyline that carries an End Point wins,
+        # which is what the re-scan below used to compute. A row carrying an
+        # End Point always reaches this line: ``coord`` falls back to that
+        # same value, so the guard above can never skip it.
+        if ep is not None:
+            polyline_terminal_ends[parent_id] = ep
         bucket = polyline_vertices.setdefault(parent_id, [])
         # Skip immediate duplicates here too - defence in depth for
         # exporters that occasionally emit zero-length segments.
         if not bucket or bucket[-1] != coord:
             bucket.append(coord)
-    # Post-pass: if a polyline's last vertex carried a distinct End
-    # Point AND the polyline is NOT closed, append the End Point of the
-    # last vertex row so the open-polyline tail isn't lost. We re-scan
-    # to find each polyline's terminal vertex row and consult its End
-    # Point column. This preserves the previous code's "also add end
-    # point" behaviour for the tail vertex of an open polyline without
-    # duplicating every interior vertex.
+    # Post-pass: if a polyline's last vertex carried a distinct End Point,
+    # append it so the open-polyline tail isn't lost. Note this also appends
+    # to closed polylines; the tail is not conditioned on
+    # ``polyline_meta[eid]["closed"]`` and never has been.
+    #
+    # This used to re-scan every row of the export once per polyline to find
+    # that value, which is O(polylines x rows). Measured on this shape of
+    # data, doubling the export roughly quadrupled the time this loop spent,
+    # and on a real 22 MB architectural drawing it runs for over an hour, in
+    # the one phase of the DWG pipeline that has no timeout on it, behind a
+    # progress card that cannot say which phase it is in. The value was
+    # already in hand during the collection pass above, so take it there.
     for parent_id, verts in polyline_vertices.items():
-        terminal_end: tuple[float, float] | None = None
-        for row in all_rows[1:]:
-            desc = str(get(row, "Description") or "")
-            if desc != "<AcDbVertex>":
-                continue
-            if str(get(row, "ParentID") or "") != parent_id:
-                continue
-            ep = _parse_coord(get(row, "End Point"))
-            if ep is not None:
-                terminal_end = ep
+        terminal_end = polyline_terminal_ends.get(parent_id)
         if terminal_end and (not verts or verts[-1] != terminal_end):
             verts.append(terminal_end)
 
@@ -494,8 +619,18 @@ def parse_ddc_dwg_excel(excel_path: str | Path) -> dict[str, Any]:
     min_x = min_y = float("inf")
     max_x = max_y = float("-inf")
 
+    # Only model-space geometry sets the drawing's extents. Paper space is a
+    # sheet in millimetres wrapped around a model authored in whatever the
+    # model is authored in, and a block definition sits around its own origin;
+    # both used to be unioned in, so an A3 title block made a 10-unit drawing
+    # report 420x297 - a box nobody is ever shown and the box the unit
+    # inference below reads. Rebound per row, read by ``expand``.
+    row_sets_extents = True
+
     def expand(x: float, y: float) -> None:
         nonlocal min_x, min_y, max_x, max_y
+        if not row_sets_extents:
+            return
         min_x = min(min_x, x)
         min_y = min(min_y, y)
         max_x = max(max_x, x)
@@ -506,6 +641,8 @@ def parse_ddc_dwg_excel(excel_path: str | Path) -> dict[str, Any]:
         layer = str(get(row, "Layer") or "0")
         ci = get(row, "Color Index")
         block_id = str(get(row, "BlockId") or "*Model_Space")
+        owner_is_block = _owner_is_block_definition(block_id, referenced_blocks, block_table)
+        row_sets_extents = not owner_is_block and _is_model_space_block_id(block_id)
         # Resolve color: entity CI, or layer color
         if ci is not None and str(ci) != "256":
             color = _aci_to_hex(ci)
@@ -749,7 +886,15 @@ def parse_ddc_dwg_excel(excel_path: str | Path) -> dict[str, Any]:
             pos = _parse_coord(get(row, "Position") or get(row, "Text Position"))
             text = str(get(row, "Text String") or get(row, "TextString") or "")
             height = _safe_float(get(row, "Height") or get(row, "TextHeight")) or 2.5
-            rotation = _safe_float(get(row, "Rotation")) or 0.0
+            # ``_parse_angle``, not ``_safe_float``. The export writes an angle
+            # either as a bare number already in radians or with a ``d`` suffix
+            # meaning degrees, which is why the ARC branch above reads its start
+            # and end angles through that helper. ``float("90.0d")`` raises, so
+            # ``_safe_float`` returned None and ``or 0.0`` turned every rotated
+            # label upright without saying anything. A bare number that reached
+            # the viewer unconverted was fed straight to ``ctx.rotate``, which
+            # takes radians, so 90 arrived as 90 radians.
+            rotation = _parse_angle(get(row, "Rotation"))
             style_name = str(
                 get(row, "Style Name")
                 or get(row, "StyleName")
@@ -785,7 +930,8 @@ def parse_ddc_dwg_excel(excel_path: str | Path) -> dict[str, Any]:
             text = re.sub(r"\\[A-Za-z][^;]*;", "", text)
             text = re.sub(r"[{}]", "", text).strip()
             height = _safe_float(get(row, "TextHeight") or get(row, "ActualHeight") or get(row, "Actual Height")) or 2.5
-            rotation = _safe_float(get(row, "Rotation")) or 0.0
+            # Radians on the wire, see the TEXT branch above.
+            rotation = _parse_angle(get(row, "Rotation"))
             style_name = str(
                 get(row, "Style Name")
                 or get(row, "StyleName")
@@ -817,7 +963,10 @@ def parse_ddc_dwg_excel(excel_path: str | Path) -> dict[str, Any]:
         elif desc == "<AcDbBlockReference>":
             pos = _parse_coord(get(row, "Position"))
             block_name = str(get(row, "BlockTableRecord") or get(row, "Name") or "block")
-            rotation = _safe_float(get(row, "Rotation")) or 0.0
+            # Radians on the wire, see the TEXT branch above. This one places a
+            # whole block definition, so a dropped rotation turns every door and
+            # window in the drawing to face the same way.
+            rotation = _parse_angle(get(row, "Rotation"))
             scale_str = get(row, "ScaleFactors") or get(row, "Scale Factors")
             x_scale = y_scale = 1.0
             if scale_str:
@@ -886,15 +1035,63 @@ def parse_ddc_dwg_excel(excel_path: str | Path) -> dict[str, Any]:
                 if layer in layers_map:
                     layers_map[layer]["entity_count"] += 1
 
-        # Tag newly added entities with their layout (BlockId)
+        # Tag newly added entities with their owner. A sheet gets ``layout``,
+        # a block definition gets ``block`` - never both. The viewer's sheet
+        # filter then drops definition members from every sheet without
+        # needing to know what a block is, and they are drawn only where an
+        # INSERT places them.
         for ent in entities[entity_count_before:]:
-            ent["layout"] = block_id
-            layout_set.add(block_id)
+            if owner_is_block:
+                ent["block"] = block_id
+            else:
+                ent["layout"] = block_id
+                layout_set.add(block_id)
+
+    # Nothing classified as a sheet while entities exist means the
+    # classification misread this export. Put everything back on model space
+    # rather than serve a drawing whose sheet picker is empty, which renders as
+    # a blank canvas - strictly worse than the phantom sheets we are removing.
+    if entities and not layout_set:
+        logger.warning(
+            "DDC DWG: no layout survived block classification over %d entities; filing all under *Model_Space",
+            len(entities),
+        )
+        for ent in entities:
+            ent.pop("block", None)
+            ent["layout"] = "*Model_Space"
+        layout_set.add("*Model_Space")
+        min_x = float("inf")
 
     # Fallback extents
     if min_x == float("inf"):
-        min_x = min_y = 0.0
-        max_x = max_y = 1000.0
+        # No model-space geometry contributed - either the drawing really is
+        # all paper space, or this export names its model space something we
+        # do not recognise. Take the box over everything that is not
+        # block-local, which is wrong about coordinate system but right about
+        # magnitude, and magnitude is what the unit inference reads.
+        recovered = extents_from_stored_entities(entities)
+        if recovered is None:
+            min_x = min_y = 0.0
+            max_x = max_y = 1000.0
+        else:
+            min_x, min_y = recovered["min_x"], recovered["min_y"]
+            max_x, max_y = recovered["max_x"], recovered["max_y"]
+
+    # A layer's count describes what toggling that layer off would remove, and
+    # toggling removes no block-definition member: those are governed by the
+    # INSERT that places them, not by their own authoring layer, which is
+    # usually "0" rather than the layer the INSERT sits on. Recomputed once
+    # here rather than gated at each of the twelve increment sites above, so
+    # the rule is written in one place - and so this path agrees with the DXF
+    # one, which is the whole point of the block/sheet split.
+    for info in layers_map.values():
+        info["entity_count"] = 0
+    for ent in entities:
+        if ent.get("block"):
+            continue
+        info = layers_map.get(ent["layer"])
+        if info is not None:
+            info["entity_count"] += 1
 
     layers = sorted(layers_map.values(), key=lambda layer: layer["name"])
     logger.info(

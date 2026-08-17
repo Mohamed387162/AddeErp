@@ -63,8 +63,7 @@ def _dec(x: Any) -> Decimal:
     return d
 
 
-# Founder principle: "Все позиции мы делаем с ресурсами" - every BOQ position
-# must carry a resource buildup. The flagship positions ship raw CWICR
+# Founding principle: every BOQ position we ship carries a resource buildup. The flagship positions ship raw CWICR
 # components in flagship.json, but those sum to whatever the source catalogue
 # row cost, not to the position's converted unit_rate. The BOQ resource
 # contract (boq/service.py) treats every leaf's ``unit_rate`` as a PER-UNIT
@@ -278,9 +277,9 @@ def _flagship_template(spec: dict) -> Any:
     # A couple of plausible bidders so the tendering module and the firm-derived
     # records (subcontract RFIs, NCRs, submittals) have companies to cite.
     tender_companies = [
-        ("Summit Residential Builders", "estimating@summitresidential.example", 1.00),
-        ("Front Range Construction", "bids@frontrangeconstruction.example", 1.04),
-        ("Mile High General Contractors", "tenders@milehighgc.example", 0.97),
+        ("Ovendell Residential Builders", "estimating@ovendellresidential.example", 1.00),
+        ("Wardenholt Construction", "bids@wardenholtconstruction.example", 1.04),
+        ("Quarrowdale General Contractors", "tenders@quarrowdalegc.example", 0.97),
     ]
 
     return DemoTemplate(
@@ -304,7 +303,7 @@ def _flagship_template(spec: dict) -> Any:
             "client": "Riverside Drive Holdings",
             "architect": "Denver Design Studio",
             "structural_engineer": "Rocky Mountain Structures",
-            "main_contractor": "Summit Residential Builders",
+            "main_contractor": "Ovendell Residential Builders",
         },
         address=template_addr,
     )
@@ -676,6 +675,10 @@ async def install_flagship(
         # parses out of the box via ezdxf. The helper falls back to a
         # metadata-only row if ezdxf is unavailable; the backend then reports
         # "needs_conversion" so the UI shows a convert CTA, still never a spinner.
+        #
+        # Nothing is copied off ``m`` but the name and the discipline. Its
+        # element count belongs to the converted drawing behind the spec, not
+        # to the DXF authored at seed time, and the seeder counts that one.
         if is_non_3d_format(m.get("model_format")):
             from app.scripts.seed_dwg_drawing import seed_ready_dwg_drawing
 
@@ -687,7 +690,6 @@ async def install_flagship(
                 name=m["name"],
                 discipline=m.get("discipline"),
                 source="flagship_seed",
-                element_count=m.get("element_count", 0),
             )
             dwg_count += 1
             continue

@@ -37,6 +37,7 @@ import { useToastStore } from '@/stores/useToastStore';
 import { useAuthStore } from '@/stores/useAuthStore';
 import { useProjectContextStore } from '@/stores/useProjectContextStore';
 import { apiGet, apiPost, extractErrorMessageFromBody, triggerDownload } from '@/shared/lib/api';
+import { fetchAllPages } from '@/shared/lib/apiHelpers';
 import { projectsApi, type Project } from '@/features/projects/api';
 import { boqApi } from '@/features/boq/api';
 import { scheduleApi } from '@/features/schedule/api';
@@ -442,9 +443,9 @@ async function downloadScheduleReport(
   projectName: string,
   t: TFunc,
 ): Promise<void> {
-  let schedules: Awaited<ReturnType<typeof scheduleApi.listSchedules>>;
+  let schedules: Awaited<ReturnType<typeof scheduleApi.listSchedules>>['items'];
   try {
-    schedules = await scheduleApi.listSchedules(projectId);
+    schedules = (await scheduleApi.listSchedules(projectId)).items;
   } catch {
     throw new Error(
       t('reports.err_no_schedule', {
@@ -744,16 +745,34 @@ async function downloadRiskRegisterReport(
   projectName: string,
   t: TFunc,
 ): Promise<void> {
-  let risks: Array<{
+  type RiskRow = {
     id: string; code: string; title: string; description: string;
     probability: number; impact_cost: number; impact_severity: string;
     risk_score: number; status: string; owner_name: string | null;
     mitigation_plan: string | null; created_at: string;
-  }>;
-  try {
-    risks = await apiGet(`/v1/risk/?project_id=${projectId}&limit=100`);
-  } catch {
-    risks = [];
+  };
+
+  // Read every page, and let a failure reach the caller.
+  //
+  // The route caps `limit` at 100, so one request is a page rather than the
+  // register. The header rows below state Total Risks and Total Exposure, and a
+  // short read turned both into confident wrong numbers inside a file the
+  // reader treats as the official record. Swallowing the error was worse again:
+  // it produced a clean-looking report asserting zero risks and zero exposure.
+  // The caller already converts a throw into a "failed to generate" toast.
+  const { items: risks, truncated, ceiling } = await fetchAllPages<RiskRow>((offset, limit) =>
+    apiGet<RiskRow[]>(`/v1/risk/?project_id=${projectId}&limit=${limit}&offset=${offset}`),
+  );
+
+  // Refuse rather than ship a register that is quietly missing rows. The
+  // ceiling is a memory guard set far above any real register, so reaching it
+  // means something is wrong; either way, a partial export of a document people
+  // treat as the record is the failure this whole change exists to prevent.
+  // Throwing surfaces it as a toast carrying this message.
+  if (truncated) {
+    throw new Error(
+      `The risk register exceeds the ${ceiling} row export ceiling, so this report would be incomplete.`,
+    );
   }
 
   const csvLines: string[] = [];
@@ -898,7 +917,7 @@ async function downloadProgressReport(
 
   // Schedule section
   try {
-    const schedules = await scheduleApi.listSchedules(projectId);
+    const { items: schedules } = await scheduleApi.listSchedules(projectId);
     htmlParts.push(`<h2>${esc(t('reports.html_schedule_status', { defaultValue: 'Schedule Status' }))}</h2>`);
     for (const sched of schedules) {
       try {
@@ -1427,7 +1446,8 @@ export function ReportsPage() {
               if (sections.includes('schedule')) {
                 htmlParts.push(`<h2>${esc(t('reports.section_schedule', { defaultValue: 'Schedule Summary' }))}</h2>`);
                 try {
-                  const schedules = await scheduleApi.listSchedules(selectedProjectId);
+                  const { items: schedules } =
+                    await scheduleApi.listSchedules(selectedProjectId);
                   if (schedules.length === 0) {
                     htmlParts.push(`<p>${esc(t('reports.html_no_schedules', { defaultValue: 'No schedules found.' }))}</p>`);
                   }

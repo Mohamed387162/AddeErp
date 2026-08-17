@@ -38,6 +38,7 @@ import {
   DismissibleInfo,
   IntroRichText,
   ModuleGuideButton,
+  CollapsibleSection,
 } from '@/shared/ui';
 import { MoneyDisplay } from '@/shared/ui/MoneyDisplay';
 import { DateDisplay } from '@/shared/ui/DateDisplay';
@@ -82,6 +83,9 @@ import { TypeFormModal } from './modals/TypeFormModal';
 import { EquipmentHealthDashboard } from './components/EquipmentHealthDashboard';
 import { FleetOptimizationPanel } from './components/FleetOptimizationPanel';
 import { equipmentGuide } from './equipmentGuide';
+import { InsightsPanel, InsightsToggleButton, useModuleInsights } from '@/features/insights';
+import { buildEquipmentInsights } from './equipmentInsights';
+import { fmtPercent } from '@/shared/lib/formatters';
 
 type DrawerTab =
   | 'utilization'
@@ -200,12 +204,12 @@ function HowEquipmentWorks() {
   ];
 
   return (
-    <Card padding="md">
-      <h2 className="flex items-center gap-1.5 text-sm font-semibold text-content-primary">
-        <Network size={15} className="text-oe-blue" />
-        {t('equipment.flow_title', { defaultValue: 'How the fleet fits together' })}
-      </h2>
-      <p className="mt-1 text-xs text-content-tertiary">
+    <CollapsibleSection
+      storageKey="equipment.how"
+      icon={<Network size={15} className="text-oe-blue" />}
+      title={t('equipment.flow_title', { defaultValue: 'How the fleet fits together' })}
+    >
+      <p className="text-xs text-content-tertiary">
         {t('equipment.flow_intro', {
           defaultValue:
             'The register keeps every machine safe, serviced and costed. Only active plant with a valid inspection can be assigned to a crew.',
@@ -261,7 +265,7 @@ function HowEquipmentWorks() {
           </ModLink>
         </span>
       </div>
-    </Card>
+    </CollapsibleSection>
   );
 }
 
@@ -326,6 +330,15 @@ export function EquipmentPage() {
     );
   }, [eqQ.data, search]);
 
+  // Module Insights - reads the loaded fleet register (charts, KPIs). Kept
+  // among the top hooks, above every conditional render, so hook order is
+  // stable no matter which tab or drawer is open.
+  const insights = useModuleInsights('equipment', { defaultOpen: true });
+  const { datasets: insightDatasets, builtins: insightBuiltins } = useMemo(
+    () => buildEquipmentInsights(eqQ.data ?? [], fleetCurrency || '', t),
+    [eqQ.data, fleetCurrency, t],
+  );
+
   return (
     <div className="space-y-5">
       <Breadcrumb
@@ -344,6 +357,7 @@ export function EquipmentPage() {
         })}
         actions={
           <>
+            <InsightsToggleButton open={insights.open} onClick={insights.toggle} />
             {/* "How it works" guide - explains the fleet register, telemetry,
                 maintenance and certification flow. Sits at the head of the
                 action cluster; its closing CTA opens the New Asset form. */}
@@ -361,6 +375,18 @@ export function EquipmentPage() {
             </Button>
           </>
         }
+      />
+
+      <InsightsPanel
+        open={insights.open}
+        title={t('equipment.insights.title', { defaultValue: 'Fleet insights' })}
+        datasets={insightDatasets}
+        builtins={insightBuiltins}
+        custom={insights.custom}
+        onAdd={insights.addCustom}
+        onUpdate={insights.updateCustom}
+        onRemove={insights.removeCustom}
+        onCollapse={() => insights.setOpen(false)}
       />
 
       <DismissibleInfo
@@ -1178,7 +1204,7 @@ function UtilizationTab({
               })}
             </p>
             <p className="mt-1 text-lg font-semibold tabular-nums">
-              {dashboard.utilization_pct.toFixed(0)}%
+              {fmtPercent(dashboard.utilization_pct, 0)}
             </p>
           </Card>
           <Card padding="sm">
@@ -1298,7 +1324,7 @@ function UtilizationTab({
                   </td>
                   <td className="px-3 py-2 text-right tabular-nums">
                     {r.fuel_level !== null && r.fuel_level !== undefined
-                      ? `${toNum(r.fuel_level).toFixed(0)}%`
+                      ? fmtPercent(toNum(r.fuel_level), 0)
                       : '—'}
                   </td>
                   <td className="px-3 py-2 text-content-secondary">

@@ -63,9 +63,9 @@ import re
 import tempfile
 import uuid
 import zipfile
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from datetime import UTC, datetime
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -87,6 +87,7 @@ from fastapi import (
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from app.core.content_disposition import attachment_disposition
 from app.core.csv_safety import neutralise_formula
 from app.core.file_signature import detect as detect_signature
 from app.core.i18n import get_locale
@@ -106,6 +107,13 @@ from app.modules.boq.copilot_schemas import (
     CopilotChatRequest,
     CopilotChatResponse,
     CopilotMessageOut,
+)
+from app.modules.boq.roundtrip import (
+    ID_COLUMN_ALIASES,
+    ID_COLUMN_HEADER,
+    RoundTripRow,
+    diff_import_rows,
+    normalise_id,
 )
 from app.modules.boq.schemas import (
     ActivityLogList,
@@ -1659,6 +1667,12 @@ async def create_budget_from_boq(
             if isinstance(row.metadata_, dict) and row.metadata_.get("boq_id") == str(boq_id)
         }
 
+        # ProjectBudget.currency_code has no DB default - the model requires
+        # the writer to supply it from the project context. Omitting it here
+        # wrote budget lines with "", which reach the finance table as
+        # em-dashes instead of money. Best-effort resolver, "" on failure.
+        currency_code = await service._resolve_project_currency(boq_id)  # noqa: SLF001
+
         for group_key, total_amount in groups.items():
             if group_key in existing_group_keys:
                 skipped_existing += 1
@@ -1667,6 +1681,7 @@ async def create_budget_from_boq(
                 project_id=boq.project_id,
                 wbs_id=group_key if group_key != "ungrouped" else None,
                 category="other",
+                currency_code=currency_code,
                 original_budget=str(total_amount),
                 revised_budget=str(total_amount),
                 metadata_={"source": "boq", "boq_id": str(boq_id)},
@@ -2913,6 +2928,46 @@ async def restore_snapshot(
 # ── Validation ────────────────────────────────────────────────────────────────
 
 
+async def _unreviewed_proposal_meta(
+    session: SessionDep,
+    project_id: uuid.UUID,
+    rule_sets: list[str],
+) -> dict[str, int]:
+    """Count takeoff rows still awaiting review, for the validation report.
+
+    A proposal is a suggestion, not a measurement, so it is deliberately kept
+    out of priced quantities. That exclusion is correct and silent, which is
+    the problem: a BOQ total can be short of what the drawings show with
+    nothing on the report to explain the difference.
+    ``ai_takeoff.unreviewed_proposals`` says so, but only if it is handed a
+    count.
+
+    Nothing is counted when ``rule_sets`` does not reach that rule. A project
+    that configures its own sets and leaves out the one the rule belongs to
+    has opted out of the warning, and a count nobody reads is a query per
+    validation for nothing. The registry is asked the same question the engine
+    asks, so this stays true if the rule is ever filed elsewhere.
+
+    Returns an empty dict when the count cannot be taken. The rule reads an
+    absent key as "no claim" rather than as zero, so a failed query stays
+    quiet instead of certifying a review queue nobody has looked at.
+    """
+    from app.core.validation.engine import rule_registry
+    from app.core.validation.rules import UNREVIEWED_PROPOSALS_META_KEY, TakeoffUnreviewedProposalsRule
+    from app.modules.takeoff.repository import MeasurementRepository
+
+    wanted = TakeoffUnreviewedProposalsRule.rule_id
+    if not any(rule.rule_id == wanted and rule.enabled for rule in rule_registry.get_rules_for_sets(rule_sets)):
+        return {}
+
+    try:
+        pending = await MeasurementRepository(session).count_unreviewed_for_project(project_id)
+    except Exception as exc:  # noqa: BLE001 - a missing count must not cost the whole report
+        logger.warning("BOQ validation could not count unreviewed takeoff proposals: %s", exc)
+        return {}
+    return {UNREVIEWED_PROPOSALS_META_KEY: pending}
+
+
 def _build_rule_sets(
     project_rule_sets: list[str],
     classification_standard: str,
@@ -3088,7 +3143,10 @@ async def _run_import_validation(
             project_id=str(boq_data.project_id),
             region=project.region,
             standard=project.classification_standard,
-            metadata={"locale": get_locale()},
+            metadata={
+                "locale": get_locale(),
+                **await _unreviewed_proposal_meta(session, boq_data.project_id, rule_sets),
+            },
         )
 
         summary = report.summary()
@@ -3243,7 +3301,10 @@ async def validate_boq(
         project_id=str(boq_data.project_id),
         region=project.region,
         standard=project.classification_standard,
-        metadata={"locale": get_locale()},
+        metadata={
+            "locale": get_locale(),
+            **await _unreviewed_proposal_meta(session, boq_data.project_id, rule_sets),
+        },
     )
 
     # Build response: summary + full results
@@ -3827,14 +3888,13 @@ async def export_boq_csv(
     content = output.getvalue()
     output.close()
 
-    safe_name = structured.name.encode("ascii", errors="replace").decode("ascii").replace('"', "'")
-    filename = f"{safe_name}.csv"
+    filename = f"{structured.name}.csv"
 
     return StreamingResponse(
         iter([content]),
         media_type="text/csv; charset=utf-8",
         headers={
-            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Content-Disposition": attachment_disposition(filename),
         },
     )
 
@@ -3920,10 +3980,17 @@ async def export_boq_excel(
         "WBS",
         "CAD Element IDs",
         "Metadata JSON",
+        # Round-trip identity (GitHub #360). The stable position UUID. Kept
+        # as the last standard column so the human-facing layout above is
+        # unchanged; greyed on every data row to signal "do not edit". On
+        # re-import a row carrying an id that belongs to THIS BOQ updates that
+        # position in place instead of duplicating it.
+        ID_COLUMN_HEADER,
     ]
     custom_headers = [c.get("display_name", c.get("name", "")) for c in custom_columns]
     headers = standard_headers + custom_headers
     n_standard = len(standard_headers)
+    id_col = n_standard  # 1-based column index of the "Position ID" column
 
     # ── Reusable styles ──────────────────────────────────────────────────
     bold_font = Font(bold=True)
@@ -3996,6 +4063,9 @@ async def export_boq_excel(
             desc_cell = ws.cell(row=current_row, column=2, value=neutralise_formula(pos.description))
             desc_cell.font = section_font
             desc_cell.fill = gray_fill
+            # Round-trip identity: sections carry their id too so a renamed
+            # section updates in place instead of duplicating (GitHub #360).
+            ws.cell(row=current_row, column=id_col, value=str(pos.id))
             current_row += 1
             continue
 
@@ -4072,6 +4142,13 @@ async def export_boq_excel(
             column=14,
             value=neutralise_formula(_json.dumps(pos_meta_raw, ensure_ascii=False) if pos_meta_raw else ""),
         )
+        # ── Round-trip identity (GitHub #360) ────────────────────────────
+        # The stable position UUID. A plain UUID string can never start with
+        # a formula-trigger char, so it needs no neutralisation. Greyed to
+        # signal "do not edit" - a re-import matches on this to update the
+        # position in place rather than creating a duplicate.
+        id_cell = ws.cell(row=current_row, column=id_col, value=str(pos.id))
+        id_cell.fill = light_gray_fill
 
         # ── Custom column values ─────────────────────────────────────────
         # Custom-column text values are user-controlled and must be
@@ -4222,14 +4299,13 @@ async def export_boq_excel(
     wb.save(buffer)
     buffer.seek(0)
 
-    safe_name = boq_data.name.encode("ascii", errors="replace").decode("ascii").replace('"', "'")
-    filename = f"{safe_name}.xlsx"
+    filename = f"{boq_data.name}.xlsx"
 
     return StreamingResponse(
         buffer,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={
-            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Content-Disposition": attachment_disposition(filename),
         },
     )
 
@@ -4347,8 +4423,7 @@ async def export_boq_pdf(
             "invalid data. Please try exporting as Excel or CSV instead.",
         )
 
-    safe_name = boq_data.name.encode("ascii", errors="replace").decode("ascii").replace('"', "'")
-    filename = f"{safe_name}.pdf"
+    filename = f"{boq_data.name}.pdf"
 
     def _iter_pdf_chunks() -> Iterator[bytes]:
         """Yield PDF bytes in chunks to enable true streaming."""
@@ -4362,7 +4437,7 @@ async def export_boq_pdf(
         _iter_pdf_chunks(),
         media_type="application/pdf",
         headers={
-            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Content-Disposition": attachment_disposition(filename),
             "Content-Length": str(len(pdf_bytes)),
         },
     )
@@ -4376,7 +4451,7 @@ async def export_boq_pdf(
 )
 @router.get(
     "/boqs/{boq_id}/export/gaeb/",
-    summary="Export BOQ as GAEB XML 3.3 (X83 default, ?format=x84 for Nebenangebot)",
+    summary="Export BOQ as GAEB XML 3.3 (X83 Angebotsaufforderung default, ?format=x84 for Angebotsabgabe)",
     dependencies=[Depends(RequirePermission("boq.read"))],
 )
 async def export_boq_gaeb(
@@ -4392,10 +4467,20 @@ async def export_boq_gaeb(
         "x83",
         alias="format",
         description=(
-            "GAEB DA phase to emit. ``x83`` = Angebotsabgabe (main bid, DP 83). "
-            "``x84`` = Nebenangebot (alternate bid, DP 84) - adds per-position "
-            "BoQBkUp / BoQBkUpRef alternate markers and an Award/Recommendation "
-            "element listing positions flagged as recommended."
+            "GAEB DA phase to emit. ``x83`` = Angebotsaufforderung (call for "
+            "bids, DP 83, unpriced). ``x84`` = Angebotsabgabe (bid "
+            "submission, DP 84, priced). An X84 is a plain Hauptangebot "
+            "unless ``bid_type=alternate`` is also passed."
+        ),
+    ),
+    bid_type: Literal["main", "alternate"] = Query(
+        "main",
+        description=(
+            "X84 only. ``main`` (default) writes a plain Hauptangebot. "
+            "``alternate`` marks the bid as a Nebenangebot: positions "
+            "carrying ``alt_parent_ref`` / ``alt_markup_reason`` metadata "
+            "get their rationale written as a schema-valid ``BidComm`` "
+            "(Bieter Kommentar). Ignored for X83."
         ),
     ),
 ) -> StreamingResponse:
@@ -4410,7 +4495,9 @@ async def export_boq_gaeb(
     - **DP 83 - Angebotsaufforderung / Request for bid** (default,
       ``?format=x83``). A priced LV is valid in DP 83 (the Einheitspreis is
       optional in the schema, so carrying it does not break conformance).
-    - **DP 84 - Angebotsabgabe / Bid submission** (``?format=x84``).
+    - **DP 84 - Angebotsabgabe / Bid submission** (``?format=x84``). A plain
+      Hauptangebot by default; ``bid_type=alternate`` additionally writes the
+      Nebenangebot rationale of flagged positions as ``BidComm`` elements.
 
     Money: each ``Item`` carries ``UP`` (Einheitspreis, 3 dp) and ``IT``
     (Gesamtbetrag, 2 dp) reconstructed so a consumer recomputing ``Qty x UP``
@@ -4443,17 +4530,82 @@ async def export_boq_gaeb(
         project_name=project_name,
         project_currency=project_currency,
         gaeb_format=gaeb_format,
+        bid_type=bid_type,
     )
 
-    safe_name = boq_data.name.encode("ascii", errors="replace").decode("ascii").replace('"', "'")
     ext = "X84" if gaeb_format == "x84" else "X83"
-    filename = f"{safe_name}.{ext}"
+    filename = f"{boq_data.name}.{ext}"
 
     return StreamingResponse(
         iter([xml_content]),
         media_type="application/xml; charset=utf-8",
         headers={
-            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Content-Disposition": attachment_disposition(filename),
+        },
+    )
+
+
+@router.get(
+    "/boqs/{boq_id}/export/bc3",
+    summary="Export BOQ as FIEBDC-3 / BC3 (no-slash alias)",
+    dependencies=[Depends(RequirePermission("boq.read"))],
+    include_in_schema=False,
+)
+@router.get(
+    "/boqs/{boq_id}/export/bc3/",
+    summary="Export BOQ as a FIEBDC-3 (BC3) budget - Spain / LATAM interchange",
+    dependencies=[Depends(RequirePermission("boq.read"))],
+)
+async def export_boq_bc3(
+    boq_id: uuid.UUID,
+    _user_id: CurrentUserId,
+    payload: CurrentUserPayload,
+    session: SessionDep,
+    service: BOQService = Depends(_get_service),
+) -> StreamingResponse:
+    """Export the BOQ as a FIEBDC-3 (BC3) budget file.
+
+    FIEBDC-3 is the standard construction-budget interchange format across
+    Spain and Hispanophone LATAM (mandated by AENOR for Spanish public
+    tenders). The file carries the full chapter / partida hierarchy with
+    codes, units, quantities, unit rates and long texts, and re-imports
+    losslessly through our own BC3 parser. Overhead / profit / VAT are left
+    to the receiving tool's coefficient settings, the FIEBDC convention.
+
+    The build is delegated to the pure, unit-tested ``build_bc3`` builder.
+    Encoding is CP1252 when the document fits it (widest desktop-tool
+    compatibility) and UTF-8 otherwise, declared honestly in the ``~V``
+    record; the ``Content-Type`` charset matches.
+    """
+    from app.config import get_settings
+    from app.modules.boq.exporters.bc3 import build_bc3
+    from app.modules.projects.repository import ProjectRepository
+
+    # IDOR guard: scope the export to the project owner/member, matching every
+    # other BOQ read endpoint.
+    await _verify_boq_owner(session, boq_id, _user_id, payload)
+    boq_data = await service.get_boq_structured(boq_id)
+
+    # Load project for label text + currency.
+    project_repo = ProjectRepository(session)
+    project = await project_repo.get_by_id(boq_data.project_id)
+    project_name = project.name if project else "OpenConstructionERP Project"
+    project_currency = (project.currency or "").strip()[:3].upper() if project else ""
+
+    data, http_charset = build_bc3(
+        boq_data,
+        project_name=project_name,
+        project_currency=project_currency,
+        program_version=getattr(get_settings(), "app_version", "") or "",
+    )
+
+    filename = f"{boq_data.name}.bc3"
+
+    return StreamingResponse(
+        iter([data]),
+        media_type=f"text/plain; charset={http_charset}",
+        headers={
+            "Content-Disposition": attachment_disposition(filename),
         },
     )
 
@@ -4464,14 +4616,21 @@ def build_gaeb_xml(
     project_name: str,
     project_currency: str,
     gaeb_format: str,
+    bid_type: str = "main",
 ) -> str:
     """Build a schema-valid GAEB DA XML 3.3 document string.
 
     Pure function (no I/O) so it is unit-testable against the official GAEB
     XSD without booting the app. ``boq_data`` is a ``BOQWithSections`` (or any
     object exposing ``name``, ``sections``, ``positions``, ``markups``,
-    ``direct_cost`` and ``net_total``). ``gaeb_format`` is ``"x83"`` or
-    ``"x84"``.
+    ``direct_cost`` and ``net_total``). ``gaeb_format`` is ``"x83"``
+    (Angebotsaufforderung, unpriced) or ``"x84"`` (Angebotsabgabe, priced).
+
+    ``bid_type`` applies to X84 only: ``"main"`` (default) emits a plain
+    Hauptangebot; ``"alternate"`` marks the bid as a Nebenangebot - positions
+    flagged with ``alt_parent_ref`` / ``alt_markup_reason`` metadata get their
+    rationale written as a ``BidComm`` (Bieter Kommentar), the schema element
+    the X84 Item provides for bidder-side remarks.
     """
     import xml.etree.ElementTree as ET
     from datetime import date
@@ -4804,31 +4963,29 @@ def build_gaeb_xml(
             return mapped
         return unit.strip()
 
-    # ── X84 alternate-bid rationale ────────────────────────────────────────
+    # ── X84 Nebenangebot (alternate-bid) rationale ─────────────────────────
     # The GAEB 3.3 schema has no <BoQBkUp>/<Recommendation> elements - the
     # previous code invented them, which fails XSD validation and silently
-    # drops the data on any conformant re-import. For an X84 alternate we
-    # instead fold the rationale into the (schema-valid) long text as an
-    # extra paragraph, so the information survives a round-trip in a real
-    # GAEB field rather than an invented one.
-    def _description_with_alt(pos: Any) -> str:
-        base = str(getattr(pos, "description", "") or "")
-        if gaeb_format != "x84":
-            return base
+    # drops the data on any conformant re-import. A plain X84 is a
+    # Hauptangebot (Angebotsabgabe per GAEB DA84) and carries NO alternate
+    # markers; only an explicit ``bid_type="alternate"`` writes the rationale
+    # of flagged positions, as a schema-valid <BidComm> (Bieter Kommentar) -
+    # the element the X84 Item provides for bidder-side remarks, so the
+    # information survives a round-trip in a real GAEB field.
+    is_alternate_bid = is_priced and bid_type == "alternate"
+
+    def _alt_rationale_lines(pos: Any) -> list[str]:
         meta = getattr(pos, "metadata", None) or {}
-        reason = ""
-        parent_ref = ""
-        if isinstance(meta, dict):
-            reason = str(meta.get("alt_markup_reason") or "").strip()
-            parent_ref = str(meta.get("alt_parent_ref") or "").strip()
-        extra: list[str] = []
+        if not isinstance(meta, dict):
+            return []
+        reason = str(meta.get("alt_markup_reason") or "").strip()
+        parent_ref = str(meta.get("alt_parent_ref") or "").strip()
+        lines: list[str] = []
         if parent_ref:
-            extra.append(f"Nebenangebot zu Position {parent_ref}")
+            lines.append(f"Nebenangebot zu Position {parent_ref}")
         if reason:
-            extra.append(reason)
-        if extra:
-            return "\n".join([base, *extra]) if base else "\n".join(extra)
-        return base
+            lines.append(reason)
+        return lines
 
     def _emit_item(parent_list: ET.Element, pos: Any, parent_ordinal: str) -> None:
         """Write one schema-valid ``Item`` into an ``Itemlist``.
@@ -4856,7 +5013,12 @@ def build_gaeb_xml(
             ET.SubElement(item, "IT").text = it_s
         else:
             ET.SubElement(item, "QU").text = _gaeb_unit(pos.unit)[:4]
-        _set_description(item, _description_with_alt(pos))
+        _set_description(item, str(getattr(pos, "description", "") or ""))
+        # Schema order: BidComm follows Description in the X84 Item.
+        if is_alternate_bid:
+            rationale = _alt_rationale_lines(pos)
+            if rationale:
+                _set_ml_text(item, "BidComm", "\n".join(rationale))
 
     def _emit_markup_item(parent_list: ET.Element, m: Any, idx: int, base: Decimal) -> None:
         """Write one priced ``MarkupItem`` (Zuschlagsposition) into an Itemlist.
@@ -5018,6 +5180,9 @@ logger = logging.getLogger(__name__)
 
 # Column name aliases for flexible matching (all lowercased for comparison)
 _COLUMN_ALIASES: dict[str, list[str]] = {
+    # Round-trip identity (GitHub #360) - matched first so an exported
+    # "Position ID" header maps here, never to ``ordinal``.
+    "position_id": sorted(ID_COLUMN_ALIASES),
     "ordinal": ["pos", "pos.", "position", "ordinal", "nr.", "nr", "no.", "no", "#"],
     "description": [
         "description",
@@ -5284,6 +5449,255 @@ def _parse_rows_from_excel(
     return rows, import_metadata
 
 
+# ── Round-trip apply (GitHub #360) ────────────────────────────────────────────
+#
+# Shared by every spreadsheet import path (legacy /import/excel/ and the
+# /import/auto/ dispatcher). The pure create/update/delete DECISION lives in
+# ``app.modules.boq.roundtrip.diff_import_rows``; the helpers below only turn
+# a validated row dict into a service call and enforce the safety rules:
+#
+#   * a row updates an existing position ONLY when its id belongs to THIS BOQ
+#     (the id universe is built solely from ``get_boq_with_positions(boq_id)``);
+#   * an update touches ONLY the human-facing columns the flat sheet faithfully
+#     round-trips (description / unit / ordinal / quantity / unit_rate) and
+#     preserves classification, metadata (resources / variants / custom fields),
+#     parent_id and sort_order - so a re-import can never silently corrupt them;
+#   * missing positions are deleted ONLY when the caller opts in.
+
+
+def _dec4(value: Any) -> Decimal | None:
+    """Quantise a numeric-ish value to 4 dp (the storage precision) so a
+    re-imported cell compares equal to the stored value; ``None`` if it
+    cannot be parsed."""
+    try:
+        return Decimal(str(value).strip() or "0").quantize(Decimal("0.0001"))
+    except (InvalidOperation, ValueError, ArithmeticError):
+        return None
+
+
+def _prepared_row_to_create(
+    boq_id: uuid.UUID,
+    pr: Mapping[str, Any],
+    parent_id: uuid.UUID | None = None,
+) -> PositionCreate:
+    """Map a validated round-trip row to a ``PositionCreate`` (new position).
+
+    ``parent_id`` carries the section link resolved by the create loop -
+    without it every imported row landed flat (parent NULL), so an imported
+    GAEB LV kept its section rows but they had zero children and every real
+    item fell into the ungrouped bucket.
+    """
+    return PositionCreate(
+        boq_id=boq_id,
+        parent_id=parent_id,
+        ordinal=pr["ordinal"],
+        description=pr.get("description", "") or "",
+        unit=pr["unit"],
+        quantity=float(pr.get("quantity", 0.0) or 0.0),
+        unit_rate=Decimal(str(pr.get("unit_rate", 0) or 0)),
+        classification=pr.get("classification") or {},
+        source=pr.get("source", "excel_import"),
+        metadata=dict(pr.get("metadata") or {}),
+    )
+
+
+# Sentinel distinguishing "row carries no section signal at all" (flat Excel /
+# BC3 sheets) from "row explicitly says it is top-level" (a GAEB item outside
+# any BoQCtgy carries ``gaeb_section: ""``).
+_NO_SECTION_SIGNAL: Any = object()
+
+
+def _resolve_import_parent(
+    pr: Mapping[str, Any],
+    section_id_by_ordinal: Mapping[str, uuid.UUID],
+    last_section_id: uuid.UUID | None,
+) -> uuid.UUID | None:
+    """Pick the parent for a freshly imported row from the sections before it.
+
+    Importers emit hierarchy top-down (a section row precedes its children),
+    so by the time a row is created every ancestor it can name already has an
+    id. Three rules, most explicit first:
+
+    * a SECTION nests under the deepest previously created section whose
+      dotted ordinal is a proper prefix of its own ("01.02" under "01");
+      no such ancestor means top-level;
+    * an ITEM that names its enclosing section (the GAEB importer stamps
+      ``gaeb_section`` into metadata/classification) attaches to that
+      section's row; an explicitly empty name means top-level;
+    * an ITEM with no signal at all (flat Excel / BC3 sheets) attaches to
+      the nearest section row above it - exactly how the sheet reads. With
+      no section rows in the upload this stays ``None``, so flat imports
+      keep their historic behaviour.
+    """
+    if pr.get("is_section"):
+        parts = [p for p in str(pr.get("ordinal") or "").strip().split(".") if p]
+        for cut in range(len(parts) - 1, 0, -1):
+            parent = section_id_by_ordinal.get(".".join(parts[:cut]))
+            if parent is not None:
+                return parent
+        return None
+
+    meta = pr.get("metadata") or {}
+    cls = pr.get("classification") or {}
+    explicit = meta.get("gaeb_section", cls.get("gaeb_section", _NO_SECTION_SIGNAL))
+    if explicit is not _NO_SECTION_SIGNAL:
+        key = str(explicit or "").strip()
+        return section_id_by_ordinal.get(key) if key else None
+    return last_section_id
+
+
+def _prepared_row_to_update(pr: Mapping[str, Any], stored: Any) -> PositionUpdate | None:
+    """Build a partial update carrying ONLY the changed human-facing fields.
+
+    Returns ``None`` when nothing the sheet carries actually changed, so a
+    re-import of an unedited export is idempotent (no version bump / audit
+    noise). Classification, metadata, parent_id and sort_order are never
+    written here - the flat sheet does not round-trip them losslessly, so
+    preserving the stored values is the only safe choice.
+    """
+    changed: dict[str, Any] = {}
+
+    new_desc = (pr.get("description") or "").strip()
+    if stored is None or new_desc != ((getattr(stored, "description", "") or "").strip()):
+        changed["description"] = new_desc
+
+    new_unit = (pr.get("unit") or "").strip()
+    if new_unit and (stored is None or new_unit.lower() != (getattr(stored, "unit", "") or "").strip().lower()):
+        changed["unit"] = new_unit
+
+    new_ordinal = (pr.get("ordinal") or "").strip()
+    if new_ordinal and (stored is None or new_ordinal != ((getattr(stored, "ordinal", "") or "").strip())):
+        changed["ordinal"] = new_ordinal
+
+    new_qty = _dec4(pr.get("quantity", 0.0))
+    if new_qty is not None and (stored is None or new_qty != _dec4(getattr(stored, "quantity", 0))):
+        changed["quantity"] = float(new_qty)
+
+    new_rate = _dec4(pr.get("unit_rate", 0))
+    if new_rate is not None and (stored is None or new_rate != _dec4(getattr(stored, "unit_rate", 0))):
+        changed["unit_rate"] = Decimal(str(new_rate))
+
+    if not changed:
+        return None
+    return PositionUpdate(**changed)
+
+
+async def _apply_boq_roundtrip(
+    boq_id: uuid.UUID,
+    prepared_rows: list[dict[str, Any]],
+    *,
+    service: BOQService,
+    delete_missing: bool = False,
+    actor_id: uuid.UUID | None = None,
+) -> dict[str, Any]:
+    """Apply validated import rows to a BOQ using the round-trip differ.
+
+    ``prepared_rows`` items are dicts with keys ``row_index``,
+    ``position_id`` (raw id cell or ``None``), ``ordinal``, ``description``,
+    ``unit``, ``quantity`` (float), ``unit_rate`` (float), ``classification``
+    (dict), ``metadata`` (dict) and ``source``.
+
+    Returns a summary dict: ``created``, ``updated``, ``unchanged``,
+    ``deleted``, ``would_delete``, ``round_trip``, ``problems`` and
+    ``apply_errors``.
+    """
+    # The id universe is scoped to THIS BOQ only - the structural guarantee
+    # that a foreign id can never be honoured as an update.
+    existing = await service.get_boq_with_positions(boq_id)
+    stored_by_id: dict[str, Any] = {str(p.id): p for p in existing.positions}
+
+    rt_rows = [
+        RoundTripRow(
+            row_index=int(pr.get("row_index", 0) or 0),
+            position_id=pr.get("position_id"),
+            payload=pr,
+        )
+        for pr in prepared_rows
+    ]
+    # Round-trip is "active" only when the sheet actually carries at least one
+    # Position ID. This gate is a safety floor: without it, a delete_missing
+    # request against a sheet that has NO id column would treat EVERY existing
+    # position as "missing" and wipe the BOQ. Deletes (and the would_delete
+    # report) therefore require a genuine round-trip - a plain no-id append can
+    # never remove anything.
+    round_trip = any(normalise_id(pr.get("position_id")) for pr in prepared_rows)
+    effective_delete = delete_missing and round_trip
+    plan = diff_import_rows(rt_rows, stored_by_id.keys(), delete_missing=effective_delete)
+
+    apply_errors: list[dict[str, Any]] = []
+    created = 0
+    updated = 0
+    unchanged = 0
+    deleted = 0
+
+    # Deletes first: frees any ordinal a following rename / insert wants to
+    # reuse. Sections with children raise 409 (cascade off) - caught + skipped
+    # so an opt-in delete never silently orphans a still-present child.
+    for pid in plan.deletes:
+        try:
+            await service.delete_position(uuid.UUID(pid))
+            deleted += 1
+        except HTTPException as exc:
+            apply_errors.append({"position_id": pid, "error": f"delete skipped: {exc.detail}"})
+        except Exception as exc:  # noqa: BLE001 - never abort a partial import
+            apply_errors.append({"position_id": pid, "error": f"delete skipped: {exc}"})
+
+    for action in plan.updates:
+        pid = action.position_id or ""
+        stored = stored_by_id.get(pid)
+        try:
+            update = _prepared_row_to_update(action.row.payload, stored)
+            if update is None:
+                unchanged += 1
+                continue
+            await service.update_position(uuid.UUID(pid), update, actor_id=actor_id)
+            updated += 1
+        except HTTPException as exc:
+            apply_errors.append({"row": action.row.row_index, "position_id": pid, "error": str(exc.detail)})
+        except Exception as exc:  # noqa: BLE001 - surface, never abort
+            apply_errors.append({"row": action.row.row_index, "position_id": pid, "error": str(exc)})
+
+    # Section identity threading: ``plan.creates`` preserves document order
+    # and importers emit a section row before its children, so each created
+    # section is remembered by ordinal and every following row can resolve
+    # its parent (see ``_resolve_import_parent``). Without this the entire
+    # imported hierarchy flattened to parent_id NULL.
+    section_id_by_ordinal: dict[str, uuid.UUID] = {}
+    last_section_id: uuid.UUID | None = None
+
+    for action in plan.creates:
+        row_payload = action.row.payload
+        parent_id = _resolve_import_parent(row_payload, section_id_by_ordinal, last_section_id)
+        try:
+            created_row = await service.add_position(_prepared_row_to_create(boq_id, row_payload, parent_id=parent_id))
+            created += 1
+            if row_payload.get("is_section"):
+                created_id = getattr(created_row, "id", None)
+                if created_id is not None:
+                    ordinal_key = str(row_payload.get("ordinal") or "").strip()
+                    if ordinal_key:
+                        section_id_by_ordinal[ordinal_key] = created_id
+                    last_section_id = created_id
+        except HTTPException as exc:
+            apply_errors.append({"row": action.row.row_index, "error": str(exc.detail)})
+        except Exception as exc:  # noqa: BLE001 - surface, never abort
+            apply_errors.append({"row": action.row.row_index, "error": str(exc)})
+
+    return {
+        "created": created,
+        "updated": updated,
+        "unchanged": unchanged,
+        "deleted": deleted,
+        # Only meaningful for a genuine round-trip; a no-id append reports 0
+        # (its existing positions are not "missing", there is just no identity
+        # column to diff them against).
+        "would_delete": len(plan.would_delete) if round_trip else 0,
+        "round_trip": round_trip,
+        "problems": plan.problems,
+        "apply_errors": apply_errors,
+    }
+
+
 @router.post(
     "/boqs/{boq_id}/import/excel/",
     summary="Import positions from Excel/CSV (deprecated - use /import/auto/)",
@@ -5297,8 +5711,17 @@ async def import_boq_excel(
     session: SessionDep,
     file: UploadFile = File(..., description="Excel (.xlsx) or CSV (.csv) file"),
     service: BOQService = Depends(_get_service),
+    delete_missing: bool = Query(
+        False,
+        description=(
+            "Round-trip delete (GitHub #360). When true, positions that "
+            "currently exist in the BOQ but are absent from the uploaded "
+            "sheet are DELETED. Off by default - the response always reports "
+            "how many WOULD be deleted so nothing is ever removed silently."
+        ),
+    ),
 ) -> dict[str, Any]:
-    """Import BOQ positions from an Excel or CSV file.
+    """Import BOQ positions from an Excel or CSV file (round-trip aware).
 
     .. deprecated::
         Epic I5 - clients should call ``POST /import/auto/`` and let
@@ -5309,6 +5732,9 @@ async def import_boq_excel(
     Accepts a multipart file upload. The file must be .xlsx or .csv.
 
     Expected columns (all optional except Description):
+    - **Position ID** - the stable UUID an export stamps. A row carrying an
+      id that belongs to THIS BOQ UPDATES that position in place; a blank id
+      CREATES a new position (GitHub #360 round-trip fidelity).
     - **Pos / Position / Ordinal / Nr.** - position ordinal number
     - **Description / Beschreibung / Text** - description (required)
     - **Unit / Einheit / ME** - unit of measurement
@@ -5318,7 +5744,9 @@ async def import_boq_excel(
     - **Classification / DIN 276 / KG / NRM / Code** - classification code
 
     Returns:
-        Summary with counts of imported, skipped, and error details per row.
+        Summary with counts of created / updated / skipped / deleted (and
+        ``would_delete``), plus per-row errors, warnings and round-trip
+        problems.
     """
     # Epic I5: deprecation signal - clients should migrate to /import/auto/.
     response.headers["Deprecation"] = "true"
@@ -5412,11 +5840,13 @@ async def import_boq_excel(
             detail="No data rows found in file. Check that the first row contains column headers.",
         )
 
-    # Import each row as a Position
-    imported = 0
+    # Validate + normalise each row into a "prepared" dict; persistence is
+    # deferred to the round-trip apply step (GitHub #360) so a row carrying a
+    # known Position ID updates in place instead of duplicating.
     skipped = 0
     errors: list[dict[str, Any]] = []
     warnings_list: list[dict[str, Any]] = []
+    prepared: list[dict[str, Any]] = []
     auto_ordinal = 1
 
     # Pre-compute a robust median unit-rate across the import set so we can
@@ -5452,6 +5882,12 @@ async def import_boq_excel(
                 "gesamtsumme",
                 "subtotal",
                 "zwischensumme",
+                # Export artifacts of our own workbook - never re-import them
+                # as positions on a round-trip (GitHub #360).
+                "direct cost",
+                "cost summary",
+                "net total",
+                "gross total",
             ):
                 skipped += 1
                 continue
@@ -5460,6 +5896,9 @@ async def import_boq_excel(
             if desc_lower.startswith("subtotal:") or desc_lower.startswith("zwischensumme:"):
                 skipped += 1
                 continue
+
+            # Round-trip identity: the stable Position ID an export stamped.
+            raw_position_id = row.get("position_id")
 
             # Build ordinal: use from file or auto-generate
             ordinal = str(row.get("ordinal", "")).strip()
@@ -5514,19 +5953,21 @@ async def import_boq_excel(
                     "import_row_index": row_idx,
                     "section_header": True,
                 }
-                position_data = PositionCreate(
-                    boq_id=boq_id,
-                    ordinal=ordinal,
-                    description=description,
-                    unit="section",
-                    quantity=0.0,
-                    unit_rate=0.0,
-                    classification={},
-                    source="excel_import",
-                    metadata=section_meta,
+                prepared.append(
+                    {
+                        "row_index": row_idx,
+                        "position_id": raw_position_id,
+                        "ordinal": ordinal,
+                        "description": description,
+                        "unit": "section",
+                        "quantity": 0.0,
+                        "unit_rate": 0.0,
+                        "classification": {},
+                        "source": "excel_import",
+                        "metadata": section_meta,
+                        "is_section": True,
+                    }
                 )
-                await service.add_position(position_data)
-                imported += 1
                 continue
 
             unit = unit_raw or "pcs"
@@ -5596,26 +6037,28 @@ async def import_boq_excel(
             if class_value:
                 classification["code"] = class_value
 
-            # Create position via service (with import metadata for round-trip)
+            # Stamp import provenance for a later round-trip export.
             pos_metadata: dict[str, Any] = {}
             if import_meta:
                 pos_metadata["import_source"] = file.filename or "excel"
                 pos_metadata["import_row_index"] = row_idx
                 pos_metadata["original_columns"] = import_meta.get("original_columns", [])
 
-            position_data = PositionCreate(
-                boq_id=boq_id,
-                ordinal=ordinal,
-                description=description,
-                unit=unit,
-                quantity=quantity,
-                unit_rate=unit_rate,
-                classification=classification,
-                source="excel_import",
-                metadata=pos_metadata,
+            prepared.append(
+                {
+                    "row_index": row_idx,
+                    "position_id": raw_position_id,
+                    "ordinal": ordinal,
+                    "description": description,
+                    "unit": unit,
+                    "quantity": quantity,
+                    "unit_rate": unit_rate,
+                    "classification": classification,
+                    "source": "excel_import",
+                    "metadata": pos_metadata,
+                    "is_section": False,
+                }
             )
-            await service.add_position(position_data)
-            imported += 1
 
         except Exception as exc:
             errors.append(
@@ -5627,8 +6070,25 @@ async def import_boq_excel(
             )
             logger.warning("Import error at row %d for BOQ %s: %s", row_idx, boq_id, exc)
 
+    # ── Round-trip apply (GitHub #360) ────────────────────────────────────
+    # Update-in-place on known ids, create on blank/unknown ids, optional
+    # delete of rows the sheet dropped. Cross-BOQ ids can never update.
+    apply_summary = await _apply_boq_roundtrip(
+        boq_id,
+        prepared,
+        service=service,
+        delete_missing=delete_missing,
+        actor_id=_user_id,
+    )
+    created = int(apply_summary["created"])
+    updated = int(apply_summary["updated"])
+    unchanged = int(apply_summary["unchanged"])
+    deleted = int(apply_summary["deleted"])
+    # DB-level apply errors join the per-row parse errors.
+    errors.extend(apply_summary["apply_errors"])
+
     # Save import metadata at BOQ level for round-trip export
-    if imported > 0 and import_meta:
+    if (created + updated) > 0 and import_meta:
         try:
             boq = await service.get_boq(boq_id)
             meta = dict(boq.metadata_) if isinstance(boq.metadata_, dict) else {}
@@ -5637,7 +6097,8 @@ async def import_boq_excel(
                 "source_format": "xlsx" if filename.endswith(".xlsx") else "csv",
                 "original_columns": import_meta.get("original_columns", []),
                 "column_mapping": import_meta.get("column_mapping", {}),
-                "total_imported": imported,
+                "total_imported": created,
+                "total_updated": updated,
                 "import_date": datetime.now(UTC).isoformat(),
             }
             boq.metadata_ = meta
@@ -5647,19 +6108,21 @@ async def import_boq_excel(
             logger.warning("Failed to save import metadata for BOQ %s", boq_id, exc_info=True)
 
     logger.info(
-        "BOQ import complete for %s: imported=%d, skipped=%d, errors=%d",
+        "BOQ import complete for %s: created=%d, updated=%d, deleted=%d, skipped=%d, errors=%d",
         boq_id,
-        imported,
+        created,
+        updated,
+        deleted,
         skipped,
         len(errors),
     )
 
-    # BUG-IMPORT02: when every parseable row failed validation (no
-    # ``imported`` rows but errors collected), surface a 400 with the
-    # first row's diagnostic so the client can show "row 2: invalid
-    # quantity" rather than a confusing 200 with imported=0. Partial
-    # successes still return 200 with the per-row error list intact.
-    if imported == 0 and errors:
+    # BUG-IMPORT02: when nothing was applied (no create / update / delete) but
+    # errors were collected, surface a 400 with the first row's diagnostic so
+    # the client shows "row 2: invalid quantity" rather than a confusing 200
+    # with imported=0. Any successful create/update/delete keeps it a 200 with
+    # the per-row error list intact.
+    if not created and not updated and not deleted and errors:
         first = errors[0]
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -5671,18 +6134,36 @@ async def import_boq_excel(
     # via the later /validate/ call (philosophy: validation is a first-
     # class citizen of the core workflow). Gated by IMPORT_INLINE_VALIDATION.
     validation_report = None
-    if imported > 0:
+    if (created + updated) > 0:
         validation_report = await _run_import_validation(boq_id, service, service.session)
 
     return {
-        "imported": imported,
+        # ``imported`` == created rows (kept for backwards compatibility).
+        "imported": created,
+        "created": created,
+        "updated": updated,
+        "unchanged": unchanged,
+        "deleted": deleted,
+        "would_delete": int(apply_summary["would_delete"]),
+        "round_trip": bool(apply_summary["round_trip"]),
         "skipped": skipped,
         "errors": errors,
         "warnings": warnings_list,
+        "problems": apply_summary["problems"],
         "total_rows": len(rows),
         "source_format": import_meta.get("source_format", "unknown") if import_meta else "unknown",
         "original_columns": import_meta.get("original_columns", []) if import_meta else [],
         "validation_report": validation_report,
+        "summary": {
+            "created": created,
+            "updated": updated,
+            "unchanged": unchanged,
+            "skipped": skipped,
+            "deleted": deleted,
+            "would_delete": int(apply_summary["would_delete"]),
+            "delete_missing": delete_missing,
+            "round_trip": bool(apply_summary["round_trip"]),
+        },
     }
 
 
@@ -5712,9 +6193,9 @@ async def import_boq_gaeb(
         response header.
 
     Supports the GAEB DA XML formats used across DACH tendering:
-      - **X83 / DP 83** - Angebotsabgabe (bid submission)
-      - **X84 / DP 84** - Nebenangebote (alternative bids)
-      - **X81** - Leistungsverzeichnis (BOQ skeleton)
+      - **X81 / DP 81** - Leistungsverzeichnis (BOQ skeleton)
+      - **X83 / DP 83** - Angebotsaufforderung (call for bids, unpriced)
+      - **X84 / DP 84** - Angebotsabgabe (priced bid submission)
 
     Namespace-agnostic parser - falls back to tag-local-name matching so
     files from different GAEB toolchains (any mainstream GAEB authoring
@@ -6058,46 +6539,49 @@ async def _persist_imported_boq(
     *,
     file_name: str,
     service: BOQService,
-) -> tuple[int, list[dict[str, Any]]]:
-    """Persist an :class:`ImportedBOQ` via the BOQService.
+    delete_missing: bool = False,
+    actor_id: uuid.UUID | None = None,
+) -> dict[str, Any]:
+    """Persist an :class:`ImportedBOQ` via the round-trip differ (GitHub #360).
 
-    Returns ``(imported_count, errors)``. Errors collected on the
-    :class:`ImportedBOQ` (per-row parser errors) are flowed through to
-    the dispatcher response unchanged; this helper appends DB-level
-    persistence errors on top.
+    A parsed row carrying a Position ID that belongs to THIS BOQ updates that
+    position in place; a blank / unknown id creates a new one; and, when
+    ``delete_missing`` is set, positions absent from the upload are deleted.
+    Every non-Excel importer leaves ``position_id`` unset, so all of its rows
+    are creates - behaviour is unchanged for GAEB / BC3.
+
+    Returns the apply summary dict (``created`` / ``updated`` / ``unchanged``
+    / ``deleted`` / ``would_delete`` / ``round_trip`` / ``problems`` /
+    ``apply_errors``).
     """
-    from decimal import Decimal
+    prepared: list[dict[str, Any]] = []
+    for idx, row in enumerate(imported.positions, start=1):
+        meta = row.metadata if isinstance(row.metadata, dict) else {}
+        prepared.append(
+            {
+                "row_index": int(meta.get("import_row_index", idx) or idx),
+                "position_id": getattr(row, "position_id", None),
+                # Blank ordinals are auto-numbered (parity with the historic
+                # persistence loop); the Excel importer already numbers them.
+                "ordinal": row.ordinal or str(idx),
+                "description": row.description,
+                "unit": row.unit,
+                "quantity": row.quantity,
+                "unit_rate": row.unit_rate,
+                "classification": row.classification,
+                "source": row.source,
+                "metadata": {**meta, "import_source": file_name},
+                "is_section": bool(getattr(row, "is_section", False)),
+            }
+        )
 
-    persistence_errors: list[dict[str, Any]] = []
-    imported_count = 0
-    for row in imported.positions:
-        try:
-            position_data = PositionCreate(
-                boq_id=boq_id,
-                ordinal=row.ordinal or str(imported_count + 1),
-                description=row.description,
-                unit=row.unit,
-                quantity=row.quantity,
-                unit_rate=Decimal(str(row.unit_rate)),
-                classification=row.classification,
-                source=row.source,
-                metadata={**row.metadata, "import_source": file_name},
-            )
-            await service.add_position(position_data)
-            imported_count += 1
-        except Exception as exc:  # noqa: BLE001 - surface row-level errors
-            persistence_errors.append(
-                {
-                    "ordinal": row.ordinal,
-                    "error": str(exc),
-                }
-            )
-            logger.warning(
-                "Auto-import row persistence error (BOQ %s, ord %s): %s",
-                boq_id,
-                row.ordinal,
-                exc,
-            )
+    summary = await _apply_boq_roundtrip(
+        boq_id,
+        prepared,
+        service=service,
+        delete_missing=delete_missing,
+        actor_id=actor_id,
+    )
 
     # Persist parsed markups (GAEB Zuschlagsposition / MarkupItem). The GAEB
     # importer surfaces them as ``metadata['markup_items']`` but they used to
@@ -6105,10 +6589,10 @@ async def _persist_imported_boq(
     # silently lost its markup and under-stated the cost. Map each one onto a
     # native BOQMarkup row so an imported BOQ carries markup exactly like a
     # natively created one (and a later GAEB export round-trips it).
-    if imported_count > 0:
-        await _persist_imported_markups(boq_id, imported, service=service, errors=persistence_errors)
+    if (summary["created"] + summary["updated"] + summary["deleted"]) > 0:
+        await _persist_imported_markups(boq_id, imported, service=service, errors=summary["apply_errors"])
 
-    return imported_count, persistence_errors
+    return summary
 
 
 async def _persist_imported_markups(
@@ -6138,7 +6622,11 @@ async def _persist_imported_markups(
         the subtotal (the unpriced X83 fallback where the file carries a
         Zuschlag percent but no ``<IT>``); clamped to the schema's 0..100 range.
       * a markup that maps to neither (no usable percentage or amount) is
-        skipped with a warning rather than persisted as a zero no-op.
+        skipped SILENTLY here: an unpriced X83 legitimately ships its
+        Zuschlagspositionen as empty placeholders the bidder prices later,
+        and the importer already surfaces every parsed markup as a parse-time
+        warning - repeating it as an import ERROR made the official
+        certification file look broken.
 
     Failures here never abort the import (positions are already committed);
     each is appended to ``errors`` so the caller surfaces it.
@@ -6215,12 +6703,10 @@ async def _persist_imported_markups(
                     },
                 )
             else:
-                errors.append(
-                    {
-                        "ordinal": ordinal,
-                        "error": "GAEB markup carried no usable percentage or amount; skipped.",
-                    }
-                )
+                # No percentage and no amount: an unpriced placeholder
+                # Zuschlagsposition (normal in an X83 Angebotsaufforderung).
+                # The importer's parse-time warning already surfaces it; an
+                # error entry here would flag a conformant file as broken.
                 continue
             await service.add_markup(boq_id, data)
         except Exception as exc:  # noqa: BLE001 - never abort an import on a markup
@@ -6252,6 +6738,15 @@ async def import_boq_auto(
     ),
     service: BOQService = Depends(_get_service),
     session: SessionDep = None,  # type: ignore[assignment]
+    delete_missing: bool = Query(
+        False,
+        description=(
+            "Round-trip delete (GitHub #360). When true and the upload is an "
+            "Excel/CSV carrying a Position ID column, positions absent from "
+            "the sheet are DELETED. Off by default; the response always "
+            "reports how many WOULD be deleted so nothing is removed silently."
+        ),
+    ),
 ) -> dict[str, Any]:
     """Auto-detect a BOQ upload's format and dispatch to the matching importer.
 
@@ -6260,6 +6755,11 @@ async def import_boq_auto(
     importer whose ``detect()`` returns ``True`` wins; its ``parse()`` is
     invoked on the full buffer and the resulting positions persisted
     via :func:`_persist_imported_boq`.
+
+    Excel/CSV uploads that carry the exported Position ID column round-trip:
+    a row whose id belongs to THIS BOQ updates that position in place
+    instead of duplicating it (a foreign id can never update across the
+    boundary). Other formats behave exactly as before (all rows created).
 
     On no match the route delegates to the existing :func:`smart_import`
     (LLM) path so legacy ``smart_import`` behaviour remains the
@@ -6349,16 +6849,22 @@ async def import_boq_auto(
             detail=f"Could not parse file as {chosen.display_name}: unexpected error.",
         ) from exc
 
-    imported_count, persistence_errors = await _persist_imported_boq(
+    apply_summary = await _persist_imported_boq(
         boq_id,
         imported_boq,
         file_name=file_name,
         service=service,
+        delete_missing=delete_missing,
+        actor_id=user_id,
     )
+    created = int(apply_summary["created"])
+    updated = int(apply_summary["updated"])
+    deleted = int(apply_summary["deleted"])
+    persistence_errors = apply_summary["apply_errors"]
 
     # Persist top-level import metadata so the round-trip exporter can
     # reproduce the original layout.
-    if imported_count > 0:
+    if (created + updated) > 0:
         try:
             boq_obj = await service.get_boq(boq_id)
             meta = dict(boq_obj.metadata_) if isinstance(boq_obj.metadata_, dict) else {}
@@ -6367,7 +6873,8 @@ async def import_boq_auto(
                 "source_format": imported_boq.source_format,
                 "format_id": chosen.format_id,
                 "currency": imported_boq.currency,
-                "total_imported": imported_count,
+                "total_imported": created,
+                "total_updated": updated,
                 "import_date": datetime.now(UTC).isoformat(),
                 **imported_boq.metadata,
             }
@@ -6384,29 +6891,49 @@ async def import_boq_auto(
     # Run inline validation using the importer's declared rule packs
     # (philosophy: validation is a first-class citizen of every import).
     validation_report = None
-    if imported_count > 0:
+    if (created + updated) > 0:
         validation_report = await _run_import_validation(boq_id, service, service.session)
 
     logger.info(
-        "Auto-import (%s) for BOQ %s: imported=%d, skipped=%d, errors=%d",
+        "Auto-import (%s) for BOQ %s: created=%d, updated=%d, deleted=%d, skipped=%d, errors=%d",
         chosen.format_id,
         boq_id,
-        imported_count,
+        created,
+        updated,
+        deleted,
         imported_boq.skipped,
         len(imported_boq.errors) + len(persistence_errors),
     )
 
     return {
-        "imported": imported_count,
+        # ``imported`` == created rows (kept for backwards compatibility).
+        "imported": created,
+        "created": created,
+        "updated": updated,
+        "unchanged": int(apply_summary["unchanged"]),
+        "deleted": deleted,
+        "would_delete": int(apply_summary["would_delete"]),
+        "round_trip": bool(apply_summary["round_trip"]),
         "skipped": imported_boq.skipped,
         "errors": imported_boq.errors + persistence_errors,
         "warnings": imported_boq.warnings,
+        "problems": apply_summary["problems"],
         "source_format": imported_boq.source_format,
         "format_id": chosen.format_id,
         "currency": imported_boq.currency,
         "validation_report": validation_report,
         "metadata": imported_boq.metadata,
         "method": "native",
+        "summary": {
+            "created": created,
+            "updated": updated,
+            "unchanged": int(apply_summary["unchanged"]),
+            "skipped": imported_boq.skipped,
+            "deleted": deleted,
+            "would_delete": int(apply_summary["would_delete"]),
+            "delete_missing": delete_missing,
+            "round_trip": bool(apply_summary["round_trip"]),
+        },
     }
 
 
@@ -6556,13 +7083,19 @@ async def _extract_from_cad(content: bytes, ext: str, filename: str) -> dict[str
         parse_cad_excel,
         summarize_cad_elements,
     )
+    from app.modules.boq.dxf_native import is_natively_readable
 
     # Resolve the converter, auto-downloading it on first use if missing.
     # Only when it genuinely cannot be provisioned (unsupported platform /
     # download failed) do we fall back to the help message + the
     # ``cad_no_converter`` flag the AI summary path branches on.
+    #
+    # Formats the platform reads in-process skip this entirely. A .dxf needs no
+    # binary, so demanding one here would answer "no converter available" for a
+    # file the next call reads without difficulty.
     try:
-        await ensure_converter_async(ext)
+        if not is_natively_readable(ext):
+            await ensure_converter_async(ext)
     except ConverterUnavailableError as exc:
         return {
             "text": (
@@ -7794,7 +8327,7 @@ async def get_position_price_analysis(
         return StreamingResponse(
             io.BytesIO(text.encode("utf-8")),
             media_type="text/markdown",
-            headers={"Content-Disposition": f'attachment; filename="price_analysis_{safe}.md"'},
+            headers={"Content-Disposition": attachment_disposition(f"price_analysis_{safe}.md")},
         )
 
     result = breakdown.to_dict()
@@ -7813,14 +8346,14 @@ def _measurement_stream(sheet: Any, fmt: str, preset: str, item_ref: str) -> Str
         return StreamingResponse(
             io.BytesIO(body.encode("utf-8")),
             media_type="text/markdown",
-            headers={"Content-Disposition": f'attachment; filename="measurement_{safe}.md"'},
+            headers={"Content-Disposition": attachment_disposition(f"measurement_{safe}.md")},
         )
     if fmt == "csv":
         body = render_csv(sheet, preset=preset)
         return StreamingResponse(
             io.BytesIO(body.encode("utf-8")),
             media_type="text/csv",
-            headers={"Content-Disposition": f'attachment; filename="measurement_{safe}.csv"'},
+            headers={"Content-Disposition": attachment_disposition(f"measurement_{safe}.csv")},
         )
     return None
 
@@ -8632,8 +9165,13 @@ class RenumberRequest(BaseModel):
     (gap-of-10 scheme, padded ordinals) so existing clients keep working.
     """
 
-    scheme: Literal["gap10", "gap100", "sequential", "dotted"] = "gap10"
+    scheme: Literal["gap10", "gap100", "sequential", "dotted", "custom"] = "gap10"
     pad: bool = True
+    # ``custom`` scheme only: the first leaf number and the increment between
+    # positions, so the user can define any numbering they want (e.g. start=100,
+    # step=5 -> 01.100, 01.105, 01.110). Ignored by the fixed schemes above.
+    start: int = 10
+    step: int = 10
 
 
 @router.post(
@@ -8662,6 +9200,8 @@ async def renumber_positions(
       good for fixed-scope BOQs that won't get extra positions later.
     * ``dotted`` - ``1, 1.1, 1.2, 1.3`` - short-form decimal numbering
       common in NRM-style measurement.
+    * ``custom`` - user-defined ``start`` and ``step`` (e.g. start=100, step=5
+      -> ``01.100, 01.105, 01.110``) so any numbering can be dialled in.
 
     The ``pad`` option controls whether top-level section numbers are
     zero-padded to two digits (``01`` vs ``1``).
@@ -8674,14 +9214,23 @@ async def renumber_positions(
 
     # Step (gap) per scheme. Sequential and dotted have step=1; gap10/gap100
     # leave room to insert.
+    is_custom = opts.scheme == "custom"
     step_per_scheme: dict[str, int] = {
         "gap10": 10,
         "gap100": 100,
         "sequential": 1,
         "dotted": 1,
+        "custom": max(1, opts.step),
     }
     step = step_per_scheme[opts.scheme]
+    custom_start = max(0, opts.start)
     use_dotted = opts.scheme == "dotted"
+
+    def _leaf_value(idx: int) -> int:
+        """Numeric value for the idx-th (1-based) leaf within its parent group."""
+        if is_custom:
+            return custom_start + (idx - 1) * step
+        return idx * step
 
     def _fmt_section(idx: int) -> str:
         if not opts.pad:
@@ -8689,7 +9238,8 @@ async def renumber_positions(
         return f"{idx:02d}"
 
     def _fmt_leaf_value(parent_ord: str, value: int) -> str:
-        if use_dotted:
+        # dotted and custom keep the raw integer; the fixed gap schemes zero-pad.
+        if use_dotted or is_custom:
             return f"{parent_ord}.{value}"
         # Width: 2 digits for gap10/sequential, 3 digits for gap100
         width = 3 if opts.scheme == "gap100" else 2
@@ -8697,7 +9247,7 @@ async def renumber_positions(
 
     def _fmt_top_leaf(value: int) -> str:
         # Top-level leaves without a parent section.
-        if use_dotted:
+        if use_dotted or is_custom:
             return str(value)
         width = 4 if opts.scheme in ("gap10", "gap100") else 2
         return f"{value:0{width}d}"
@@ -8740,13 +9290,13 @@ async def renumber_positions(
                     new_ord = _fmt_section(section_idx)
                 else:
                     leaf_idx += 1
-                    new_ord = _fmt_leaf_value(parent_ordinal or "", leaf_idx * step)
+                    new_ord = _fmt_leaf_value(parent_ordinal or "", _leaf_value(leaf_idx))
             else:
                 leaf_idx += 1
                 if parent_ordinal:
-                    new_ord = _fmt_leaf_value(parent_ordinal, leaf_idx * step)
+                    new_ord = _fmt_leaf_value(parent_ordinal, _leaf_value(leaf_idx))
                 else:
-                    new_ord = _fmt_top_leaf(leaf_idx * step)
+                    new_ord = _fmt_top_leaf(_leaf_value(leaf_idx))
             updates.append((child.id, new_ord))
             _walk(str(child.id), new_ord)
 

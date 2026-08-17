@@ -58,11 +58,11 @@ TEMPLATE = DemoTemplate(
     validation_rule_sets=["masterformat", "boq_quality"],
     boq_name="جدول الكميات - كود البناء السعودي SBC 2018 (BOQ - Saudi Building Code SBC 2018)",
     boq_description=(
-        "جدول كميات تفصيلي وفق تصنيف MasterFormat مع مراجع كود البناء السعودي. "
-        "(Detailed BOQ per MasterFormat with Saudi Building Code references.)"
+        "جدول كميات تفصيلي وفق تصنيف الأقسام مع مراجع كود البناء السعودي. "
+        "(Detailed BOQ by standard divisions with Saudi Building Code references.)"
     ),
     boq_metadata={
-        "standard": "CSI MasterFormat 2018 + SBC 2018 (SBC 201/301/304/501/601)",
+        "standard": "Division-based classification + SBC 2018 (SBC 201/301/304/501/601)",
         "phase": "Detailed Estimate (Tender Documents)",
         "base_date": "2026-Q1",
         "price_level": "Riyadh 2026 (SAR, excl. VAT)",
@@ -84,7 +84,7 @@ TEMPLATE = DemoTemplate(
                 ("02.08", "معالجة التربة ضد النمل الأبيض (Anti-termite soil treatment)", "m2", 4000, 9.50, {"masterformat": "31 31 16", "sbc": "SBC 201"}),
             ],
         ),
-        # ── 03 - Concrete (الأعمال الخرسانية) ────────────────────────────
+        # ── 03 - Cast-in-place and precast concrete work (الأعمال الخرسانية) ─
         (
             "03",
             "03 - الأعمال الخرسانية المسلحة (Concrete - SBC 304)",
@@ -117,7 +117,7 @@ TEMPLATE = DemoTemplate(
                 ("04.05", "أربطة ومثبتات البلوك المعدنية (Masonry ties & wall starters)", "m2", 33000, 6.50, {"masterformat": "04 05 23", "sbc": "SBC 201"}),
             ],
         ),
-        # ── 05 - Metals (الأعمال المعدنية) ───────────────────────────────
+        # ── 05 - Structural and miscellaneous metal work (الأعمال المعدنية) ─
         (
             "05",
             "05 - الأعمال المعدنية الإنشائية (Metals)",
@@ -145,7 +145,7 @@ TEMPLATE = DemoTemplate(
                 ("07.08", "معالجة مقاومة الحريق للفتحات (Firestopping to penetrations)", "lsum", 1, 220000.00, {"masterformat": "07 84 00", "sbc": "SBC 801"}),
             ],
         ),
-        # ── 08 - Openings: Facade / Glazing (الواجهات والزجاج) ───────────
+        # ── 08 - Facade and glazing (الواجهات والزجاج) ───────────────────
         (
             "08",
             "08 - الواجهات والزجاج بحماية شمسية (Facade & Solar-Control Glazing)",
@@ -161,7 +161,7 @@ TEMPLATE = DemoTemplate(
                 ("08.08", "أبواب معدنية للخدمات والمخازن (Hollow-metal doors, plant/stores)", "pcs", 240, 1250.00, {"masterformat": "08 11 13", "sbc": "SBC 201"}),
             ],
         ),
-        # ── 09 - Finishes (التشطيبات) ───────────────────────────────────
+        # ── 09 - Interior finishing: drywall, flooring, painting (التشطيبات) ─
         (
             "09",
             "09 - أعمال التشطيبات (Finishes)",
@@ -179,10 +179,10 @@ TEMPLATE = DemoTemplate(
                 ("09.10", "دهان أرضيات الجراج إيبوكسي (Epoxy floor coating, car park)", "m2", 14000, 58.00, {"masterformat": "09 67 00", "sbc": "SBC 201"}),
             ],
         ),
-        # ── 11/12 - Equipment & Furnishings (التجهيزات) ─────────────────
+        # ── 11/12 - Fixed equipment and furniture (التجهيزات) ───────────
         (
             "11",
-            "11 - التجهيزات الثابتة (Equipment & Furnishings)",
+            "11 - التجهيزات الثابتة (Fixed equipment and furniture)",
             {"masterformat": "11", "sbc": "SBC 201"},
             [
                 ("11.01", "مطابخ مجهزة للشقق الفندقية (Fitted kitchens, serviced apartments)", "pcs", 96, 18500.00, {"masterformat": "11 31 00", "sbc": "SBC 201"}),
@@ -219,7 +219,7 @@ TEMPLATE = DemoTemplate(
                 ("23.09", "نظام التحكم بالضغط للسلالم (Stair pressurisation system)", "pcs", 8, 145000.00, {"masterformat": "23 34 23", "sbc": "SBC 801"}),
             ],
         ),
-        # ── 22 - Plumbing (السباكة) ─────────────────────────────────────
+        # ── 22 - Piping systems and sanitary fixtures (السباكة) ─────────
         (
             "22",
             "22 - أعمال السباكة والصرف (Plumbing & Drainage)",
@@ -235,13 +235,13 @@ TEMPLATE = DemoTemplate(
                 ("22.08", "سخانات مياه شمسية للشقق (Solar water heaters, apartments)", "pcs", 48, 6800.00, {"masterformat": "22 33 36", "sbc": "SBC 601"}),
             ],
         ),
-        # ── 26 - Electrical (الكهرباء) ──────────────────────────────────
+        # ── 26 - Power distribution and lighting systems (الكهرباء) ─────
         (
             "26",
             "26 - الأعمال الكهربائية (Electrical)",
             {"masterformat": "26", "sbc": "SBC 401"},
             [
-                ("26.01", "غرفة محولات وتوصيلة الشركة السعودية للكهرباء (HV substation & SEC connection)", "lsum", 1, 3200000.00, {"masterformat": "26 11 00", "sbc": "SBC 401"}),
+                ("26.01", "غرفة محولات وتوصيلة شبكة الكهرباء المحلية (HV substation & utility connection)", "lsum", 1, 3200000.00, {"masterformat": "26 11 00", "sbc": "SBC 401"}),
                 ("26.02", "لوحة التوزيع الرئيسية للجهد المنخفض MDB (Main LV distribution board MDB)", "pcs", 3, 285000.00, {"masterformat": "26 24 13", "sbc": "SBC 401"}),
                 ("26.03", "لوحات توزيع فرعية للأدوار (Sub-distribution boards per floor)", "pcs", 64, 18500.00, {"masterformat": "26 24 16", "sbc": "SBC 401"}),
                 ("26.04", "مولد احتياطي ديزل 1500kVA (Standby diesel generator 1500kVA)", "pcs", 2, 1250000.00, {"masterformat": "26 32 13", "sbc": "SBC 401"}),
@@ -294,9 +294,9 @@ TEMPLATE = DemoTemplate(
     total_months=30,
     tender_name="حزمة الأعمال الإنشائية (Structural Works Package)",
     tender_companies=[
-        ("El Seif Engineering Contracting", "tenders@elseif.com.sa", 0.98),
-        ("Nesma & Partners Contracting", "bids@nesma.com.sa", 1.04),
-        ("Almabani General Contractors", "estimation@almabani.com.sa", 1.01),
+        ("Talveen Engineering Contracting", "tenders@talveen.example", 0.98),
+        ("Sarwaneh & Partners Contracting", "bids@sarwaneh.example", 1.04),
+        ("Wadhaan General Contractors", "estimation@wadhaan.example", 1.01),
     ],
     tender_packages=[
         (
@@ -304,9 +304,9 @@ TEMPLATE = DemoTemplate(
             "Foundations, basement parking, reinforced concrete frame and cores.",
             "evaluating",
             [
-                ("El Seif Engineering Contracting", "tenders@elseif.com.sa", 0.98),
-                ("Almabani General Contractors", "estimation@almabani.com.sa", 1.01),
-                ("Nesma & Partners Contracting", "bids@nesma.com.sa", 1.04),
+                ("Talveen Engineering Contracting", "tenders@talveen.example", 0.98),
+                ("Wadhaan General Contractors", "estimation@wadhaan.example", 1.01),
+                ("Sarwaneh & Partners Contracting", "bids@sarwaneh.example", 1.04),
             ],
         ),
         (
@@ -314,8 +314,8 @@ TEMPLATE = DemoTemplate(
             "Curtain walling, unitised facade, cladding and roofing to the mixed-use envelope.",
             "issued",
             [
-                ("Folcra Beach Industrial (KSA)", "tenders@folcra.com", 1.05),
-                ("Permasteelisa Gulf", "bids@permasteelisagroup.com", 1.08),
+                ("Sarwellan Glazing Industrial (KSA)", "tenders@sarwellan.example", 1.05),
+                ("Clanmere Facades Gulf", "bids@clanmere-gulf.example", 1.08),
             ],
         ),
         (
@@ -323,16 +323,16 @@ TEMPLATE = DemoTemplate(
             "HVAC, electrical, plumbing, vertical transportation and tenant fit-out works.",
             "draft",
             [
-                ("Drake & Scull International (KSA)", "bids@drakescull.com", 1.03),
-                ("Nesma & Partners Contracting", "bids@nesma.com.sa", 1.00),
+                ("Nakhbara International (KSA)", "bids@nakhbara.example", 1.03),
+                ("Sarwaneh & Partners Contracting", "bids@sarwaneh.example", 1.00),
             ],
         ),
     ],
     project_metadata={
         "address": "King Fahd Road, Al Olaya District, Riyadh 12214, Saudi Arabia",
-        "client": "Al Waha Real Estate Development Co.",
-        "architect": "Omrania & Associates",
-        "main_consultant": "Dar Al-Handasah (Shair & Partners)",
+        "client": "Sirhaan Real Estate Development Co.",
+        "architect": "Hadeeba & Associates",
+        "main_consultant": "Dar Al-Hadeeba (Marhoun & Partners)",
         "gfa_m2": 21500,
         "storeys": 12,
         "basement_levels": 2,

@@ -10,7 +10,7 @@ import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { RefreshCw, Layers, AlertTriangle, X } from 'lucide-react';
 import { Button, Card, Badge, Breadcrumb, DismissibleInfo, IntroRichText } from '@/shared/ui';
 import { PageHeader } from '@/shared/ui/PageHeader';
-import { apiGet, apiPost, getErrorMessage } from '@/shared/lib/api';
+import { apiGet, apiPost, getErrorMessage, type Page } from '@/shared/lib/api';
 import { useToastStore } from '@/stores/useToastStore';
 
 /* ── Types ─────────────────────────────────────────────────────────────── */
@@ -45,10 +45,21 @@ interface LevelResourcesShift {
   delta_days: number;
 }
 
+interface LevelResourcesUnresolvable {
+  activity_id: string;
+  resource: string;
+  required: number;
+  limit: number;
+}
+
 interface LevelResourcesResponse {
   schedule_id: string;
   shifts: LevelResourcesShift[];
   num_shifted: number;
+  // An activity demanding more than a ceiling on its own cannot be helped by
+  // moving it, so it never appears among the shifts. Without this list it
+  // would read as an activity that needed nothing.
+  unresolvable?: LevelResourcesUnresolvable[];
 }
 
 interface CPMViewProps {
@@ -69,7 +80,9 @@ export function CPMView({ scheduleId }: CPMViewProps) {
   const activitiesQuery = useQuery<ActivityRow[]>({
     queryKey: ['schedule', scheduleId, 'activities'],
     queryFn: () =>
-      apiGet<ActivityRow[]>(`/v1/schedule/schedules/${scheduleId}/activities/`),
+      apiGet<Page<ActivityRow>>(`/v1/schedule/schedules/${scheduleId}/activities/`).then(
+        (page) => page.items,
+      ),
     enabled: Boolean(scheduleId),
   });
 
@@ -119,8 +132,9 @@ export function CPMView({ scheduleId }: CPMViewProps) {
       ),
     onSuccess: (data) => {
       setLevelResult(data);
-      // Leveling persists shifted early-start values on the activities, so
-      // refresh the table behind the modal to reflect the new ES/float.
+      // This endpoint proposes shifts, it does not write them. The refresh is
+      // here because the CPM figures behind the modal are read from the same
+      // query and a stale table next to a fresh proposal reads as a conflict.
       void qc.invalidateQueries({ queryKey: ['schedule', scheduleId, 'activities'] });
     },
     onError: (err) => {
@@ -376,6 +390,30 @@ export function CPMView({ scheduleId }: CPMViewProps) {
                 <p className="mb-3 text-sm">
                   {t('schedule.cpm.level_result', { count: levelResult.num_shifted })}
                 </p>
+                {levelResult.unresolvable && levelResult.unresolvable.length > 0 && (
+                  <div
+                    className="mb-3 rounded border border-amber-300 bg-amber-50 px-3 py-2 text-xs text-amber-900"
+                    data-testid="level-unresolvable"
+                  >
+                    <p className="font-medium">
+                      {t('schedule.cpm.level_unresolvable', {
+                        count: levelResult.unresolvable.length,
+                      })}
+                    </p>
+                    <ul className="mt-1 space-y-0.5">
+                      {levelResult.unresolvable.map((u) => (
+                        <li key={`${u.activity_id}-${u.resource}`}>
+                          <span className="font-mono">{u.activity_id.slice(0, 8)}</span>{' '}
+                          {t('schedule.cpm.level_unresolvable_row', {
+                            resource: u.resource,
+                            required: u.required,
+                            limit: u.limit,
+                          })}
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
                 <div className="max-h-60 overflow-y-auto rounded border border-gray-200">
                   <table className="min-w-full text-xs">
                     <thead className="bg-gray-50 text-left">

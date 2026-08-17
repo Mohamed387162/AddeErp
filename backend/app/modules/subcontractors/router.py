@@ -33,7 +33,13 @@ from app.core.file_signature import (
     mime_for_signature,
 )
 from app.core.file_signature import require as require_signature
-from app.dependencies import CurrentUserId, RequirePermission, SessionDep, verify_project_access
+from app.dependencies import (
+    CurrentUserId,
+    RequirePermission,
+    SessionDep,
+    accessible_project_ids,
+    verify_project_access,
+)
 from app.modules.subcontractors.models import LienWaiver
 from app.modules.subcontractors.schemas import (
     AgreementCreate,
@@ -565,6 +571,13 @@ async def list_agreements(
     svc = SubcontractorService(session)
     if subcontractor_id is not None:
         rows = await svc.agreements.list_for_subcontractor(subcontractor_id, status=status_filter)
+        # Cross-tenant guard: a subcontractor's agreements span every project it
+        # works on, so scope the result to the projects the caller may access -
+        # otherwise a shared subcontractor leaks another tenant's commercial
+        # terms. Admins get None (unrestricted) and stay unfiltered.
+        allowed = await accessible_project_ids(session, user_id)
+        if allowed is not None:
+            rows = [r for r in rows if r.project_id in allowed]
     elif project_id is not None:
         rows = await svc.agreements.list_for_project(project_id, status=status_filter)
     else:
@@ -599,6 +612,24 @@ async def update_agreement(
     await _verify_agreement_project(agreement_id, user_id, session, svc)
     entity = await svc.update_agreement(agreement_id, data)
     return AgreementResponse.model_validate(entity)
+
+
+@router.get("/agreements/{agreement_id}/validate/")
+async def validate_agreement(
+    agreement_id: uuid.UUID,
+    session: SessionDep,
+    user_id: CurrentUserId,
+    _perm: None = Depends(RequirePermission("subcontractors.read")),
+) -> dict[str, Any]:
+    """Report what is wrong with an agreement before it is activated.
+
+    Read-only: it changes nothing and refuses nothing. Activation runs the same
+    checks and records the findings, so this endpoint is the place to look
+    first rather than the place the problem is discovered.
+    """
+    svc = SubcontractorService(session)
+    await _verify_agreement_project(agreement_id, user_id, session, svc)
+    return await svc.validate_agreement(agreement_id)
 
 
 @router.delete("/agreements/{agreement_id}", status_code=204)

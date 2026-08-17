@@ -67,8 +67,12 @@ import {
   GitCompare,
   FileStack,
   Hash,
+  FolderOpen,
 } from 'lucide-react';
-import { Badge, ConfirmDialog, DismissibleInfo, ElementInfoPopover, ModuleGuideButton, type DWGElementPayload } from '@/shared/ui';
+import { Badge, ConfirmDialog, DismissibleInfo, ElementInfoPopover, ModuleGuideButton, ProjectFilePicker, projectDocumentToFile, type DWGElementPayload } from '@/shared/ui';
+import { DWG_TAKEOFF_FORMATS } from '@/shared/lib/projectFileFormats';
+import { formatDuration } from '@/shared/lib/duration';
+import type { DocumentItem } from '@/features/documents/api';
 import { useConfirm } from '@/shared/hooks/useConfirm';
 import { useToastStore } from '@/stores/useToastStore';
 import { useProjectContextStore } from '@/stores/useProjectContextStore';
@@ -82,6 +86,7 @@ import { installBIMConverter } from '@/features/bim/api';
 import { ConverterInstallProgressBar } from '@/features/bim/ConverterInstallProgressBar';
 import { AutoInstallConverterNotice } from '@/features/bim/AutoInstallConverterNotice';
 import { useAutoInstallConverter } from '@/features/bim/useAutoInstallConverter';
+import { ElementCostMatchPanel } from '@/features/match';
 import {
   fetchDrawing,
   fetchDrawings,
@@ -113,6 +118,8 @@ import {
   type EntityContextMenuEvent,
 } from './components/DxfViewer';
 import { aggregateEntities } from './lib/group-aggregation';
+import { effectiveLayout, layoutNames, sceneEntities } from './lib/dxf-renderer';
+import { groupBlockDefinitions } from './lib/blocks';
 import { findTextMatches, type DwgTextMatch } from './lib/dwg-textsearch';
 import {
   quantifyByLayer,
@@ -155,6 +162,9 @@ import {
 import type { SnapModes } from './lib/snap';
 import { LayerPanel } from './components/LayerPanel';
 import { EntityNameFilter, entityDisplayName } from './components/EntityNameFilter';
+import { TextDisplayControl } from './components/TextDisplayControl';
+import type { TextDisplayState } from './lib/text-display-store';
+import { loadTextDisplay, saveTextDisplay } from './lib/text-display-store';
 import CreateTaskFromDwgModal from './CreateTaskFromDwgModal';
 import LinkDocumentToDwgModal from './LinkDocumentToDwgModal';
 import LinkActivityToDwgModal from './LinkActivityToDwgModal';
@@ -667,16 +677,25 @@ export function DwgTakeoffPage() {
   // ``clearProject`` wiped a stale id from localStorage), use the first
   // project from the server list. Without this, ``fetchDrawings('')``
   // short-circuits to ``[]`` and the DWG panel looks empty on every
-  // reload - reported as "при перезагрузке потеряются все документы".
+  // reload, reported as losing every document on reload.
   // The drawings themselves are always persisted server-side; only the
   // client-side project context was lost.
-  const { data: projects = [], isLoading: projectsLoading } = useQuery({
+  const {
+    data: projects = [],
+    isLoading: projectsLoading,
+    isError: projectsFailed,
+  } = useQuery({
     queryKey: ['projects'],
     queryFn: projectsApi.list,
     staleTime: 5 * 60_000,
   });
   const projectId = activeProjectId || projects[0]?.id || '';
-  const noProjects = !projectsLoading && projects.length === 0;
+  // The default above turns a failed request into an empty array, so this must
+  // require the query to have SUCCEEDED before it calls the account empty.
+  // Otherwise an unreachable backend renders "Create a project first" to
+  // someone who already has projects, and the obvious response to that advice
+  // is to create a duplicate.
+  const noProjects = !projectsLoading && !projectsFailed && projects.length === 0;
 
   // Persist the fallback choice so subsequent reloads and sibling
   // modules (BIM, BOQ, CDE) see the same active project instead of each
@@ -747,6 +766,17 @@ export function DwgTakeoffPage() {
     }
   }, [snapModes]);
   const [snapMenuOpen, setSnapMenuOpen] = useState(false);
+
+  /* ── Text display ──────────────────────────────────────────────────
+   * Hide every label on the sheet, or draw them smaller / larger than the
+   * drawing asks for. Stored globally like the snap modes rather than per
+   * drawing: it says how big this person wants to read, not anything about
+   * the file. Display only - the entity list the viewer measures, hit-tests
+   * and quantifies is the same list either way. */
+  const [textDisplay, setTextDisplay] = useState<TextDisplayState>(() => loadTextDisplay());
+  useEffect(() => {
+    saveTextDisplay(textDisplay);
+  }, [textDisplay]);
   /**
    * Drawing scale denominator (RFC 13 #13). `1` = use raw DXF units as
    * meters. `50` = the drawing is 1:50, so a 0.20-unit segment represents
@@ -901,6 +931,13 @@ export function DwgTakeoffPage() {
   // collides with the main new-drawing upload flow above.
   const revisionInputRef = useRef<HTMLInputElement>(null);
   const [uploadFile, setUploadFile] = useState<File | null>(null);
+  /** "Open from project files" picker: lists the DWG/DXF already filed in
+   *  this project so the user does not have to find the drawing on their own
+   *  machine again. Picking one downloads its bytes into the SAME
+   *  `uploadFile` state a local pick fills, so the rest of the upload flow
+   *  (name, discipline, converter auto-install) is untouched. */
+  const [showProjectFilePicker, setShowProjectFilePicker] = useState(false);
+  const [pickingFileId, setPickingFileId] = useState<string | null>(null);
   /** Visual drop-zone hover state - flips on `dragenter`/`dragover` and
    *  back on `dragleave`/`drop`. The hero card and modal both bind to it
    *  so the dashed border highlights while a real file is hovering, not
@@ -1269,33 +1306,26 @@ export function DwgTakeoffPage() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [deepLinkDrawingId, deepLinkDocId, deepLinkDocName, drawings, loadingDrawings]);
 
-  // Layout support
-  const [selectedLayout, setSelectedLayout] = useState<string | null>(null);
+  // Layout support. What the reader picked in the sheet strip, which is not
+  // the same thing as which sheet is on screen: see `selectedLayout` below.
+  const [pickedLayout, setPickedLayout] = useState<string | null>(null);
 
-  // Unique layout names from entities
-  const layouts = useMemo(() => {
-    const set = new Set<string>();
-    for (const e of entities) {
-      if (e.layout) set.add(e.layout);
-    }
-    if (set.size === 0) return [];
-    // Sort: "Model" / "*Model_Space" first, then alphabetical
-    return Array.from(set).sort((a, b) => {
-      const aIsModel = a === 'Model' || a === '*Model_Space';
-      const bIsModel = b === 'Model' || b === '*Model_Space';
-      if (aIsModel && !bIsModel) return -1;
-      if (!aIsModel && bIsModel) return 1;
-      return a.localeCompare(b);
-    });
-  }, [entities]);
+  // Unique layout names from entities, model space first.
+  const layouts = useMemo(() => layoutNames(entities), [entities]);
 
-  // Auto-select first layout when entities load
-  useEffect(() => {
-    if (layouts.length > 0 && selectedLayout === null) {
-      setSelectedLayout(layouts[0] ?? null);
-    }
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [layouts]);
+  /**
+   * The sheet on screen. Derived during render, not latched by an effect.
+   *
+   * An effect runs after commit, so latching "no pick yet -> first sheet" left
+   * the first painted frame of every drawing showing whatever the un-picked
+   * state rendered as - and that was the union of every sheet, model space and
+   * paper space fitted into one box. Deriving it means there is no frame in
+   * which no sheet is chosen.
+   */
+  const selectedLayout = useMemo(
+    () => effectiveLayout(layouts, pickedLayout),
+    [layouts, pickedLayout],
+  );
 
   // Per-layout entity counts for the SheetStrip. Memoised so a hover on
   // the strip doesn't re-walk the entity list.
@@ -1449,11 +1479,19 @@ export function DwgTakeoffPage() {
     });
   }, [entities]);
 
-  // Filter entities by selected layout
-  const filteredEntities = useMemo(() => {
-    if (!selectedLayout || layouts.length === 0) return annotatedEntities;
-    return annotatedEntities.filter((e) => e.layout === selectedLayout);
-  }, [annotatedEntities, selectedLayout, layouts]);
+  // Block definitions, grouped off the flat wire list before any layout
+  // filtering. Their members carry `block` instead of `layout`, so they belong
+  // to no sheet and every sheet at once - whichever one places them.
+  const blockDefs = useMemo(() => groupBlockDefinitions(entities), [entities]);
+
+  // The scene: one sheet's entities, minus the definition members that are
+  // drawn only through the INSERTs placing them. `sceneEntities` keeps the
+  // union for a drawing that has no sheets at all, which is the one case where
+  // the union is the right answer.
+  const filteredEntities = useMemo(
+    () => sceneEntities(annotatedEntities, layouts, pickedLayout),
+    [annotatedEntities, layouts, pickedLayout],
+  );
 
   // Layers present in THIS (possibly server-filtered) fetch + the virtual
   // USER_MARKUP layer so it gets a LayerPanel row once users start drawing.
@@ -2083,7 +2121,7 @@ export function DwgTakeoffPage() {
     setSelectedEntityIds(new Set());
     setHiddenEntityIds(new Set());
     setSelectedAnnotationId(null);
-    setSelectedLayout(null);
+    setPickedLayout(null);
     setEntityPopup(null);
     setContextMenu(null);
     // Drop in-progress draw / calibration so a half-started measurement on
@@ -2448,6 +2486,38 @@ export function DwgTakeoffPage() {
     setUploadName('');
     setUploadDiscipline('architectural');
   }, []);
+
+  /** Adopt a drawing already stored in the project's Files area. The bytes
+   *  are downloaded and handed to the SAME `uploadFile` state a local pick
+   *  fills, so conversion, naming and the converter auto-install all behave
+   *  identically whichever way the file arrived. */
+  const handlePickProjectFile = useCallback(
+    async (doc: DocumentItem) => {
+      setPickingFileId(doc.id);
+      try {
+        const file = await projectDocumentToFile(doc);
+        setUploadFile(file);
+        setUploadName((prev) => prev || doc.name.replace(/\.[^.]+$/, ''));
+        setShowProjectFilePicker(false);
+      } catch (err) {
+        addToast({
+          type: 'error',
+          title: t('project_files.pick_failed_title', {
+            defaultValue: 'Could not open that file',
+          }),
+          message:
+            err instanceof Error
+              ? err.message
+              : t('project_files.pick_failed_msg', {
+                  defaultValue: 'The file could not be read from the project. Try again.',
+                }),
+        });
+      } finally {
+        setPickingFileId(null);
+      }
+    },
+    [addToast, t],
+  );
 
   /* ── BOQ-link picker handlers ──────────────────────────────────────
    * Mirror the PDF-takeoff pattern: self-contained picker loads projects,
@@ -3359,6 +3429,7 @@ export function DwgTakeoffPage() {
               <DxfViewer
                 key={`${selectedDrawingId}:${selectedLayout ?? 'default'}`}
                 entities={viewerEntities}
+                blockDefs={blockDefs}
                 annotations={visibleAnnotations}
                 visibleLayers={visibleLayers}
                 activeTool={activeTool}
@@ -3395,6 +3466,7 @@ export function DwgTakeoffPage() {
                 searchBoxes={searchBoxes}
                 activeSearchBox={activeMatch ? activeMatch.box : null}
                 focusTarget={findFocusTarget}
+                textDisplay={textDisplay}
               />
 
               {/* Onion-skin overlay (Item 17) - a dim wash over the current
@@ -3421,250 +3493,277 @@ export function DwgTakeoffPage() {
                 onCancel={handleCalibrationCancel}
               />
 
-              {/* Floating ToolPalette - top-left corner, above the canvas.
-                  Lives here (not in a fixed header bar) so the drawing gets
-                  the full viewport height and tools stay visually attached
-                  to the thing they act on. */}
-              <div className="absolute top-3 left-3 z-10 flex items-start gap-2">
-                <div className="rounded-lg border border-white/60 bg-white/85 dark:bg-white/90 backdrop-blur-md shadow-xl shadow-black/30 ring-1 ring-black/5">
-                  <ToolPalette
-                    activeTool={activeTool}
-                    onToolChange={setActiveTool}
-                    activeColor={activeColor}
-                    onColorChange={setActiveColor}
-                  />
-                </div>
+              {/* One row across the top of the viewer: the drawing tools at the
+                  left end, the page-level actions at the right end.
+                  These were two independent absolutely-positioned strips, and
+                  the left one was allowed to grow to the full width. On a viewer
+                  narrower than the two of them together, that put the text-size
+                  control straight under the "How it works" and "Cases" pills,
+                  which is what a tester hit on a real sheet. Sharing one flex row
+                  makes the collision impossible rather than unlikely: the left
+                  group can only grow into space the right group is not using, and
+                  wraps within its own share instead of crossing over.
+                  pointer-events-none on the row, auto on each group. The row now
+                  spans the full width, so its empty middle would otherwise
+                  swallow clicks meant for the drawing underneath - and the right
+                  group needs the opt-in explicitly, because it did not sit under
+                  a pointer-events-none parent before. */}
+              <div className="pointer-events-none absolute inset-x-3 top-3 z-10 flex items-start justify-between gap-3">
+                {/* Floating ToolPalette. Lives here rather than in a fixed header
+                    bar so the drawing gets the full viewport height and the tools
+                    stay visually attached to the thing they act on. Each group
+                    inside re-enables pointer events for itself: with three groups
+                    the row wraps on a narrow viewer, and an empty transparent box
+                    beside the second row would swallow clicks. */}
+                <div className="pointer-events-none flex min-w-0 flex-wrap items-start gap-2">
+                  <div className="pointer-events-auto rounded-lg border border-white/60 bg-white/85 dark:bg-white/90 backdrop-blur-md shadow-xl shadow-black/30 ring-1 ring-black/5">
+                    <ToolPalette
+                      activeTool={activeTool}
+                      onToolChange={setActiveTool}
+                      activeColor={activeColor}
+                      onColorChange={setActiveColor}
+                    />
+                  </div>
 
-                {/* Q1 UX #2 + #4: Undo / redo + snap-mode menu. Sit next
-                    to the tool palette so tool + history + snap controls
-                    are all reachable without leaving the top-left. */}
-                <div
-                  className="flex items-center gap-1 rounded-lg border border-white/60 bg-white/85 dark:bg-white/90 backdrop-blur-md px-1.5 py-1 shadow-xl shadow-black/30 ring-1 ring-black/5"
-                  data-testid="dwg-history-bar"
-                >
-                  <button
-                    type="button"
-                    onClick={handleUndo}
-                    disabled={!canUndoFn(undoState)}
-                    data-testid="dwg-undo"
-                    title={t('dwg_takeoff.undo', { defaultValue: 'Undo (Ctrl+Z)' })}
-                    aria-label={t('dwg_takeoff.undo_aria', { defaultValue: 'Undo' })}
-                    className={clsx(
-                      'flex h-7 w-7 items-center justify-center rounded-md transition-colors',
-                      canUndoFn(undoState)
-                        ? 'text-slate-800 hover:bg-slate-100'
-                        : 'text-slate-300 cursor-not-allowed',
-                    )}
+                  {/* Q1 UX #2 + #4: Undo / redo + snap-mode menu. Sit next
+                      to the tool palette so tool + history + snap controls
+                      are all reachable without leaving the top-left. */}
+                  <div
+                    className="pointer-events-auto flex items-center gap-1 rounded-lg border border-white/60 bg-white/85 dark:bg-white/90 backdrop-blur-md px-1.5 py-1 shadow-xl shadow-black/30 ring-1 ring-black/5"
+                    data-testid="dwg-history-bar"
                   >
-                    <Undo2 size={14} />
-                  </button>
-                  <button
-                    type="button"
-                    onClick={handleRedo}
-                    disabled={!canRedoFn(undoState)}
-                    data-testid="dwg-redo"
-                    title={t('dwg_takeoff.redo', {
-                      defaultValue: 'Redo (Ctrl+Y / Ctrl+Shift+Z)',
-                    })}
-                    aria-label={t('dwg_takeoff.redo_aria', { defaultValue: 'Redo' })}
-                    className={clsx(
-                      'flex h-7 w-7 items-center justify-center rounded-md transition-colors',
-                      canRedoFn(undoState)
-                        ? 'text-slate-800 hover:bg-slate-100'
-                        : 'text-slate-300 cursor-not-allowed',
-                    )}
-                  >
-                    <Redo2 size={14} />
-                  </button>
-
-                  <div className="mx-1 h-5 w-px bg-slate-300" />
-
-                  <div className="relative">
                     <button
                       type="button"
-                      onClick={() => setSnapMenuOpen((o) => !o)}
-                      data-testid="dwg-snap-menu-toggle"
-                      title={t('dwg_takeoff.snap_menu', {
-                        defaultValue: 'Snap modes',
-                      })}
-                      aria-label={t('dwg_takeoff.snap_menu', {
-                        defaultValue: 'Snap modes',
-                      })}
+                      onClick={handleUndo}
+                      disabled={!canUndoFn(undoState)}
+                      data-testid="dwg-undo"
+                      title={t('dwg_takeoff.undo', { defaultValue: 'Undo (Ctrl+Z)' })}
+                      aria-label={t('dwg_takeoff.undo_aria', { defaultValue: 'Undo' })}
                       className={clsx(
-                        'flex h-7 items-center gap-1 rounded-md px-2 text-xs transition-colors',
-                        snapModes.endpoint || snapModes.midpoint || snapModes.intersection
-                          ? 'bg-emerald-500/20 text-emerald-700'
-                          : 'text-slate-700 hover:bg-slate-100',
+                        'flex h-7 w-7 items-center justify-center rounded-md transition-colors',
+                        canUndoFn(undoState)
+                          ? 'text-slate-800 hover:bg-slate-100'
+                          : 'text-slate-300 cursor-not-allowed',
                       )}
                     >
-                      <Target size={13} />
-                      <span className="font-semibold">
-                        {t('dwg_takeoff.snap_label', { defaultValue: 'Snap' })}
-                      </span>
+                      <Undo2 size={14} />
                     </button>
-                    {snapMenuOpen && (
-                      <div
-                        data-testid="dwg-snap-menu"
-                        className="absolute left-0 top-full mt-1 w-48 rounded-lg border border-slate-200 bg-white p-2 shadow-xl"
-                        onMouseLeave={() => setSnapMenuOpen(false)}
+                    <button
+                      type="button"
+                      onClick={handleRedo}
+                      disabled={!canRedoFn(undoState)}
+                      data-testid="dwg-redo"
+                      title={t('dwg_takeoff.redo', {
+                        defaultValue: 'Redo (Ctrl+Y / Ctrl+Shift+Z)',
+                      })}
+                      aria-label={t('dwg_takeoff.redo_aria', { defaultValue: 'Redo' })}
+                      className={clsx(
+                        'flex h-7 w-7 items-center justify-center rounded-md transition-colors',
+                        canRedoFn(undoState)
+                          ? 'text-slate-800 hover:bg-slate-100'
+                          : 'text-slate-300 cursor-not-allowed',
+                      )}
+                    >
+                      <Redo2 size={14} />
+                    </button>
+
+                    <div className="mx-1 h-5 w-px bg-slate-300" />
+
+                    <div className="relative">
+                      <button
+                        type="button"
+                        onClick={() => setSnapMenuOpen((o) => !o)}
+                        data-testid="dwg-snap-menu-toggle"
+                        title={t('dwg_takeoff.snap_menu', {
+                          defaultValue: 'Snap modes',
+                        })}
+                        aria-label={t('dwg_takeoff.snap_menu', {
+                          defaultValue: 'Snap modes',
+                        })}
+                        className={clsx(
+                          'flex h-7 items-center gap-1 rounded-md px-2 text-xs transition-colors',
+                          snapModes.endpoint || snapModes.midpoint || snapModes.intersection
+                            ? 'bg-emerald-500/20 text-emerald-700'
+                            : 'text-slate-700 hover:bg-slate-100',
+                        )}
                       >
-                        <label className="flex cursor-pointer items-center gap-2 rounded-md px-2 py-1.5 text-xs text-slate-700 hover:bg-slate-100">
-                          <input
-                            type="checkbox"
-                            data-testid="dwg-snap-endpoint"
-                            checked={!!snapModes.endpoint}
-                            onChange={(e) =>
-                              setSnapModes((m) => ({ ...m, endpoint: e.target.checked }))
-                            }
-                          />
-                          {t('dwg_takeoff.snap_endpoint', {
-                            defaultValue: 'Endpoint snap',
-                          })}
-                        </label>
-                        <label className="flex cursor-pointer items-center gap-2 rounded-md px-2 py-1.5 text-xs text-slate-700 hover:bg-slate-100">
-                          <input
-                            type="checkbox"
-                            data-testid="dwg-snap-midpoint"
-                            checked={!!snapModes.midpoint}
-                            onChange={(e) =>
-                              setSnapModes((m) => ({ ...m, midpoint: e.target.checked }))
-                            }
-                          />
-                          {t('dwg_takeoff.snap_midpoint', {
-                            defaultValue: 'Midpoint snap',
-                          })}
-                        </label>
-                        <label className="flex cursor-not-allowed items-center gap-2 rounded-md px-2 py-1.5 text-xs text-slate-400">
-                          <input
-                            type="checkbox"
-                            data-testid="dwg-snap-intersection"
-                            checked={!!snapModes.intersection}
-                            disabled
-                          />
-                          {t('dwg_takeoff.snap_intersection', {
-                            defaultValue: 'Intersection snap (soon)',
-                          })}
-                        </label>
-                      </div>
-                    )}
+                        <Target size={13} />
+                        <span className="font-semibold">
+                          {t('dwg_takeoff.snap_label', { defaultValue: 'Snap' })}
+                        </span>
+                      </button>
+                      {snapMenuOpen && (
+                        <div
+                          data-testid="dwg-snap-menu"
+                          className="absolute left-0 top-full mt-1 w-48 rounded-lg border border-slate-200 bg-white p-2 shadow-xl"
+                          onMouseLeave={() => setSnapMenuOpen(false)}
+                        >
+                          <label className="flex cursor-pointer items-center gap-2 rounded-md px-2 py-1.5 text-xs text-slate-700 hover:bg-slate-100">
+                            <input
+                              type="checkbox"
+                              data-testid="dwg-snap-endpoint"
+                              checked={!!snapModes.endpoint}
+                              onChange={(e) =>
+                                setSnapModes((m) => ({ ...m, endpoint: e.target.checked }))
+                              }
+                            />
+                            {t('dwg_takeoff.snap_endpoint', {
+                              defaultValue: 'Endpoint snap',
+                            })}
+                          </label>
+                          <label className="flex cursor-pointer items-center gap-2 rounded-md px-2 py-1.5 text-xs text-slate-700 hover:bg-slate-100">
+                            <input
+                              type="checkbox"
+                              data-testid="dwg-snap-midpoint"
+                              checked={!!snapModes.midpoint}
+                              onChange={(e) =>
+                                setSnapModes((m) => ({ ...m, midpoint: e.target.checked }))
+                              }
+                            />
+                            {t('dwg_takeoff.snap_midpoint', {
+                              defaultValue: 'Midpoint snap',
+                            })}
+                          </label>
+                          <label className="flex cursor-not-allowed items-center gap-2 rounded-md px-2 py-1.5 text-xs text-slate-400">
+                            <input
+                              type="checkbox"
+                              data-testid="dwg-snap-intersection"
+                              checked={!!snapModes.intersection}
+                              disabled
+                            />
+                            {t('dwg_takeoff.snap_intersection', {
+                              defaultValue: 'Intersection snap (soon)',
+                            })}
+                          </label>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+
+                  {/* Text display. Sits with the tools rather than in the
+                      layer panel because it is reached mid-measurement, with
+                      a drawing tool still selected, and a trip to a side tab
+                      to unbury the wall you are tracing is a trip too far. */}
+                  <div className="pointer-events-auto">
+                    <TextDisplayControl value={textDisplay} onChange={setTextDisplay} />
                   </div>
                 </div>
-              </div>
 
-              {/* Floating Offline Ready badge + PDF export - top-right corner
-                  of the viewer (opposite the ToolPalette). Download PDF is
-                  paired with the badge so estimators discover it while
-                  glancing at converter status without stealing real estate
-                  from the drawing. */}
-              <div className="absolute top-3 right-3 z-10 flex items-center gap-2">
-                <ModuleGuideButton content={dwgTakeoffGuide} />
-                <button
-                  type="button"
-                  onClick={() => setFindOpen((o) => !o)}
-                  disabled={!selectedDrawingId}
-                  className={clsx(
-                    'inline-flex items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-xs font-semibold',
-                    'border border-white/60 backdrop-blur-md',
-                    'shadow-xl shadow-black/30 ring-1 ring-black/5 transition-colors',
-                    !selectedDrawingId
-                      ? 'bg-white/85 dark:bg-white/90 text-slate-400 cursor-not-allowed'
-                      : findOpen
-                        ? 'bg-oe-blue text-white hover:bg-oe-blue-dark'
-                        : 'bg-white/85 dark:bg-white/90 text-slate-800 hover:bg-white',
-                  )}
-                  title={t('dwg_takeoff.find_text_title', {
-                    defaultValue: 'Find text on the drawing (Ctrl+F)',
-                  })}
-                  data-testid="dwg-find-toggle"
-                >
-                  <Search size={14} />
-                  <span>{t('dwg_takeoff.find_text', { defaultValue: 'Find' })}</span>
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setShowCompare(true)}
-                  disabled={!selectedDrawingId}
-                  className={clsx(
-                    'inline-flex items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-xs font-semibold',
-                    'border border-white/60 bg-white/85 dark:bg-white/90 backdrop-blur-md',
-                    'shadow-xl shadow-black/30 ring-1 ring-black/5 transition-colors',
-                    selectedDrawingId
-                      ? 'text-slate-800 hover:bg-white'
-                      : 'text-slate-400 cursor-not-allowed',
-                  )}
-                  title={t('dwg_compare.compare_revisions', {
-                    defaultValue: 'Compare revisions with cost delta',
-                  })}
-                  data-testid="dwg-compare-button"
-                >
-                  <GitCompare size={14} />
-                  <span>{t('dwg_compare.compare_short', { defaultValue: 'Compare' })}</span>
-                </button>
-                <button
-                  type="button"
-                  onClick={() => revisionInputRef.current?.click()}
-                  disabled={!selectedDrawingId || revisionUploadMutation.isPending}
-                  className={clsx(
-                    'inline-flex items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-xs font-semibold',
-                    'border border-white/60 bg-white/85 dark:bg-white/90 backdrop-blur-md',
-                    'shadow-xl shadow-black/30 ring-1 ring-black/5 transition-colors',
-                    selectedDrawingId
-                      ? 'text-slate-800 hover:bg-white'
-                      : 'text-slate-400 cursor-not-allowed',
-                  )}
-                  title={t('dwg_takeoff.upload_revision_title', {
-                    defaultValue: 'Upload a new revision of this drawing (adds a version)',
-                  })}
-                  data-testid="dwg-upload-revision"
-                >
-                  {revisionUploadMutation.isPending ? (
-                    <Loader2 size={14} className="animate-spin" />
-                  ) : (
-                    <FileStack size={14} />
-                  )}
-                  <span>
-                    {t('dwg_takeoff.upload_revision_short', { defaultValue: 'New revision' })}
-                  </span>
-                </button>
-                <input
-                  ref={revisionInputRef}
-                  type="file"
-                  accept=".dwg,.dxf"
-                  className="hidden"
-                  data-testid="dwg-upload-revision-input"
-                  onChange={(e) => {
-                    const file = e.target.files?.[0];
-                    if (file && selectedDrawingId) {
-                      revisionUploadMutation.mutate({ drawingId: selectedDrawingId, file });
-                    }
-                    e.target.value = '';
-                  }}
-                />
-                <button
-                  type="button"
-                  onClick={handleDownloadCanvasPdf}
-                  disabled={!selectedDrawingId}
-                  className={clsx(
-                    'inline-flex items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-xs font-semibold',
-                    'border border-white/60 bg-white/85 dark:bg-white/90 backdrop-blur-md',
-                    'shadow-xl shadow-black/30 ring-1 ring-black/5 transition-colors',
-                    selectedDrawingId
-                      ? 'text-slate-800 hover:bg-white'
-                      : 'text-slate-400 cursor-not-allowed',
-                  )}
-                  title={t('dwg_takeoff.download_pdf', {
-                    defaultValue: 'Download current viewport as PDF',
-                  })}
-                  data-testid="dwg-download-pdf"
-                >
-                  <FileDown size={14} />
-                  <span>{t('dwg_takeoff.download_pdf_short', { defaultValue: 'PDF' })}</span>
-                </button>
-                <OfflineReadyBadge
-                  readiness={offlineReadiness}
-                  isLoading={loadingOfflineReadiness}
-                  data-testid="dwg-offline-badge"
-                />
+                {/* Floating Offline Ready badge + PDF export - top-right corner
+                    of the viewer (opposite the ToolPalette). Download PDF is
+                    paired with the badge so estimators discover it while
+                    glancing at converter status without stealing real estate
+                    from the drawing. */}
+                  <div className="pointer-events-auto flex shrink-0 flex-wrap items-center justify-end gap-2">
+                  <ModuleGuideButton content={dwgTakeoffGuide} />
+                  <button
+                    type="button"
+                    onClick={() => setFindOpen((o) => !o)}
+                    disabled={!selectedDrawingId}
+                    className={clsx(
+                      'inline-flex items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-xs font-semibold',
+                      'border border-white/60 backdrop-blur-md',
+                      'shadow-xl shadow-black/30 ring-1 ring-black/5 transition-colors',
+                      !selectedDrawingId
+                        ? 'bg-white/85 dark:bg-white/90 text-slate-400 cursor-not-allowed'
+                        : findOpen
+                          ? 'bg-oe-blue text-white hover:bg-oe-blue-dark'
+                          : 'bg-white/85 dark:bg-white/90 text-slate-800 hover:bg-white',
+                    )}
+                    title={t('dwg_takeoff.find_text_title', {
+                      defaultValue: 'Find text on the drawing (Ctrl+F)',
+                    })}
+                    data-testid="dwg-find-toggle"
+                  >
+                    <Search size={14} />
+                    <span>{t('dwg_takeoff.find_text', { defaultValue: 'Find' })}</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setShowCompare(true)}
+                    disabled={!selectedDrawingId}
+                    className={clsx(
+                      'inline-flex items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-xs font-semibold',
+                      'border border-white/60 bg-white/85 dark:bg-white/90 backdrop-blur-md',
+                      'shadow-xl shadow-black/30 ring-1 ring-black/5 transition-colors',
+                      selectedDrawingId
+                        ? 'text-slate-800 hover:bg-white'
+                        : 'text-slate-400 cursor-not-allowed',
+                    )}
+                    title={t('dwg_compare.compare_revisions', {
+                      defaultValue: 'Compare revisions with cost delta',
+                    })}
+                    data-testid="dwg-compare-button"
+                  >
+                    <GitCompare size={14} />
+                    <span>{t('dwg_compare.compare_short', { defaultValue: 'Compare' })}</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => revisionInputRef.current?.click()}
+                    disabled={!selectedDrawingId || revisionUploadMutation.isPending}
+                    className={clsx(
+                      'inline-flex items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-xs font-semibold',
+                      'border border-white/60 bg-white/85 dark:bg-white/90 backdrop-blur-md',
+                      'shadow-xl shadow-black/30 ring-1 ring-black/5 transition-colors',
+                      selectedDrawingId
+                        ? 'text-slate-800 hover:bg-white'
+                        : 'text-slate-400 cursor-not-allowed',
+                    )}
+                    title={t('dwg_takeoff.upload_revision_title', {
+                      defaultValue: 'Upload a new revision of this drawing (adds a version)',
+                    })}
+                    data-testid="dwg-upload-revision"
+                  >
+                    {revisionUploadMutation.isPending ? (
+                      <Loader2 size={14} className="animate-spin" />
+                    ) : (
+                      <FileStack size={14} />
+                    )}
+                    <span>
+                      {t('dwg_takeoff.upload_revision_short', { defaultValue: 'New revision' })}
+                    </span>
+                  </button>
+                  <input
+                    ref={revisionInputRef}
+                    type="file"
+                    accept=".dwg,.dxf"
+                    className="hidden"
+                    data-testid="dwg-upload-revision-input"
+                    onChange={(e) => {
+                      const file = e.target.files?.[0];
+                      if (file && selectedDrawingId) {
+                        revisionUploadMutation.mutate({ drawingId: selectedDrawingId, file });
+                      }
+                      e.target.value = '';
+                    }}
+                  />
+                  <button
+                    type="button"
+                    onClick={handleDownloadCanvasPdf}
+                    disabled={!selectedDrawingId}
+                    className={clsx(
+                      'inline-flex items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-xs font-semibold',
+                      'border border-white/60 bg-white/85 dark:bg-white/90 backdrop-blur-md',
+                      'shadow-xl shadow-black/30 ring-1 ring-black/5 transition-colors',
+                      selectedDrawingId
+                        ? 'text-slate-800 hover:bg-white'
+                        : 'text-slate-400 cursor-not-allowed',
+                    )}
+                    title={t('dwg_takeoff.download_pdf', {
+                      defaultValue: 'Download current viewport as PDF',
+                    })}
+                    data-testid="dwg-download-pdf"
+                  >
+                    <FileDown size={14} />
+                    <span>{t('dwg_takeoff.download_pdf_short', { defaultValue: 'PDF' })}</span>
+                  </button>
+                  <OfflineReadyBadge
+                    readiness={offlineReadiness}
+                    isLoading={loadingOfflineReadiness}
+                    data-testid="dwg-offline-badge"
+                  />
+                </div>
               </div>
 
               {/* Find-text bar - top-center overlay, parity with the PDF
@@ -4106,7 +4205,7 @@ export function DwgTakeoffPage() {
               layouts={layouts}
               entities={entities}
               activeLayout={selectedLayout}
-              onLayoutChange={setSelectedLayout}
+              onLayoutChange={setPickedLayout}
               entityCountByLayout={entityCountByLayout}
             />
             </>
@@ -4572,6 +4671,60 @@ export function DwgTakeoffPage() {
                         </div>
                       )}
 
+                      {/* Match to a cost position - search every loaded cost catalogue by this
+                          entity's layer/type/size and apply a priced BOQ position, linked to the
+                          entity via a text_pin annotation. */}
+                      {projectId && (() => {
+                        const matchPayload = toDWGElementPayload(selectedEntity, effectiveScale, {
+                          calculatePerimeter,
+                          calculateArea,
+                          calculateDistance,
+                        });
+                        const matchMeasurement = extractEntityMeasurement(selectedEntity, effectiveScale);
+                        const matchQuantities: Record<string, number> = {};
+                        if (matchMeasurement && Number.isFinite(matchMeasurement.value)) {
+                          const isArea = matchMeasurement.kind === 'area'; // m2 -> area
+                          matchQuantities[isArea ? 'area_m2' : 'length_m'] = matchMeasurement.value;
+                        }
+                        return (
+                          <div className="mt-2 pt-2 border-t border-[#3a3a3a]">
+                            <p className="text-[10px] font-bold uppercase tracking-widest text-blue-300 mb-1.5">
+                              {t('match.apply_section_title', { defaultValue: 'Find a cost position' })}
+                            </p>
+                            <div className="h-96 rounded-sm border border-[#3a3a3a] overflow-hidden bg-surface-primary">
+                              <ElementCostMatchPanel
+                                key={selectedEntity.id}
+                                source="dwg"
+                                projectId={projectId}
+                                elementKey={selectedEntity.id}
+                                compact
+                                rawElementData={matchPayload as unknown as Record<string, unknown>}
+                                envelope={{
+                                  category: selectedEntity.type,
+                                  description: `${selectedEntity.type} · ${selectedEntity.layer}`,
+                                  properties: matchPayload.properties,
+                                  quantities: matchQuantities,
+                                  unitHint: matchMeasurement?.unit ?? null,
+                                }}
+                                quantityOverride={matchMeasurement ? matchMeasurement.value : null}
+                                onApplied={async (result) => {
+                                  // Native back-link: ensure a text_pin annotation for this entity
+                                  // and link it to the freshly created BOQ position, so the entity
+                                  // shows as linked on the canvas.
+                                  const annotationId = await ensureAnnotationForEntity(
+                                    selectedEntity,
+                                    matchMeasurement,
+                                  );
+                                  if (annotationId) {
+                                    await linkAnnotationToBoq(annotationId, result.position_id);
+                                  }
+                                }}
+                              />
+                            </div>
+                          </div>
+                        );
+                      })()}
+
                       {/* ── Polyline measurements ──────────────── */}
                       {selectedEntity.type === 'LWPOLYLINE' && selectedEntity.vertices && selectedEntity.vertices.length >= 2 && (() => {
                         const verts = selectedEntity.vertices!;
@@ -4813,6 +4966,23 @@ export function DwgTakeoffPage() {
               )}
             </button>
 
+            {/* Second way in: a drawing already filed in this project. The
+                local upload above stays exactly as it was - this only saves
+                the user from hunting down (and re-uploading) a file the
+                project already holds. */}
+            <button
+              type="button"
+              onClick={() => setShowProjectFilePicker(true)}
+              disabled={!projectId}
+              data-testid="dwg-open-from-project-files"
+              className="mt-2 inline-flex w-full items-center justify-center gap-1.5 rounded-lg border border-border-medium bg-surface-primary px-3 py-2 text-xs font-semibold text-content-secondary transition-colors hover:border-oe-blue/40 hover:text-oe-blue disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              <FolderOpen size={14} />
+              {t('project_files.open_from_project', {
+                defaultValue: 'Open from project files',
+              })}
+            </button>
+
             {/* Auto-install of the local DWG converter (background, no click).
                 Shown when the user picks a .dwg and the converter is missing;
                 DXF uploads bypass it entirely. The notice renders only while
@@ -4988,6 +5158,17 @@ export function DwgTakeoffPage() {
           </div>
         </div>
       )}
+
+      {/* "Open from project files" - lists the DWG/DXF already stored in
+          this project so a filed drawing does not have to be re-uploaded. */}
+      <ProjectFilePicker
+        open={showProjectFilePicker}
+        onClose={() => setShowProjectFilePicker(false)}
+        projectId={projectId}
+        accepted={DWG_TAKEOFF_FORMATS}
+        onPick={handlePickProjectFile}
+        busyId={pickingFileId}
+      />
 
       {/* Delete drawing confirmation */}
       {confirmDeleteId && (
@@ -6232,9 +6413,9 @@ function UploadProgressInline() {
  *
  * These render in place of the DxfViewer when the selected drawing has
  * not yet reached `status="ready"`. Before P1 the page silently rendered
- * an empty viewer for the entire 3-8 minute DDC conversion window - the
- * user reported it as "показывает что проект загружен - но ничего не
- * показывается и только потом через 5 минут происходит загрузка".
+ * an empty viewer for the entire 3-8 minute DDC conversion window, reported
+ * as the project showing up as loaded while nothing is rendered, with the
+ * actual load only arriving minutes later.
  *
  * ConversionProgressCard intentionally does NOT show a determinate
  * percentage. The DDC pipeline does not expose granular progress, and a
@@ -6271,17 +6452,29 @@ function ConversionProgressCard({
   }, []);
 
   const elapsedSec = Math.max(0, Math.round((Date.now() - startedAt) / 1000));
-  const elapsedLabel =
-    elapsedSec < 60
-      ? `${elapsedSec}s`
-      : `${Math.floor(elapsedSec / 60)}m ${elapsedSec % 60}s`;
+  // #174: this used to floor at minutes, so a conversion that ran for over an
+  // hour reported "94m 12s". The shared formatter climbs to hours. Zero is
+  // rendered as "0s" rather than blank so the pill has content from the first
+  // tick - the counter refreshes every second and an empty pill for the first
+  // second reads as a broken control.
+  const elapsedLabel = formatDuration(t, elapsedSec, 's', { parts: 2, empty: '0s' });
 
-  // Step machine - drives the highlighted "current step". When the
-  // backend says `uploaded` the file is on disk but conversion has not
-  // started yet (step 1). `processing` covers steps 2 and 3 - we can't
-  // distinguish them from the API, so step 2 is "current" until the
-  // status flips out of processing.
-  const currentStep = status === 'uploaded' ? 1 : status === 'processing' ? 2 : 4;
+  // Step machine - drives the highlighted "current step".
+  //
+  // Three steps, not four, and the missing one is the point. Conversion and
+  // entity extraction used to be listed separately while the API reports a
+  // single `processing` for both, so the card marked "Converting" as current
+  // and left "Extracting" greyed out ahead of it for the whole run. That reads
+  // as knowledge we do not have. It cost us a real diagnosis: the reporter on
+  // issue #409 told us their conversion failed at step 2, which was the only
+  // thing the screen could ever have said, so it narrowed nothing.
+  //
+  // The two are one row until the backend can tell them apart. What actually
+  // failed is already in the drawing's error message, which names the phase,
+  // so nothing diagnostic is lost by not guessing here. The conv_step_extract
+  // keys are kept translated in all 29 locales for the day the backend can
+  // report the phase - they are unreferenced now, not abandoned.
+  const currentStep = status === 'uploaded' ? 1 : status === 'processing' ? 2 : 3;
 
   const steps: { id: number; label: string; hint: string }[] = [
     {
@@ -6303,15 +6496,6 @@ function ConversionProgressCard({
     },
     {
       id: 3,
-      label: t('dwg_takeoff.conv_step_extract', {
-        defaultValue: 'Extracting entities and layers',
-      }),
-      hint: t('dwg_takeoff.conv_step_extract_hint', {
-        defaultValue: 'Building the entity list the viewer will render.',
-      }),
-    },
-    {
-      id: 4,
       label: t('dwg_takeoff.conv_step_render', { defaultValue: 'Opening the viewer' }),
       hint: t('dwg_takeoff.conv_step_render_hint', {
         defaultValue: 'You will see the drawing here as soon as the entities arrive.',
@@ -6321,10 +6505,11 @@ function ConversionProgressCard({
 
   // Live-region announcement: changes whenever the backend status flips
   // (uploaded → processing → ready/error). Screen readers hear "Converting
-  // your drawing…" / "Step 2 of 4 - extracting entities" etc., instead of
-  // silently rendering a spinner. Kept terse so it doesn't drone on.
+  // your drawing, step 2 of 3" instead of a silently rendered spinner. Kept
+  // terse so it doesn't drone on. The total is spelled out in every locale
+  // rather than interpolated, so it moves with the step list above.
   const liveAnnouncement = t('dwg_takeoff.conv_aria_live', {
-    defaultValue: 'Converting {{name}}, step {{step}} of 4, {{elapsed}} elapsed',
+    defaultValue: 'Converting {{name}}, step {{step}} of 3, {{elapsed}} elapsed',
     name: drawingName || filename,
     step: currentStep,
     elapsed: elapsedLabel,

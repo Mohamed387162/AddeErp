@@ -89,6 +89,14 @@ export interface ContractItem {
   retention_release_event: RetentionReleaseEvent;
   status: ContractStatus;
   signed_at: string | null;
+  /**
+   * The clause template the contract was drawn from, pinned as a pair. Version
+   * 0 means a built-in standard form, which carries no versions of its own, so
+   * zero is a complete answer here and not a missing one. Both are null on a
+   * contract written from scratch.
+   */
+  template_code: string | null;
+  template_version: number | null;
   terms: Record<string, unknown>;
   created_by: string | null;
   metadata: Record<string, unknown>;
@@ -248,6 +256,12 @@ export interface ContractCreatePayload {
   retention_release_event?: RetentionReleaseEvent;
   status?: ContractStatus;
   signed_at?: string | null;
+  /**
+   * The clause template this contract is drawn from, if any. Only the code is
+   * sent: the server resolves the version and stores the pair, so the contract
+   * keeps naming the version it actually used after a later one is published.
+   */
+  template_code?: string | null;
   terms?: Record<string, unknown>;
   metadata?: Record<string, unknown>;
 }
@@ -593,16 +607,180 @@ export function cloneContract(
 
 /* ── Clause templates (FIDIC / JCT / NEC / AIA / ConsensusDocs) ───────── */
 
+/**
+ * One row of the catalogue, from either half of the namespace.
+ *
+ * `source` says which half: `builtin` are the standard forms the platform
+ * ships as constants, `authored` are the tenant's own versioned paper.
+ * `editable` is the answer to "may the pencil be drawn", which is false for
+ * both a built-in and a published version. `version` is 0 for a built-in
+ * rather than null, so sorting on it never has to branch on the type.
+ */
 export interface ClauseTemplate {
   code: string;
   name: string;
   family: string;
+  description?: string;
   retention_release_event: string;
   clause_count: number;
+  source: 'builtin' | 'authored';
+  editable: boolean;
+  version: number;
+  status: TemplateStatus;
+  derived_from_builtin?: string | null;
+  template_id?: string | null;
+}
+
+export type TemplateStatus = 'draft' | 'published' | 'archived';
+export type ClauseRiskLevel = 'none' | 'low' | 'medium' | 'high';
+
+export interface TemplateClause {
+  id?: string | null;
+  number: string;
+  title: string;
+  body: string;
+  sort_order: number;
+  risk_level: ClauseRiskLevel;
+  risk_note: string;
+  is_optional: boolean;
+}
+
+/** One template version. Built-ins answer in this shape too, at version 0. */
+export interface ClauseTemplateDetail extends ClauseTemplate {
+  id?: string | null;
+  lineage_id?: string | null;
+  published_at?: string | null;
+  published_by?: string | null;
+  clauses: TemplateClause[];
+}
+
+export interface ClauseTemplateCreatePayload {
+  code: string;
+  name: string;
+  family?: string;
+  description?: string;
+  retention_release_event?: RetentionReleaseEvent;
+  clauses?: TemplateClause[];
+}
+
+export interface ClauseTemplateUpdatePayload {
+  name?: string;
+  family?: string;
+  description?: string;
+  retention_release_event?: RetentionReleaseEvent;
 }
 
 export function listClauseTemplates(): Promise<ClauseTemplate[]> {
   return safeGetList<ClauseTemplate>('/v1/contracts/contract-templates/');
+}
+
+export function getClauseTemplate(
+  code: string,
+  version?: number,
+): Promise<ClauseTemplateDetail> {
+  const q = version === undefined ? '' : `?version=${version}`;
+  return apiGet<ClauseTemplateDetail>(
+    `/v1/contracts/contract-templates/${encodeURIComponent(code)}${q}`,
+  );
+}
+
+/**
+ * One entry of a version history. Deliberately narrower than ClauseTemplate:
+ * a built-in answers here with a single frozen row that carries no family and
+ * no clause count, so one history screen serves both halves of the catalogue.
+ */
+export interface TemplateVersionRow {
+  code: string;
+  version: number;
+  status: TemplateStatus;
+  name: string;
+  source: 'builtin' | 'authored';
+  editable: boolean;
+  published_at?: string | null;
+  published_by?: string | null;
+}
+
+export function listClauseTemplateVersions(
+  code: string,
+): Promise<TemplateVersionRow[]> {
+  return safeGetList<TemplateVersionRow>(
+    `/v1/contracts/contract-templates/${encodeURIComponent(code)}/versions`,
+  );
+}
+
+export function createClauseTemplate(
+  data: ClauseTemplateCreatePayload,
+): Promise<ClauseTemplateDetail> {
+  return apiPost<ClauseTemplateDetail>('/v1/contracts/contract-templates/', data);
+}
+
+export function forkClauseTemplate(
+  code: string,
+  data: { new_code: string; new_name?: string | null },
+): Promise<ClauseTemplateDetail> {
+  return apiPost<ClauseTemplateDetail>(
+    `/v1/contracts/contract-templates/${encodeURIComponent(code)}/fork`,
+    data,
+  );
+}
+
+export function updateClauseTemplate(
+  code: string,
+  version: number,
+  data: ClauseTemplateUpdatePayload,
+): Promise<ClauseTemplateDetail> {
+  return apiPatch<ClauseTemplateDetail>(
+    `/v1/contracts/contract-templates/${encodeURIComponent(code)}/versions/${version}`,
+    data,
+  );
+}
+
+/**
+ * Replace the whole clause set of a draft.
+ *
+ * Whole-set rather than per-clause because numbering and order are one
+ * document: renumbering 14.3 to 14.4 while 14.4 still exists is a legal edit
+ * of the document and an illegal sequence of row updates.
+ */
+export function setClauseTemplateClauses(
+  code: string,
+  version: number,
+  clauses: TemplateClause[],
+): Promise<ClauseTemplateDetail> {
+  return apiPut<ClauseTemplateDetail>(
+    `/v1/contracts/contract-templates/${encodeURIComponent(code)}/versions/${version}/clauses`,
+    { clauses },
+  );
+}
+
+export function publishClauseTemplate(
+  code: string,
+  version: number,
+): Promise<ClauseTemplateDetail> {
+  return apiPost<ClauseTemplateDetail>(
+    `/v1/contracts/contract-templates/${encodeURIComponent(code)}/versions/${version}/publish`,
+    {},
+  );
+}
+
+/** Open version N+1 as a draft. This is what editing published paper means. */
+export function openNextClauseTemplateVersion(
+  code: string,
+): Promise<ClauseTemplateDetail> {
+  return apiPost<ClauseTemplateDetail>(
+    `/v1/contracts/contract-templates/${encodeURIComponent(code)}/versions`,
+    {},
+  );
+}
+
+export function archiveClauseTemplateVersion(
+  code: string,
+  version: number,
+): Promise<ClauseTemplateDetail> {
+  return apiPost<ClauseTemplateDetail>(
+    `/v1/contracts/contract-templates/${encodeURIComponent(code)}/versions/${version}/archive`,
+    {},
+  );
 }
 
 /* ── Compliance gate (Item #27) ───────────────────────────────────────── */
@@ -785,6 +963,564 @@ export async function downloadAiaApplicationPdf(
   }
   const blob = await res.blob();
   triggerDownload(blob, `AIA_G702_${applicationNumber || claimId}.pdf`);
+}
+
+/* ── Contract analytics (detail-view panels) ──────────────────────────── */
+//
+// Four read-only analytics endpoints that hang off a single contract. All are
+// GET, permission `contracts.read`, path param `contract_id`. They mirror the
+// backend shapes in contracts/router.py and contracts/service.py exactly. Money
+// is a decimal STRING on the wire (the SoV router coerces Decimals to strings);
+// we type money as `number | string` for parity with ContractItem and coerce at
+// the call site.
+
+/** One Schedule-of-Values line's billed-vs-earned-vs-paid position. */
+export interface SovStatusLine {
+  scheduled: number | string;
+  billed: number | string;
+  earned: number | string;
+  paid: number | string;
+  retained: number | string;
+  net_paid: number | string;
+  /** Earned / scheduled × 100, already rounded server-side (a plain number). */
+  percent_complete: number;
+}
+
+/** Totals row for the SoV status table. Note: no `net_paid` at the total level. */
+export interface SovStatusTotals {
+  scheduled: number | string;
+  billed: number | string;
+  earned: number | string;
+  paid: number | string;
+  retained: number | string;
+  percent_complete: number;
+}
+
+export interface SovStatusResponse {
+  /** Keyed by contract-line id (UUID string), in contract-line order. */
+  by_line: Record<string, SovStatusLine>;
+  totals: SovStatusTotals;
+}
+
+/** Per-line scheduled/billed/earned/paid + totals for a contract's SoV. */
+export function getSovStatus(contractId: string): Promise<SovStatusResponse> {
+  return apiGet<SovStatusResponse>(
+    `/v1/contracts/contracts/${contractId}/sov-status`,
+  );
+}
+
+/** One finding from the contracts completeness rule set (parties/security/EOT). */
+export interface CompletenessFinding {
+  rule_id: string;
+  rule_name: string;
+  severity: 'error' | 'warning' | 'info';
+  passed: boolean;
+  message: string;
+  element_ref: string | null;
+  suggestion: string | null;
+}
+
+/** Overall validation status (mirrors backend ValidationStatus enum). */
+export type CompletenessStatus =
+  | 'passed'
+  | 'warnings'
+  | 'errors'
+  | 'info'
+  | 'skipped'
+  | 'unsupported';
+
+export interface CompletenessReport {
+  contract_id: string;
+  status: CompletenessStatus;
+  score: number | null;
+  summary: {
+    id?: string | null;
+    status: string;
+    score: number | null;
+    counts: {
+      total: number;
+      passed: number;
+      errors: number;
+      warnings: number;
+      infos: number;
+      engine_errors: number;
+    };
+    rule_sets?: string[];
+    supported_rule_sets?: string[];
+    unsupported_rule_sets?: string[];
+    duration_ms?: number;
+  };
+  errors: CompletenessFinding[];
+  warnings: CompletenessFinding[];
+}
+
+/** Run the contracts rule set over a contract for a traffic-light panel. */
+export function getContractCompleteness(
+  contractId: string,
+): Promise<CompletenessReport> {
+  return apiGet<CompletenessReport>(
+    `/v1/contracts/contracts/${contractId}/completeness`,
+  );
+}
+
+/** Aggregate extension-of-time exposure for a contract. */
+export interface EotSummary {
+  contract_id: string;
+  claims_count: number;
+  pending_count: number;
+  decided_count: number;
+  total_days_claimed: number;
+  total_days_granted: number;
+  /** ISO date of the latest revised completion date, or null when none set. */
+  latest_revised_completion_date: string | null;
+}
+
+export function getEotSummary(contractId: string): Promise<EotSummary> {
+  return apiGet<EotSummary>(
+    `/v1/contracts/contracts/${contractId}/eot-summary`,
+  );
+}
+
+export type FinalAccountCheckStatus = 'pass' | 'fail' | 'not_applicable';
+
+/** One close-out condition in the final-account readiness checklist. */
+export interface FinalAccountCheckItem {
+  /** Stable identifier, e.g. `progress_claims_settled` (safe for i18n wiring). */
+  key: string;
+  status: FinalAccountCheckStatus;
+  reason: string;
+  based_on: Record<string, string>;
+}
+
+export interface FinalAccountChecklist {
+  contract_id: string;
+  ready: boolean;
+  /** Passed / applicable × 100 (a Decimal on the wire; coerce with toNum). */
+  completion_percent: number | string;
+  passed_count: number;
+  applicable_count: number;
+  total_count: number;
+  items: FinalAccountCheckItem[];
+}
+
+/** Close-out readiness checklist for a contract. */
+export function getFinalAccountChecklist(
+  contractId: string,
+): Promise<FinalAccountChecklist> {
+  return apiGet<FinalAccountChecklist>(
+    `/v1/contracts/contracts/${contractId}/final-account-checklist`,
+  );
+}
+
+/* ── Gain-share preview (GMP target-cost) ─────────────────────────────── */
+//
+// GET /contracts/{id}/gainshare-preview?actual_cost=… returns the gain / pain
+// split for a hypothetical out-turn cost. It is only valid for GMP contracts
+// (400 otherwise) and needs a gain-share configuration (404 otherwise). Money
+// fields are Decimal on the wire (typed number | string; coerce with toNum).
+// Note: the response carries no currency, so callers pass the contract's.
+
+/** GMP gain / pain split computed for a given out-turn cost. */
+export interface GainshareCalculation {
+  actual_cost: number | string;
+  target_cost: number | string;
+  gmp_cap: number | string;
+  /** Under-run below target, shared between owner and contractor. */
+  savings: number | string;
+  owner_share: number | string;
+  contractor_share: number | string;
+  /** Over-run above target. */
+  overrun: number | string;
+  /** Who carries the over-run, e.g. `contractor` / `owner` / `shared`. */
+  overrun_responsibility: string;
+}
+
+/** Preview the gain / pain split for a GMP contract at a given out-turn cost. */
+export function getGainsharePreview(
+  contractId: string,
+  actualCost: number | string,
+): Promise<GainshareCalculation> {
+  const qs = new URLSearchParams({ actual_cost: String(actualCost) });
+  return apiGet<GainshareCalculation>(
+    `/v1/contracts/contracts/${contractId}/gainshare-preview?${qs.toString()}`,
+  );
+}
+
+/* ── Security / bonds coverage ────────────────────────────────────────── */
+
+/** Bonds / guarantees / insurance held against a contract, summarised. */
+export interface SecurityCoverage {
+  contract_id: string;
+  currency: string;
+  /** Total securities recorded, in any status. */
+  count: number;
+  /** How many are currently `active`. */
+  active_count: number;
+  /** Sum of active security amounts (Decimal on the wire; coerce with toNum). */
+  total_active_amount: number | string;
+  /** Count of securities per status, e.g. `{ required: 1, active: 2 }`. */
+  by_status: Record<string, number>;
+  /** Distinct security types among the active ones, sorted. */
+  active_types: string[];
+}
+
+/** Summary of bonds / guarantees / insurance held on a contract. */
+export function getSecurityCoverage(
+  contractId: string,
+): Promise<SecurityCoverage> {
+  return apiGet<SecurityCoverage>(
+    `/v1/contracts/contracts/${contractId}/security-coverage`,
+  );
+}
+
+/* ── Security register (the rows behind the coverage summary) ─────────── */
+
+/**
+ * The instruments a contract can be secured with, ordered the way a commercial
+ * manager reads them: the bonds, then the guarantees, then the insurance lines.
+ * Mirrors SECURITY_TYPES in the module's schemas; a value outside this list is
+ * refused by the API rather than stored.
+ */
+export const CONTRACT_SECURITY_TYPES = [
+  'performance_bond',
+  'payment_bond',
+  'advance_payment_bond',
+  'retention_bond',
+  'parent_company_guarantee',
+  'bank_guarantee',
+  'insurance_pl',
+  'insurance_car',
+  'insurance_pi',
+  'other',
+] as const;
+
+export type ContractSecurityType = (typeof CONTRACT_SECURITY_TYPES)[number];
+
+/**
+ * The life of one instrument, from the clause that demands it to the day it is
+ * given back or called. Mirrors SECURITY_STATUSES in the module's schemas.
+ */
+export const CONTRACT_SECURITY_STATUSES = [
+  'required',
+  'received',
+  'active',
+  'expired',
+  'released',
+  'claimed',
+] as const;
+
+export type ContractSecurityStatus =
+  (typeof CONTRACT_SECURITY_STATUSES)[number];
+
+export interface ContractSecurity {
+  id: string;
+  contract_id: string;
+  security_type: string;
+  /** The instrument's own number, as the issuer wrote it. */
+  reference: string | null;
+  /** The issuer: the bank, surety or insurer standing behind the instrument. */
+  provider_name: string;
+  /** Face value. Decimal on the wire, so keep the string when round-tripping. */
+  amount: number | string;
+  /** Per row, not per contract: a bond can be issued in another currency. */
+  currency: string;
+  /** Decimal on the wire; null when the row was entered as a flat sum. */
+  percent_of_contract: number | string | null;
+  /** ISO YYYY-MM-DD, or null when the instrument has no stated start. */
+  valid_from: string | null;
+  /** ISO YYYY-MM-DD expiry, or null when it is open-ended. */
+  valid_to: string | null;
+  status: string;
+  document_id: string | null;
+  notes: string | null;
+  metadata: Record<string, unknown>;
+  created_at: string;
+  updated_at: string;
+}
+
+/**
+ * Money and percent are typed `string` on the way in, never `number`. They are
+ * Decimal columns and the wire form is the exact text that was typed; parsing
+ * to a float here would send back a figure nobody entered. The date fields take
+ * `YYYY-MM-DD` only — the schema rejects an empty string, so an unknown date is
+ * omitted rather than blanked.
+ */
+export interface ContractSecurityCreate {
+  contract_id: string;
+  security_type: string;
+  reference?: string | null;
+  provider_name?: string;
+  amount?: string;
+  currency?: string;
+  percent_of_contract?: string;
+  valid_from?: string;
+  valid_to?: string;
+  status?: string;
+  document_id?: string | null;
+  notes?: string | null;
+}
+
+/**
+ * PATCH body. Only the keys present are touched, and note the asymmetry the
+ * service imposes: it drops nulls before writing, so a field cannot be cleared
+ * by sending null. An empty string does clear the free-text fields; the dated
+ * and numeric ones have no clear operation at all.
+ */
+export interface ContractSecurityUpdate {
+  security_type?: string;
+  reference?: string;
+  provider_name?: string;
+  amount?: string;
+  currency?: string;
+  percent_of_contract?: string;
+  valid_from?: string;
+  valid_to?: string;
+  status?: string;
+  document_id?: string | null;
+  notes?: string;
+}
+
+/** Every bond, guarantee and insurance line recorded against a contract. */
+export function listContractSecurities(
+  contractId: string,
+): Promise<ContractSecurity[]> {
+  return apiGet<ContractSecurity[]>(
+    `/v1/contracts/contracts/${contractId}/securities`,
+  );
+}
+
+export function createContractSecurity(
+  contractId: string,
+  body: ContractSecurityCreate,
+): Promise<ContractSecurity> {
+  return apiPost<ContractSecurity>(
+    `/v1/contracts/contracts/${contractId}/securities`,
+    body,
+  );
+}
+
+/**
+ * Securities are addressed by their own id, not through the contract. Note the
+ * doubled segment, as with the party register: the module router is mounted at
+ * /v1/contracts and the route itself is /contracts/securities/{id}, so both
+ * belong in the path.
+ */
+export function updateContractSecurity(
+  securityId: string,
+  body: ContractSecurityUpdate,
+): Promise<ContractSecurity> {
+  return apiPatch<ContractSecurity>(
+    `/v1/contracts/contracts/securities/${securityId}`,
+    body,
+  );
+}
+
+export function deleteContractSecurity(securityId: string): Promise<void> {
+  return apiDelete(`/v1/contracts/contracts/securities/${securityId}`);
+}
+
+/* ── Milestone payment schedule ───────────────────────────────────────── */
+
+/** One resolved milestone in the payment schedule. */
+export interface MilestoneScheduleItem {
+  id: string;
+  code: string;
+  name: string;
+  /** ISO date the milestone is planned for, or null when unscheduled. */
+  planned_date: string | null;
+  /** What releases the milestone, e.g. `date` / `completion` / `approval`. */
+  trigger: string;
+  /** One of `pending` / `reached` / `invoiced` / `paid`. */
+  status: string;
+  /** Resolved milestone value (Decimal on the wire; coerce with toNum). */
+  value: number | string;
+}
+
+export interface MilestoneSchedule {
+  contract_id: string;
+  currency: string;
+  count: number;
+  /** Total scheduled milestone value (Decimal on the wire; coerce with toNum). */
+  scheduled_value: number | string;
+  milestones: MilestoneScheduleItem[];
+}
+
+/** Resolve each milestone's value and the total scheduled milestone value. */
+export function getMilestoneSchedule(
+  contractId: string,
+): Promise<MilestoneSchedule> {
+  return apiGet<MilestoneSchedule>(
+    `/v1/contracts/contracts/${contractId}/milestone-schedule`,
+  );
+}
+
+/* ── E-signature bridge ───────────────────────────────────────────────── */
+
+/** One expected signatory on a session, derived from the party register. */
+export interface ContractSignatory {
+  name: string;
+  role: string;
+  required?: boolean;
+}
+
+/**
+ * A signing session opened against a contract.
+ *
+ * `content_hash_current` and `stale_signatories` are the two fields the screen
+ * exists for. A contract can be edited while it is out for signature, and when
+ * that happens everyone who already signed signed different paper. The flag
+ * drives the banner, the names drive the list of who has to sign again.
+ */
+export interface ContractSigningSession {
+  id: string;
+  document_ref: string;
+  document_content_hash: string;
+  provider_capability: string;
+  status: string;
+  signatory_map: ContractSignatory[];
+  expires_at: string | null;
+  created_at: string | null;
+  content_hash_current: boolean;
+  stale_signatories: string[];
+  signed_roles: string[];
+}
+
+export interface ContractSigningSessionOpen {
+  provider_capability?: string;
+  expires_at?: string | null;
+  /** Override the map derived from the contract's parties. Rarely needed. */
+  signatories?: ContractSignatory[];
+}
+
+/**
+ * Put the contract up for signature.
+ *
+ * Runs the compliance gate first, so this rejects with 422 on a contract that
+ * would be blocked at activation. That is the point: finding out after every
+ * party has signed is finding out too late.
+ */
+export function openContractSigningSession(
+  contractId: string,
+  body: ContractSigningSessionOpen = {},
+): Promise<ContractSigningSession> {
+  return apiPost<ContractSigningSession>(
+    `/v1/contracts/contracts/${contractId}/signing-session`,
+    body,
+  );
+}
+
+/** Every session ever opened against this contract, newest first. */
+export function listContractSigningSessions(
+  contractId: string,
+): Promise<ContractSigningSession[]> {
+  return apiGet<ContractSigningSession[]>(
+    `/v1/contracts/contracts/${contractId}/signing-sessions`,
+  );
+}
+
+/**
+ * Bring the contract's own status in line with its signing session.
+ *
+ * A partly signed contract stays in draft; a fully signed one is transitioned
+ * to active through the normal path, gate and audit included.
+ */
+export function syncContractFromSigning(
+  contractId: string,
+): Promise<ContractItem> {
+  return apiPost<ContractItem>(
+    `/v1/contracts/contracts/${contractId}/signing-session/sync`,
+    {},
+  );
+}
+
+/* ── Party register ───────────────────────────────────────────────────── */
+
+/**
+ * The roles a party can hold on a contract, in the order a signature block
+ * puts them. Mirrors PARTY_ROLES in the module's schemas; a value outside this
+ * list is refused by the API rather than stored.
+ */
+export const CONTRACT_PARTY_ROLES = [
+  'employer',
+  'contractor',
+  'subcontractor',
+  'consultant',
+  'architect',
+  'engineer',
+  'guarantor',
+  'other',
+] as const;
+
+export type ContractPartyRole = (typeof CONTRACT_PARTY_ROLES)[number];
+
+/**
+ * The roles that are asked to sign. Kept in step with SIGNING_PARTY_ROLES on
+ * the backend, which is what actually decides: this copy only lets the screen
+ * say which rows matter before the server is asked.
+ */
+export const SIGNING_PARTY_ROLES: readonly ContractPartyRole[] = [
+  'employer',
+  'contractor',
+  'subcontractor',
+];
+
+export interface ContractParty {
+  id: string;
+  contract_id: string;
+  party_role: string;
+  party_type: string;
+  party_id: string | null;
+  display_name: string;
+  /**
+   * The name resolved from the linked contact, subcontractor or user, which is
+   * current where display_name is a copy taken when the row was written. Null
+   * when there is no link or it no longer resolves, and the caller falls back
+   * to display_name.
+   */
+  resolved_name: string | null;
+  is_primary: boolean;
+  contact_details: Record<string, unknown>;
+  metadata: Record<string, unknown>;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ContractPartyCreate {
+  contract_id: string;
+  party_role: string;
+  party_type?: string;
+  party_id?: string | null;
+  display_name: string;
+  is_primary?: boolean;
+}
+
+/** The contract's parties, each with the live name resolved for it. */
+export function listContractParties(
+  contractId: string,
+): Promise<ContractParty[]> {
+  return apiGet<ContractParty[]>(
+    `/v1/contracts/contracts/${contractId}/parties`,
+  );
+}
+
+export function createContractParty(
+  contractId: string,
+  body: ContractPartyCreate,
+): Promise<ContractParty> {
+  return apiPost<ContractParty>(
+    `/v1/contracts/contracts/${contractId}/parties`,
+    body,
+  );
+}
+
+/**
+ * Parties are addressed by their own id, not through the contract. Note the
+ * doubled segment: the module router is mounted at /v1/contracts and the route
+ * itself is /contracts/parties/{id}, so both belong in the path. Dropping one
+ * gives a 404 that looks like a missing row rather than a missing route.
+ */
+export function deleteContractParty(partyId: string): Promise<void> {
+  return apiDelete(`/v1/contracts/contracts/parties/${partyId}`);
 }
 
 /* ── Back-compat aliases (old skeleton names) ─────────────────────────── */

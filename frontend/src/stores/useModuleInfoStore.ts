@@ -1,20 +1,25 @@
 // DDC-CWICR-OE: DataDrivenConstruction · OpenConstructionERP
 // Copyright (c) 2026 Artem Boiko / DataDrivenConstruction
 /**
- * Registry of COLLAPSED module info cards on the current page.
+ * Registry of COLLAPSED module info blocks on the current page.
  *
- * Founder decision 2026-06-06: when a `DismissibleInfo` card is collapsed
- * (card click or X) it disappears from the page entirely - no leftover
- * "Module information" line in the content flow. Instead a small info icon
- * appears in the TOP APP BAR, right after the module name (project pill >
- * module icon + name > info icon). Clicking that icon re-expands the card.
+ * When a `DismissibleInfo` card or a `CollapsibleSection` explainer is
+ * collapsed it disappears from the content flow entirely. The way back is a
+ * single `ModuleInfoButton`: an information icon in the top app bar, sitting
+ * immediately to the right of the module name (founder 2026-08-07).
  *
- * Mechanics: every DismissibleInfo registers itself here while collapsed
- * (key + an `expand` callback) and unregisters when expanded or unmounted,
- * so navigation naturally clears the registry. The Header renders the icon
- * whenever at least one entry exists and fires every entry's `expand` - the
- * canon is one info card per page, so this is a single-card toggle in
- * practice while staying correct for multi-card pages.
+ * Mechanics: every collapsed block registers itself here (key + an `expand`
+ * callback) and unregisters when expanded or unmounted, so navigating away
+ * clears the registry by itself. The icon fires every registered entry's
+ * `expand`, which is why one click restores a page carrying both a card and
+ * an explainer.
+ *
+ * There used to be a second, competing control - a labelled pill next to the
+ * module's "How it works" button (founder 2026-07-23) - and a `guideKeys`
+ * registry whose only job was to let the Header detect that pill and suppress
+ * itself. Both are gone rather than left dormant: with one control there is
+ * nothing to arbitrate between, and a suppression flag no caller reads is a
+ * mechanism the next reader has to disprove.
  */
 
 import { create } from 'zustand';
@@ -30,7 +35,7 @@ interface ModuleInfoState {
   entries: CollapsedModuleInfo[];
   register: (entry: CollapsedModuleInfo) => void;
   unregister: (key: string) => void;
-  /** Expand every collapsed card on the page (top-bar icon click). */
+  /** Expand every collapsed card on the page (re-open control click). */
   expandAll: () => void;
 }
 

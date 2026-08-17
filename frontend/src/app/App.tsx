@@ -4,7 +4,7 @@ import { Suspense, lazy, useState, useCallback, useEffect, useLayoutEffect, useC
 import { Routes, Route, Navigate, Outlet, useLocation, useParams } from 'react-router-dom';
 import { AppLayout } from './layout';
 import { DashboardPage } from '@/features/dashboard';
-import { LoginPage, RegisterPage, ForgotPasswordPage } from '@/features/auth';
+import { LoginPage, RegisterPage, ForgotPasswordPage, AuthedHome } from '@/features/auth';
 import { ProjectsPage, CreateProjectPage, ProjectDetailPage, ProjectSettingsPage } from '@/features/projects';
 // Import the lightweight BOQ pages from their source modules directly,
 // NOT via the `@/features/boq` barrel.  The barrel re-exports
@@ -30,12 +30,14 @@ import { useAuthStore } from '@/stores/useAuthStore';
 import { useThemeStore } from '@/stores/useThemeStore';
 import { useBrandingStore } from '@/stores/useBrandingStore';
 import { usePreferencesStore } from '@/stores/usePreferencesStore';
+import { hydrateInfoBlocksFromServer } from '@/stores/useInfoBlockPrefsStore';
 import { ddcVerifyIntegrity, ddcInjectMeta, DDC_ORIGIN } from '@/shared/lib/ddc-integrity';
 import { NavigationProgress } from '@/shared/lib/navigationProgress';
 import { useKeyboardShortcuts } from '@/shared/hooks/useKeyboardShortcuts';
 import { useTranslation } from 'react-i18next';
 import { getLanguageByCode } from './i18n';
 import { initErrorLogger } from '@/shared/lib/errorLogger';
+import { installDesktopExternalLinks } from '@/shared/lib/desktop';
 
 // Lazy-loaded heavy pages — code-split into separate chunks
 const BOQEditorPage = lazy(() =>
@@ -55,6 +57,9 @@ const CadDataExplorerPage = lazy(() =>
 );
 const PointCloudPage = lazy(() =>
   import('@/features/pointcloud/PointCloudPage').then((m) => ({ default: m.PointCloudPage }))
+);
+const PipelinesPage = lazy(() =>
+  import('@/features/pipelines/PipelinesPage').then((m) => ({ default: m.PipelinesPage }))
 );
 const MatchElementsPage = lazy(() =>
   import('@/features/match-elements/MatchElementsPage').then((m) => ({ default: m.MatchElementsPage }))
@@ -117,9 +122,18 @@ const PunchListPage = lazy(() =>
 const IssuesHubPage = lazy(() =>
   import('@/features/issues/IssuesHubPage').then((m) => ({ default: m.IssuesHubPage }))
 );
+const DeadlinesPage = lazy(() =>
+  import('@/features/deadlines/DeadlinesPage').then((m) => ({ default: m.DeadlinesPage }))
+);
 const BcfPage = lazy(() => import('@/features/bcf/BcfPage').then((m) => ({ default: m.BcfPage })));
 const ModelReviewPage = lazy(() =>
   import('@/features/bim/ModelReviewPage').then((m) => ({ default: m.ModelReviewPage }))
+);
+const PlanRoomPage = lazy(() =>
+  import('@/features/plan-room/PlanRoomPage').then((m) => ({ default: m.PlanRoomPage }))
+);
+const ProgressPage = lazy(() =>
+  import('@/features/progress/ProgressPage').then((m) => ({ default: m.ProgressPage }))
 );
 const CloseoutPage = lazy(() => import('@/features/closeout/CloseoutPage'));
 const InboxPage = lazy(() =>
@@ -140,6 +154,20 @@ const ProcurementPage = lazy(() =>
 const SafetyPage = lazy(() =>
   import('@/features/safety/SafetyPage').then((m) => ({ default: m.SafetyPage }))
 );
+const CredentialsPage = lazy(() =>
+  import('@/features/credentials/CredentialsPage').then((m) => ({ default: m.CredentialsPage }))
+);
+const ModuleBuilderPage = lazy(() =>
+  import('@/features/module-builder/ModuleBuilderPage').then((m) => ({ default: m.ModuleBuilderPage }))
+);
+// One screen for every module ever built on this instance: it renders from the
+// specification the module serves, because a runtime module cannot ship a
+// compiled screen of its own.
+const GeneratedModulePage = lazy(() =>
+  import('@/features/module-builder/GeneratedModulePage').then((m) => ({
+    default: m.GeneratedModulePage,
+  }))
+);
 const ContactsPage = lazy(() =>
   import('@/features/contacts/ContactsPage').then((m) => ({ default: m.ContactsPage }))
 );
@@ -158,6 +186,25 @@ const SubmittalsPage = lazy(() =>
 const CorrespondencePage = lazy(() =>
   import('@/features/correspondence/CorrespondencePage').then((m) => ({ default: m.CorrespondencePage }))
 );
+// International delivery / authority modules (frontends added this wave).
+const AuthoritySubmissionPage = lazy(() =>
+  import('@/features/authority-submission/AuthoritySubmissionPage').then((m) => ({ default: m.AuthoritySubmissionPage }))
+);
+const ReviewAuthorityPage = lazy(() =>
+  import('@/features/review-authority/ReviewAuthorityPage').then((m) => ({ default: m.ReviewAuthorityPage }))
+);
+const SigningPage = lazy(() =>
+  import('@/features/signing/SigningPage').then((m) => ({ default: m.SigningPage }))
+);
+const SourceDataPage = lazy(() =>
+  import('@/features/source-data/SourceDataPage').then((m) => ({ default: m.SourceDataPage }))
+);
+const ProjectRoutePage = lazy(() =>
+  import('@/features/project-route/ProjectRoutePage').then((m) => ({ default: m.ProjectRoutePage }))
+);
+const SiteSupervisionPage = lazy(() =>
+  import('@/features/site-supervision/SiteSupervisionPage').then((m) => ({ default: m.SiteSupervisionPage }))
+);
 const CDEPage = lazy(() =>
   import('@/features/cde/CDEPage').then((m) => ({ default: m.CDEPage }))
 );
@@ -172,6 +219,27 @@ const InspectionsPage = lazy(() =>
 );
 const NCRPage = lazy(() =>
   import('@/features/ncr/NCRPage').then((m) => ({ default: m.NCRPage }))
+);
+// Delivery-lifecycle registers (backend modules oe_site_inventory / oe_site_prep /
+// oe_temporary_works / oe_interface_management / oe_defects_liability).
+const SiteInventoryPage = lazy(() =>
+  import('@/features/site-inventory/SiteInventoryPage').then((m) => ({ default: m.SiteInventoryPage }))
+);
+const SitePrepPage = lazy(() =>
+  import('@/features/site-prep/SitePrepPage').then((m) => ({ default: m.SitePrepPage }))
+);
+const TemporaryWorksPage = lazy(() =>
+  import('@/features/temporary-works/TemporaryWorksPage').then((m) => ({ default: m.TemporaryWorksPage }))
+);
+const InterfaceManagementPage = lazy(() =>
+  import('@/features/interface-management/InterfaceManagementPage').then((m) => ({
+    default: m.InterfaceManagementPage,
+  }))
+);
+const DefectsLiabilityPage = lazy(() =>
+  import('@/features/defects-liability/DefectsLiabilityPage').then((m) => ({
+    default: m.DefectsLiabilityPage,
+  }))
 );
 const MoCPage = lazy(() =>
   import('@/features/moc/MoCPage').then((m) => ({ default: m.MoCPage }))
@@ -233,6 +301,9 @@ const ProjectIntelligencePage = lazy(() =>
 const FileManagerPage = lazy(() =>
   import('@/features/file-manager/FileManagerPage').then((m) => ({ default: m.FileManagerPage }))
 );
+const SheetsIndexPage = lazy(() =>
+  import('@/features/file-manager/SheetsIndexPage').then((m) => ({ default: m.SheetsIndexPage }))
+);
 const TrashPage = lazy(() =>
   import('@/features/file-trash/TrashPage').then((m) => ({ default: m.TrashPage }))
 );
@@ -241,6 +312,9 @@ const GlobalSearchPage = lazy(() =>
 );
 const TransmittalLogPage = lazy(() =>
   import('@/features/file-transmittals/TransmittalLogPage').then((m) => ({ default: m.TransmittalLogPage }))
+);
+const FileApprovalsRegisterPage = lazy(() =>
+  import('@/features/file-approvals/FileApprovalsRegisterPage').then((m) => ({ default: m.FileApprovalsRegisterPage }))
 );
 const SharePage = lazy(() =>
   import('@/features/file-manager/SharePage').then((m) => ({ default: m.SharePage }))
@@ -315,6 +389,24 @@ const ResourceLevelingPage = lazy(() =>
 );
 const ContractsPage = lazy(() =>
   import('@/features/contracts').then((m) => ({ default: m.ContractsPage }))
+);
+const PaymentClockPage = lazy(() =>
+  import('@/features/payment-clock').then((m) => ({ default: m.PaymentClockPage }))
+);
+const TaxWithholdingPage = lazy(() =>
+  import('@/features/tax-withholding').then((m) => ({ default: m.TaxWithholdingPage }))
+);
+const EInvoiceClearancePage = lazy(() =>
+  import('@/features/einvoice-clearance').then((m) => ({ default: m.EInvoiceClearancePage }))
+);
+const CostMatchPage = lazy(() =>
+  import('@/features/cost-match').then((m) => ({ default: m.CostMatchPage }))
+);
+const FullEvmPage = lazy(() =>
+  import('@/features/full-evm').then((m) => ({ default: m.FullEvmPage }))
+);
+const FxPage = lazy(() =>
+  import('@/features/fx').then((m) => ({ default: m.FxPage }))
 );
 const ProgressClaimDetailPage = lazy(() =>
   import('@/features/contracts').then((m) => ({ default: m.ProgressClaimDetailPage }))
@@ -424,6 +516,9 @@ const ProjectControlsPage = lazy(() =>
 const ChangeIntelligencePage = lazy(() =>
   import('@/features/change-intelligence').then((m) => ({ default: m.ChangeIntelligencePage }))
 );
+const ClaimsEvidencePage = lazy(() =>
+  import('@/features/claims-evidence').then((m) => ({ default: m.ClaimsEvidencePage }))
+);
 const ValueDashboardPage = lazy(() =>
   import('@/features/value').then((m) => ({ default: m.ValueDashboardPage }))
 );
@@ -434,6 +529,9 @@ const ReconciliationPage = lazy(() =>
 );
 const InboundCapturePage = lazy(() =>
   import('@/features/inbound').then((m) => ({ default: m.InboundCapturePage })),
+);
+const InboundEmailPage = lazy(() =>
+  import('@/features/inbound-email').then((m) => ({ default: m.InboundEmailPage })),
 );
 const RetrievalPage = lazy(() => import('@/features/retrieval').then((m) => ({ default: m.RetrievalPage })));
 // v4.1 — three additional P1 Slice-1 features land behind dedicated routes
@@ -532,6 +630,8 @@ const AllowancesPage = lazy(() =>
   import('@/features/allowances').then((m) => ({ default: m.AllowancesPage }))
 );
 const DesignOptionsPage = lazy(() => import('@/features/design-options'));
+const TeamsPage = lazy(() => import('@/features/teams'));
+const FormworkPage = lazy(() => import('@/features/formwork'));
 const WasteFactorsPage = lazy(() =>
   import('@/features/waste-factors').then((m) => ({ default: m.WasteFactorsPage }))
 );
@@ -574,6 +674,10 @@ const HowItWorksPage = lazy(() => import('@/features/help/HowItWorksPage'));
 // playbook data + runner stay out of the boot bundle.
 const CasesPage = lazy(() =>
   import('@/features/cases').then((m) => ({ default: m.CasesPage }))
+);
+// The case editor, split from the hub: most readers never author one.
+const CaseEditorPage = lazy(() =>
+  import('@/features/cases').then((m) => ({ default: m.CaseEditorPage }))
 );
 // Inside track - backers-only early-look panel (donation perk). Lazy so the
 // changelog it reuses does not weigh down the boot bundle.
@@ -828,6 +932,14 @@ export default function App() {
     (window as any).__ddc_oe = ddcVerifyIntegrity();
   }
 
+  // Desktop shell: outbound links (docs, GitHub, marketing site, contact mail)
+  // must be handed to the OS browser, because the webview swallows a
+  // target="_blank" anchor and nothing opens. Install the one global click
+  // handler once on mount. No-op in a normal web build.
+  useEffect(() => {
+    installDesktopExternalLinks();
+  }, []);
+
   // Pull the user's saved custom-unit catalogue once after auth resolves.
   // Fire-and-forget — the BOQ Unit dropdown still works from localStorage
   // before this completes; the server merge just keeps it consistent across
@@ -835,6 +947,10 @@ export default function App() {
   useEffect(() => {
     if (!isAuthenticated) return;
     void syncCustomUnitsFromServer();
+    // Per-user module info-card collapse state, so a card the user collapsed
+    // (into the pill next to "How it works") stays collapsed on every browser
+    // and device, not just the one they clicked on.
+    void hydrateInfoBlocksFromServer();
   }, [isAuthenticated]);
 
   // Pull the workspace white-label brand from the server so it follows the user
@@ -883,8 +999,9 @@ export default function App() {
 
   return (
     <Suspense fallback={<LoadingScreen />}>
-      {/* Route-transition pending feedback: under v7_startTransition the
-          old page stays on screen while a lazy chunk loads, so this binder
+      {/* Route-transition pending feedback: a navigation commits inside a
+          transition, so the old page stays on screen while a lazy chunk
+          loads and nothing on screen moves. This binder
           drives the top progress bar + sidebar row spinner for the gap
           between history push and location commit (navigationProgress.ts). */}
       <NavigationProgress />
@@ -951,10 +1068,10 @@ export default function App() {
         />
 
         {/* Auth — public */}
-        <Route path="/login" element={isAuthenticated ? <Navigate to="/" replace /> : <LoginPage />} />
-        <Route path="/login-next" element={isAuthenticated ? <Navigate to="/" replace /> : <Suspense fallback={<LoadingScreen />}><LoginPageNext /></Suspense>} />
-        <Route path="/register" element={isAuthenticated ? <Navigate to="/" replace /> : <RegisterPage />} />
-        <Route path="/forgot-password" element={isAuthenticated ? <Navigate to="/" replace /> : <ForgotPasswordPage />} />
+        <Route path="/login" element={isAuthenticated ? <AuthedHome /> : <LoginPage />} />
+        <Route path="/login-next" element={isAuthenticated ? <AuthedHome /> : <Suspense fallback={<LoadingScreen />}><LoginPageNext /></Suspense>} />
+        <Route path="/register" element={isAuthenticated ? <AuthedHome /> : <RegisterPage />} />
+        <Route path="/forgot-password" element={isAuthenticated ? <AuthedHome /> : <ForgotPasswordPage />} />
 
         {/* Onboarding — full-screen, no layout */}
         <Route path="/onboarding" element={
@@ -987,9 +1104,20 @@ export default function App() {
         <Route path="/chat/admin" element={<P title="Chat Observability"><ERPChatAdminStatsPage /></P>} />
         <Route path="/cad-takeoff" element={<Navigate to="/data-explorer" replace />} />
         <Route path="/cad-explorer" element={<Navigate to="/data-explorer" replace />} />
-        <Route path="/data-explorer" element={<P title="Data Explorer"><CadDataExplorerPage /></P>} />
+        {/* #149: this literal is both the browser-tab title and the lookup key
+            into Header's TITLE_I18N_MAP. Renaming it here without renaming the
+            map entry drops the lookup to `t(title, { defaultValue: title })`,
+            which ships the English string to all 28 other locales and throws
+            nothing. The two move together. */}
+        <Route path="/data-explorer" element={<P title="CAD-BIM BI Explorer"><CadDataExplorerPage /></P>} />
         <Route path="/match-elements" element={<P title="Match Elements"><MatchElementsPage /></P>} />
         <Route path="/pointcloud" element={<P title="Point Cloud"><PointCloudPage /></P>} />
+        {/* The sidebar has linked to /pipelines since the module landed, and the
+            feature is complete (page, canvas, store, templates, api), but the
+            route was never declared, so the menu entry went nowhere. It only
+            shows for an advanced user who installed an opt-in module, which is
+            why it went unreported for so long. */}
+        <Route path="/pipelines" element={<P title="Pipelines"><PipelinesPage /></P>} />
         <Route path="/bim" element={<P title="BIM Viewer"><BIMPage /></P>} />
         <Route path="/bim/federations" element={<P title="BIM Federations"><FederationsPage /></P>} />
         <Route path="/bim/rules" element={<P title="BIM Rules"><BIMQuantityRulesPage /></P>} />
@@ -1002,6 +1130,8 @@ export default function App() {
         <Route path="/coordination" element={<P title="Model Coordination"><CoordinationHubPage /></P>} />
         <Route path="/bcf" element={<P title="Model Issues"><BcfPage /></P>} />
         <Route path="/model-review" element={<P title="Model Review"><ModelReviewPage /></P>} />
+        <Route path="/plan-room" element={<P title="Plan Room"><PlanRoomPage /></P>} />
+        <Route path="/progress" element={<P title="Progress"><ProgressPage /></P>} />
         <Route path="/assets" element={<P title="Asset Register"><AssetsPage /></P>} />
         <Route path="/bim/:modelId" element={<P title="BIM Viewer"><BIMPage /></P>} />
         <Route path="/projects/:projectId/bim" element={<P title="BIM Viewer"><BIMPage /></P>} />
@@ -1030,6 +1160,7 @@ export default function App() {
         <Route path="/preliminaries" element={<P title="Preliminaries"><PreliminariesPage /></P>} />
         <Route path="/allowances" element={<P title="Allowances"><AllowancesPage /></P>} />
         <Route path="/design-options" element={<P title="Design Options"><DesignOptionsPage /></P>} />
+        <Route path="/formwork" element={<P title="Formwork"><FormworkPage /></P>} />
         <Route path="/price-index" element={<P title="Price Index"><PriceIndexPage /></P>} />
         <Route path="/labor-rates" element={<P title="Labor Rates"><LaborRatesPage /></P>} />
         <Route path="/resource-summary" element={<P title="Resource Summary"><ResourceSummaryPage /></P>} />
@@ -1080,8 +1211,14 @@ export default function App() {
         <Route path="/files/trash" element={<P title="Recycle Bin"><TrashPage /></P>} />
         <Route path="/files/search" element={<P title="Search across projects"><GlobalSearchPage /></P>} />
         <Route path="/files/transmittals" element={<P title="Transmittals"><TransmittalLogPage /></P>} />
-        <Route path="/files" element={<P title="Project Files"><FileManagerPage /></P>} />
-        <Route path="/projects/:projectId/files" element={<P title="Project Files"><FileManagerPage /></P>} />
+        <Route path="/files/approvals" element={<P title="Approvals register"><FileApprovalsRegisterPage /></P>} />
+        <Route path="/files" element={<P title="Documents"><FileManagerPage /></P>} />
+        <Route path="/projects/:projectId/files" element={<P title="Documents"><FileManagerPage /></P>} />
+        {/* Drawing-sheet index. The page takes :projectId when it is there
+            and otherwise falls back to the active project, so both entries
+            work and the sidebar can link the bare path. */}
+        <Route path="/sheets" element={<P title="Drawing Sheets"><SheetsIndexPage /></P>} />
+        <Route path="/projects/:projectId/sheets" element={<P title="Drawing Sheets"><SheetsIndexPage /></P>} />
 
         <Route path="/risks" element={<P title="Risk Register"><RiskRegisterPage /></P>} />
         {/* Monte Carlo IA merge (#71): the standalone Risk Analysis tool
@@ -1101,6 +1238,7 @@ export default function App() {
         <Route path="/markups" element={<P title="Markups"><MarkupsPage /></P>} />
         <Route path="/markups/compare" element={<P title="Compare Revisions"><PdfComparePage /></P>} />
         <Route path="/punchlist" element={<P title="Punch List"><PunchListPage /></P>} />
+        <Route path="/deadlines" element={<P title="Deadlines"><DeadlinesPage /></P>} />
         <Route path="/issues" element={<P title="Issues"><IssuesHubPage /></P>} />
         <Route path="/closeout" element={<P title="Handover & Closeout"><CloseoutPage /></P>} />
         <Route path="/field-reports" element={<P title="Field Reports"><FieldReportsPage /></P>} />
@@ -1114,6 +1252,16 @@ export default function App() {
         <Route path="/safety" element={<P title="Safety"><SafetyPage /></P>} />
         <Route path="/projects/:projectId/safety" element={<P title="Safety"><SafetyPage /></P>} />
 
+        <Route path="/credentials" element={<P title="Credentials"><CredentialsPage /></P>} />
+        <Route path="/projects/:projectId/credentials" element={<P title="Credentials"><CredentialsPage /></P>} />
+
+        {/* The register of modules built here, and the screen each one renders
+            on. `:moduleKey` is the module's key, not its URL: the loader owns
+            the key-to-URL rule and the page asks the server for it. */}
+        <Route path="/module-builder" element={<P title="Module Builder"><ModuleBuilderPage /></P>} />
+        <Route path="/modules/:moduleKey" element={<P title="Module"><GeneratedModulePage /></P>} />
+        <Route path="/projects/:projectId/modules/:moduleKey" element={<P title="Module"><GeneratedModulePage /></P>} />
+
         <Route path="/contacts" element={<P title="Contacts"><ContactsPage /></P>} />
         <Route path="/projects/:projectId/tasks" element={<P title="Tasks"><TasksPage /></P>} />
         <Route path="/tasks" element={<P title="Tasks"><TasksPage /></P>} />
@@ -1124,6 +1272,18 @@ export default function App() {
         <Route path="/submittals" element={<P title="Submittals"><SubmittalsPage /></P>} />
         <Route path="/projects/:projectId/correspondence" element={<P title="Correspondence"><CorrespondencePage /></P>} />
         <Route path="/correspondence" element={<P title="Correspondence"><CorrespondencePage /></P>} />
+        <Route path="/projects/:projectId/authority-submissions" element={<P title="Authority Submissions"><AuthoritySubmissionPage /></P>} />
+        <Route path="/authority-submissions" element={<P title="Authority Submissions"><AuthoritySubmissionPage /></P>} />
+        <Route path="/projects/:projectId/review-authority" element={<P title="Review Authority"><ReviewAuthorityPage /></P>} />
+        <Route path="/review-authority" element={<P title="Review Authority"><ReviewAuthorityPage /></P>} />
+        <Route path="/projects/:projectId/signing" element={<P title="E-Signatures"><SigningPage /></P>} />
+        <Route path="/signing" element={<P title="E-Signatures"><SigningPage /></P>} />
+        <Route path="/projects/:projectId/source-data" element={<P title="Source Data"><SourceDataPage /></P>} />
+        <Route path="/source-data" element={<P title="Source Data"><SourceDataPage /></P>} />
+        <Route path="/projects/:projectId/project-route" element={<P title="Route Classifier"><ProjectRoutePage /></P>} />
+        <Route path="/project-route" element={<P title="Route Classifier"><ProjectRoutePage /></P>} />
+        <Route path="/projects/:projectId/site-supervision" element={<P title="Site Supervision"><SiteSupervisionPage /></P>} />
+        <Route path="/site-supervision" element={<P title="Site Supervision"><SiteSupervisionPage /></P>} />
         <Route path="/projects/:projectId/cde" element={<P title="CDE"><CDEPage /></P>} />
         <Route path="/cde" element={<P title="CDE"><CDEPage /></P>} />
         <Route path="/projects/:projectId/transmittals" element={<P title="Transmittals"><TransmittalsPage /></P>} />
@@ -1134,6 +1294,16 @@ export default function App() {
         <Route path="/inspections" element={<P title="Inspections"><InspectionsPage /></P>} />
         <Route path="/projects/:projectId/ncr" element={<P title="NCR"><NCRPage /></P>} />
         <Route path="/ncr" element={<P title="NCR"><NCRPage /></P>} />
+        <Route path="/projects/:projectId/site-inventory" element={<P title="Site Inventory"><SiteInventoryPage /></P>} />
+        <Route path="/site-inventory" element={<P title="Site Inventory"><SiteInventoryPage /></P>} />
+        <Route path="/projects/:projectId/site-prep" element={<P title="Site Mobilisation"><SitePrepPage /></P>} />
+        <Route path="/site-prep" element={<P title="Site Mobilisation"><SitePrepPage /></P>} />
+        <Route path="/projects/:projectId/temporary-works" element={<P title="Temporary Works"><TemporaryWorksPage /></P>} />
+        <Route path="/temporary-works" element={<P title="Temporary Works"><TemporaryWorksPage /></P>} />
+        <Route path="/projects/:projectId/interface-management" element={<P title="Interface Register"><InterfaceManagementPage /></P>} />
+        <Route path="/interface-management" element={<P title="Interface Register"><InterfaceManagementPage /></P>} />
+        <Route path="/projects/:projectId/defects-liability" element={<P title="Defects Liability"><DefectsLiabilityPage /></P>} />
+        <Route path="/defects-liability" element={<P title="Defects Liability"><DefectsLiabilityPage /></P>} />
         <Route path="/projects/:projectId/moc" element={<P title="Management of Change"><MoCPage /></P>} />
         <Route path="/moc" element={<P title="Management of Change"><MoCPage /></P>} />
         {/* Construction Control (QA/QC) - acceptance criteria, inspections,
@@ -1146,6 +1316,10 @@ export default function App() {
         <Route path="/portfolio" element={<P title="Portfolio"><PortfolioPage /></P>} />
 
         <Route path="/users" element={<P title="User Management"><UserManagementPage /></P>} />
+        {/* Teams sit beside Users rather than under Governance: they are
+            per-project and edited by the project owner, not deployment-wide
+            policy set by an administrator. */}
+        <Route path="/teams" element={<P title="Teams and Visibility"><TeamsPage /></P>} />
         <Route path="/admin/audit-log" element={<P title="Audit Log"><AuditLogPage /></P>} />
         {/* Governance — merged home for Permissions, Approval Routes and
             Validation Rules (three /modules-style top tabs). The active
@@ -1169,8 +1343,14 @@ export default function App() {
         <Route path="/about" element={<P title="About"><AboutPage /></P>} />
         <Route path="/how-it-works" element={<P title="How it works"><HowItWorksPage /></P>} />
         {/* Cases (playbooks) - list at /cases, the stepper at /cases/:playbookId
-            (one component serves both so it stays a single lazy chunk). */}
+            (one component serves both so it stays a single lazy chunk).
+            The editor is a separate chunk: most readers never author a case,
+            and the form has no business loading for the ones who do not.
+            /cases/new is declared before the stepper for readability only -
+            the router ranks a static segment above a dynamic one regardless. */}
         <Route path="/cases" element={<P title="Cases"><CasesPage /></P>} />
+        <Route path="/cases/new" element={<P title="Cases"><CaseEditorPage /></P>} />
+        <Route path="/cases/:playbookId/edit" element={<P title="Cases"><CaseEditorPage /></P>} />
         <Route path="/cases/:playbookId" element={<P title="Cases"><CasesPage /></P>} />
         {/* Inside track - backers-only early-look panel (donation perk):
             recent releases (reused from the /about changelog) + a short
@@ -1225,7 +1405,13 @@ export default function App() {
         <Route path="/service" element={<P title="Service & Maintenance"><ServicePage /></P>} />
         <Route path="/projects/:projectId/service" element={<P title="Service & Maintenance"><ServicePage /></P>} />
         <Route path="/equipment" element={<P title="Equipment & Fleet"><EquipmentPage /></P>} />
-        <Route path="/projects/:projectId/equipment" element={<P title="Equipment & Fleet"><EquipmentPage /></P>} />
+        {/* The fleet is a company register, not a project one: only a hire
+            (EquipmentRental) carries a project, the machine itself does not.
+            A route with :projectId in it promised a filter the data cannot
+            express, and the page answered it with the whole register, silently.
+            Redirected rather than deleted so an old link still lands somewhere
+            true. Same for the two registers below. */}
+        <Route path="/projects/:projectId/equipment" element={<Navigate to="/equipment" replace />} />
         <Route path="/payroll" element={<P title="Payroll"><PayrollPage /></P>} />
         <Route path="/projects/:projectId/payroll" element={<P title="Payroll"><PayrollPage /></P>} />
         <Route path="/daily-diary" element={<P title="Daily Diary"><DailyDiaryPage /></P>} />
@@ -1233,7 +1419,8 @@ export default function App() {
         <Route path="/field-time" element={<P title="Field Time"><FieldTimePage /></P>} />
         <Route path="/projects/:projectId/field-time" element={<P title="Field Time"><FieldTimePage /></P>} />
         <Route path="/portal" element={<P title="Client & Partner Portal"><PortalPage /></P>} />
-        <Route path="/projects/:projectId/portal" element={<P title="Client & Partner Portal"><PortalPage /></P>} />
+        {/* Portal users, access rules and sessions carry no project at all. */}
+        <Route path="/projects/:projectId/portal" element={<Navigate to="/portal" replace />} />
         <Route path="/resources" element={<P title="Resources & Crew"><ResourcesPage /></P>} />
         <Route path="/projects/:projectId/resources" element={<P title="Resources & Crew"><ResourcesPage /></P>} />
         <Route path="/portfolio/capacity" element={<P title="Capacity Planning"><CapacityPlanningPage /></P>} />
@@ -1241,10 +1428,18 @@ export default function App() {
 
         {/* 18-Modules Wave — Commercial */}
         <Route path="/contracts" element={<P title="Contracts"><ContractsPage /></P>} />
+        <Route path="/payment-clock" element={<P title="Payment Clock"><PaymentClockPage /></P>} />
+        <Route path="/tax-withholding" element={<P title="Withholding Tax"><TaxWithholdingPage /></P>} />
+        <Route path="/einvoice-clearance" element={<P title="E-invoice Clearance"><EInvoiceClearancePage /></P>} />
+        <Route path="/cost-match" element={<P title="Cost Match"><CostMatchPage /></P>} />
+        <Route path="/full-evm" element={<P title="Earned Value"><FullEvmPage /></P>} />
+        <Route path="/fx" element={<P title="Currencies"><FxPage /></P>} />
         <Route path="/projects/:projectId/contracts" element={<P title="Contracts"><ContractsPage /></P>} />
         <Route path="/projects/:projectId/contracts/claims/:claimId" element={<P title="Progress Claim"><ProgressClaimDetailPage /></P>} />
         <Route path="/subcontractors" element={<P title="Subcontractors"><SubcontractorsPage /></P>} />
-        <Route path="/projects/:projectId/subcontractors" element={<P title="Subcontractors"><SubcontractorsPage /></P>} />
+        {/* A subcontractor is a company relationship; only the agreement
+            (SubcontractAgreement) is struck against a project. */}
+        <Route path="/projects/:projectId/subcontractors" element={<Navigate to="/subcontractors" replace />} />
         <Route path="/bid-management" element={<P title="Bid Management"><BidManagementPage /></P>} />
         <Route path="/projects/:projectId/bid-management" element={<P title="Bid Management"><BidManagementPage /></P>} />
         <Route path="/crm" element={<P title="CRM"><CRMPage /></P>} />
@@ -1264,12 +1459,6 @@ export default function App() {
           path="/property-dev/settings/document-templates"
           element={
             <P title="Document Templates"><PropertyDevDocumentTemplatesSettingsPage /></P>
-          }
-        />
-        <Route
-          path="/property-dev/admin/bulk-operations"
-          element={
-            <P title="Bulk Operations"><PropertyDevBulkOperationsPage /></P>
           }
         />
         <Route path="/property-dev/dashboards/:key" element={<P title="Property Development Dashboard"><PropertyDevDashboardFullView /></P>} />
@@ -1316,6 +1505,8 @@ export default function App() {
         <Route path="/projects/:projectId/variations" element={<P title="Variations"><VariationsPage /></P>} />
         <Route path="/change-intelligence" element={<P title="Change Intelligence"><ChangeIntelligencePage /></P>} />
         <Route path="/projects/:projectId/change-intelligence" element={<P title="Change Intelligence"><ChangeIntelligencePage /></P>} />
+        <Route path="/claims-evidence" element={<P title="Claims Evidence"><ClaimsEvidencePage /></P>} />
+        <Route path="/projects/:projectId/claims-evidence" element={<P title="Claims Evidence"><ClaimsEvidencePage /></P>} />
         <Route path="/value" element={<P title="Value Realized"><ValueDashboardPage /></P>} />
         <Route path="/projects/:projectId/value" element={<P title="Value Realized"><ValueDashboardPage /></P>} />
         <Route path="/phone-log" element={<P title="Phone Log"><PhoneLogPage /></P>} />
@@ -1343,6 +1534,10 @@ export default function App() {
             </AdminOnly>
           }
         />
+        {/* The file-import sibling of the capture gateway above: it reads one
+            exported message and keeps nothing, so it needs neither the admin
+            gate nor a project in context. */}
+        <Route path="/inbound-email" element={<P title="Email Delay Scan"><InboundEmailPage /></P>} />
         <Route path="/find" element={<P title="Find Records"><RetrievalPage /></P>} />
         <Route path="/projects/:projectId/find" element={<P title="Find Records"><RetrievalPage /></P>} />
         <Route path="/estimates" element={<Navigate to="/boq" replace />} />

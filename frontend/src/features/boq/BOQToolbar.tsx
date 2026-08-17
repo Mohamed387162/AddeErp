@@ -57,8 +57,12 @@ import {
   PieChart,
   FoldVertical,
   UnfoldVertical,
+  ListTree,
+  ListCollapse,
 } from 'lucide-react';
 import { Button } from '@/shared/ui';
+import { getIntlLocale } from '@/shared/lib/formatters';
+import { formatCurrency } from '@/shared/lib/money';
 import { useBoqDescDensityStore, type BoqDescDensity } from '@/stores/useBoqDescDensityStore';
 
 export interface BOQToolbarProps {
@@ -80,7 +84,7 @@ export interface BOQToolbarProps {
   importInputRef: React.RefObject<HTMLInputElement | null>;
   onImportInputChange: (e: React.ChangeEvent<HTMLInputElement>) => void;
   // Export
-  onExport: (format: 'excel' | 'csv' | 'pdf' | 'gaeb') => void;
+  onExport: (format: 'excel' | 'csv' | 'pdf' | 'gaeb' | 'bc3') => void;
   /**
    * Open the embodied-carbon view for this BOQ. When provided, a "Carbon
    * footprint" action appears in the File group; the host wires it to
@@ -129,6 +133,19 @@ export interface BOQToolbarProps {
   onToggleCollapseAll?: () => void;
   allSectionsCollapsed?: boolean;
   /**
+   * Show or hide the resource breakdown under every position at once. Showing
+   * also expands the sections, because a position inside a collapsed section
+   * renders nothing and the button would look broken.
+   */
+  onToggleAllResources?: () => void;
+  resourcesAllExpanded?: boolean;
+  /**
+   * How many positions carry resources. Zero disables the toggle: on a BOQ
+   * priced with flat unit rates there is no breakdown to show, and a live
+   * button that does nothing reads as a bug.
+   */
+  expandableResourceCount?: number;
+  /**
    * ── Grand-Total summary, rendered as its own card to the right of the
    * toolbar card. Falls back to wrapping below on narrow screens. Pass `null`
    * to hide entirely (e.g. on the empty-state of a BOQ with zero positions).
@@ -147,10 +164,21 @@ export interface BOQToolbarProps {
     /** Currently picked display currency (empty string ⇒ base). */
     displayCurrency: string;
     onChangeDisplayCurrency: (code: string) => void;
-    /** Live total in base currency. */
-    grossTotal: number;
-    /** Live total converted to display currency (or base when display === base). */
-    grossTotalDisplay: number;
+    /**
+     * The BOQ's Grand Total, converted to the display currency (or the base
+     * value when display === base).
+     *
+     * Audit #156: this is the SERVER's ``cost-breakdown.grand_total``, read
+     * from the same React Query cache entry the Cost Breakdown panel renders,
+     * so the two "Grand Total" figures on this page cannot disagree. It used
+     * to be a client-side chain whose VAT came from the first percentage tax
+     * markup only, which under-stated any BOQ carrying more than one tax line.
+     * Do not repoint this at a locally computed total.
+     *
+     * ``null`` while the server has not answered yet — the card renders a
+     * placeholder, never a client-computed stand-in.
+     */
+    grandTotalDisplay: number | null;
     /** Symbol/code of the active display currency (mirrors `displayCurrency` once resolved). */
     displaySymbol: string;
     /** Resolved FX rate for the display currency, used in the conversion tooltip. */
@@ -204,6 +232,9 @@ export function BOQToolbar({
   onShowShortcuts,
   onToggleCollapseAll,
   allSectionsCollapsed,
+  onToggleAllResources,
+  resourcesAllExpanded,
+  expandableResourceCount,
   summary,
 }: BOQToolbarProps) {
   /* ── Export dropdown (portaled so it floats above the grid) ────────── */
@@ -237,7 +268,7 @@ export function BOQToolbar({
     };
   }, [showExportMenu]);
 
-  const handleExportItem = (format: 'excel' | 'csv' | 'pdf' | 'gaeb') => {
+  const handleExportItem = (format: 'excel' | 'csv' | 'pdf' | 'gaeb' | 'bc3') => {
     setShowExportMenu(false);
     onExport(format);
   };
@@ -395,6 +426,30 @@ export function BOQToolbar({
               testId="boq-collapse-all-toggle"
             />
           )}
+          {onToggleAllResources && (
+            <IconBtn
+              icon={resourcesAllExpanded ? <ListCollapse size={15} /> : <ListTree size={15} />}
+              title={
+                expandableResourceCount === 0
+                  ? t('boq.no_resources_to_expand', {
+                      defaultValue: 'No position has a resource breakdown to show',
+                    })
+                  : resourcesAllExpanded
+                    ? t('boq.hide_all_resources', {
+                        defaultValue: 'Hide the resource breakdown everywhere',
+                      })
+                    : t('boq.show_all_resources', {
+                        defaultValue:
+                          'Open every position and show its resources ({{count}} priced)',
+                        count: expandableResourceCount ?? 0,
+                      })
+              }
+              onClick={onToggleAllResources}
+              active={resourcesAllExpanded}
+              disabled={expandableResourceCount === 0}
+              testId="boq-expand-all-resources-toggle"
+            />
+          )}
 
           <span className="mx-0.5 h-5 w-px shrink-0 bg-border-light" />
 
@@ -444,9 +499,13 @@ export function BOQToolbar({
                     <FileDown size={15} className="text-content-tertiary" />
                     {t('boq.export_format_pdf', { defaultValue: 'PDF' })}
                   </button>
-                  <button role="menuitem" onClick={() => handleExportItem('gaeb')} className="flex w-full items-center gap-2.5 px-3 py-2.5 text-sm text-content-primary hover:bg-surface-secondary transition-colors rounded-b-lg">
+                  <button role="menuitem" onClick={() => handleExportItem('gaeb')} className="flex w-full items-center gap-2.5 px-3 py-2.5 text-sm text-content-primary hover:bg-surface-secondary transition-colors">
                     <FileText size={15} className="text-content-tertiary" />
                     {t('boq.export_format_gaeb', { defaultValue: 'GAEB XML (.x83)' })}
+                  </button>
+                  <button role="menuitem" onClick={() => handleExportItem('bc3')} className="flex w-full items-center gap-2.5 px-3 py-2.5 text-sm text-content-primary hover:bg-surface-secondary transition-colors rounded-b-lg">
+                    <FileText size={15} className="text-content-tertiary" />
+                    {t('boq.export_format_bc3', { defaultValue: 'FIEBDC-3 (.bc3)' })}
                   </button>
                 </div>,
                 document.body,
@@ -609,7 +668,7 @@ export function BOQToolbar({
                       'Whole BOQ rendered in {{disp}} at rate {{rate}} ({{base}} → {{disp}}). View-only - server keeps base values. Switch to "Base" to edit prices.',
                     base: summary.currencyCode || summary.currencySymbol,
                     disp: summary.displayCurrency,
-                    rate: summary.displayRate.toLocaleString(undefined, {
+                    rate: summary.displayRate.toLocaleString(getIntlLocale(), {
                       minimumFractionDigits: 2,
                       maximumFractionDigits: 6,
                     }),
@@ -617,11 +676,29 @@ export function BOQToolbar({
                 : undefined
             }
           >
-            {summary.displaySymbol}{' '}
-            {summary.grossTotalDisplay.toLocaleString(undefined, {
-              minimumFractionDigits: 2,
-              maximumFractionDigits: 2,
-            })}
+            {summary.grandTotalDisplay == null ? (
+              // Server total not in yet. A dash says "not known", which is the
+              // truth; printing a client-side approximation under the same
+              // label is what audit #156 removed.
+              <span className="text-content-tertiary">—</span>
+            ) : (() => {
+              // Locale-aware money: the grid rows already format as
+              // "133.000,00 €" under de-DE, so the headline total must not
+              // fall back to the browser default ("€ 12,550,880.81").
+              const code = summary.displayCurrency || summary.currencyCode;
+              if (/^[A-Z]{3}$/.test(code)) {
+                return <>{formatCurrency(summary.grandTotalDisplay, code)}</>;
+              }
+              return (
+                <>
+                  {summary.displaySymbol}{' '}
+                  {summary.grandTotalDisplay.toLocaleString(getIntlLocale(), {
+                    minimumFractionDigits: 2,
+                    maximumFractionDigits: 2,
+                  })}
+                </>
+              );
+            })()}
           </span>
 
           {/* Meta line: counts + quality status badges */}

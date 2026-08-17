@@ -21,13 +21,48 @@ Dataflows wired:
   13. variation.approved             -> update contract_value + budget
   14. transmittal.issued            -> audit trail for distribution
   15. cde.container.promoted        -> audit + notify stakeholders
+  15b. commissioning.system.commissioned -> audit trail for handover
 """
 
 import logging
+from typing import TYPE_CHECKING
 
 from app.core.events import Event, event_bus
 
+if TYPE_CHECKING:
+    import uuid
+
+    from sqlalchemy.ext.asyncio import AsyncSession
+
 logger = logging.getLogger(__name__)
+
+
+async def _resolve_project_currency(
+    session: "AsyncSession",
+    project_id: "str | uuid.UUID",
+) -> str:
+    """Return the project's currency code, or "" when it cannot be read.
+
+    ``ProjectBudget.currency_code`` carries no DB default on purpose - the
+    model comment requires service code to supply it from the project
+    context so per-project rollups do not bias toward one currency. A
+    budget line written without it reaches the UI with no currency and
+    renders as an em-dash instead of money.
+
+    Mirrors ``FinanceService.create_budget``: best-effort, never raises.
+    An empty string is the honest "unknown", and a wrong hardcoded
+    currency is worse than a blank one.
+    """
+    from sqlalchemy import select
+
+    from app.modules.projects.models import Project
+
+    try:
+        row = await session.execute(select(Project.currency).where(Project.id == project_id))
+        return row.scalar_one_or_none() or ""
+    except Exception:  # noqa: BLE001 - lookup is non-critical, never fail the handler
+        logger.exception("Project-currency lookup failed for project %s", project_id)
+        return ""
 
 
 # ---------------------------------------------------------------------------
@@ -627,6 +662,7 @@ async def _handle_estimate_approved(event: Event) -> None:
                 wbs_totals[wbs_key] = wbs_totals.get(wbs_key, Decimal("0")) + total
 
             # Upsert budget lines for each WBS group
+            currency_code = await _resolve_project_currency(session, project_id)
             created_count = 0
             for wbs_key, total in wbs_totals.items():
                 existing = await session.execute(
@@ -647,6 +683,7 @@ async def _handle_estimate_approved(event: Event) -> None:
                             project_id=project_id,
                             wbs_id=wbs_key if wbs_key != "general" else None,
                             category="estimate",
+                            currency_code=currency_code,
                             original_budget=str(total),
                             revised_budget=str(total),
                         )
@@ -1065,6 +1102,10 @@ async def _handle_variation_approved(event: Event) -> None:
                         project_id=project_id,
                         wbs_id=None,
                         category="variations",
+                        # The project is already loaded above - reuse it
+                        # rather than re-query. "" when the project row is
+                        # missing, matching _resolve_project_currency.
+                        currency_code=(getattr(project, "currency", None) or "") if project else "",
                         original_budget="0",
                         revised_budget=str(amount),
                     )
@@ -1219,6 +1260,68 @@ async def _handle_cde_container_promoted(event: Event) -> None:
             )
     except Exception:
         logger.exception("Error handling cde.container.promoted")
+
+
+# ---------------------------------------------------------------------------
+# 15b. commissioning.system.commissioned -> audit trail for handover
+# ---------------------------------------------------------------------------
+
+
+async def _handle_system_commissioned(event: Event) -> None:
+    """Record a durable audit entry when a system passes the commission gate.
+
+    Commissioning a system is a handover milestone: a commercial or closeout
+    manager assembling the handover record needs to see who commissioned which
+    system, when, and at what readiness. The commissioning module emits this
+    once, after the gate (no open functional item, no open critical issue), so
+    the entry only ever marks a genuine, gated completion.
+
+    ``audit_log`` also mirrors into the unified activity log, so the milestone
+    shows up on the project timeline the closeout and dispute views read from,
+    with no direct import between the two modules.
+
+    Expected event.data:
+        project_id: str (UUID)
+        system_id: str (UUID)
+        system_name: str
+        system_type: str
+        readiness_pct: float
+        user_id: str (UUID of the commissioner, optional)
+    """
+    try:
+        data = event.data
+        system_id = data.get("system_id")
+        if not system_id:
+            logger.debug("commissioning.system.commissioned: missing system_id")
+            return
+
+        from app.core.audit import audit_log
+        from app.database import async_session_factory
+
+        async with async_session_factory() as session:
+            await audit_log(
+                session,
+                action="system_commissioned",
+                entity_type="commissioning_system",
+                entity_id=str(system_id),
+                user_id=data.get("user_id"),
+                details={
+                    "project_id": str(data.get("project_id") or ""),
+                    "system_name": str(data.get("system_name", ""))[:200],
+                    "system_type": data.get("system_type", ""),
+                    "readiness_pct": data.get("readiness_pct"),
+                },
+            )
+            await session.commit()
+
+        logger.info(
+            "commissioning.system.commissioned: audit trail for system %s (%s, project %s)",
+            system_id,
+            data.get("system_name", ""),
+            data.get("project_id"),
+        )
+    except Exception:
+        logger.exception("Error handling commissioning.system.commissioned")
 
 
 # ===========================================================================
@@ -1696,7 +1799,7 @@ async def _dispatch_to_webhooks(event: Event) -> None:
 # Registration
 # ---------------------------------------------------------------------------
 
-_HANDLER_COUNT = 24
+_HANDLER_COUNT = 25
 
 
 def register_event_handlers() -> None:
@@ -1721,6 +1824,7 @@ def register_event_handlers() -> None:
     event_bus.subscribe("variation.approved", _handle_variation_approved)
     event_bus.subscribe("transmittal.issued", _handle_transmittal_issued)
     event_bus.subscribe("cde.container.promoted", _handle_cde_container_promoted)
+    event_bus.subscribe("commissioning.system.commissioned", _handle_system_commissioned)
 
     # Smart notification triggers (16–23)
     event_bus.subscribe("rfi.assigned", _notify_rfi_assigned)

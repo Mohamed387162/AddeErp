@@ -5,6 +5,8 @@
 // the stepper) and the auto-discovery glob shape (the contract the parallel
 // data-file authors write against).
 
+import { existsSync, readFileSync, readdirSync } from 'node:fs';
+import { join, resolve } from 'node:path';
 import { describe, it, expect } from 'vitest';
 import {
   clampStepIndex,
@@ -20,7 +22,9 @@ import {
 } from './progress';
 import { PLAYBOOKS, getPlaybook } from './playbooks';
 import { CATEGORY_META } from './categories';
+import { ICON_MAP } from './icons';
 import { COMPANY_TYPE_META } from './companyTypes';
+import { moreCasesFor } from './relatedness';
 import type { Playbook, PlaybookProgress } from './types';
 
 /** A small synthetic playbook so the helper tests do not depend on shipped content. */
@@ -190,10 +194,10 @@ describe('resolveStepRoute', () => {
 /* ── Auto-discovery contract ────────────────────────────────────────────── */
 
 describe('playbook auto-discovery (import.meta.glob)', () => {
-  it('discovers at least the reference case', () => {
+  it('discovers the shipped case files', () => {
     expect(Array.isArray(PLAYBOOKS)).toBe(true);
     expect(PLAYBOOKS.length).toBeGreaterThan(0);
-    expect(PLAYBOOKS.some((p) => p.id === 'price-from-pdf')).toBe(true);
+    expect(PLAYBOOKS.some((p) => p.id === 'takeoff-quantities-from-a-pdf-plan')).toBe(true);
   });
 
   it('is sorted by order ascending', () => {
@@ -237,9 +241,15 @@ describe('playbook auto-discovery (import.meta.glob)', () => {
   });
 
   it('getPlaybook resolves a known id and rejects unknown', () => {
-    expect(getPlaybook('price-from-pdf')?.id).toBe('price-from-pdf');
+    expect(getPlaybook('takeoff-quantities-from-a-pdf-plan')?.id).toBe(
+      'takeoff-quantities-from-a-pdf-plan',
+    );
     expect(getPlaybook('does-not-exist')).toBeUndefined();
     expect(getPlaybook(undefined)).toBeUndefined();
+    // Retired: its route was folded into the German takeoff case above. A file
+    // restored by a stray revert would put the card back on the hub silently,
+    // so the absence is asserted rather than left to the card count.
+    expect(getPlaybook('price-from-pdf')).toBeUndefined();
   });
 });
 
@@ -312,5 +322,119 @@ describe('shipped cases integrity', () => {
         expect(badChar.test(s), `bad character in "${s}"`).toBe(false);
       }
     }
+  });
+
+  it('every icon name a playbook references resolves to a real glyph', () => {
+    // Icons are runtime STRINGS resolved through ICON_MAP by `iconFor`, which
+    // falls back to Sparkles for anything it does not know. That means a typo
+    // or a name nobody added to the map is not a build error and not a runtime
+    // error - the card just quietly renders the wrong picture. This assertion
+    // is the only thing standing between a new playbook and that silence.
+    for (const pb of PLAYBOOKS) {
+      if (pb.icon) {
+        expect(pb.icon in ICON_MAP, `playbook "${pb.id}" uses unmapped icon "${pb.icon}"`).toBe(
+          true,
+        );
+      }
+      for (const step of pb.steps) {
+        if (!step.icon) continue;
+        expect(
+          step.icon in ICON_MAP,
+          `step "${pb.id}/${step.id}" uses unmapped icon "${step.icon}"`,
+        ).toBe(true);
+      }
+    }
+  });
+
+  it('every step points at a route the app actually declares', () => {
+    // A playbook step whose `to` names no real route sends the user to the
+    // 404 page mid-case. Grepping App.tsx alone is not enough to check this:
+    // module routes are declared in `modules/*/manifest.ts` and mounted by
+    // `useModuleRouteElements`, so a manifest-only route looks dead to a naive
+    // scan and a genuinely dead one looks fine if the scan is too loose.
+    // Read both sources and compare on a normalised form.
+    // Resolved from the working directory, not from `import.meta.url`: under
+    // vitest the module URL is a vite-internal path, not a file: URL, so
+    // `fileURLToPath` throws on it. The run may be rooted at `frontend/` or at
+    // the repo, so accept either.
+    const srcRoot = [resolve(process.cwd(), 'src'), resolve(process.cwd(), 'frontend/src')].find(
+      (p) => existsSync(join(p, 'app/App.tsx')),
+    );
+    expect(srcRoot, 'could not locate frontend/src from the test working directory').toBeTruthy();
+    const readText = (p: string) => readFileSync(join(srcRoot!, p), 'utf8');
+
+    /** Strip query and hash, collapse `:param` segments, drop a trailing slash. */
+    const normalise = (route: string): string | null => {
+      const bare = route.split('?')[0]!.split('#')[0]!;
+      if (!bare.startsWith('/')) return null; // relative child route or the `*` catch-all
+      return bare.replace(/:[A-Za-z0-9_]+/g, '*').replace(/\/$/, '') || '/';
+    };
+
+    const declared = new Set<string>();
+    for (const raw of readText('app/App.tsx').matchAll(/path="([^"]+)"/g)) {
+      const n = normalise(raw[1]!);
+      if (n) declared.add(n);
+    }
+    // `import.meta.glob` is avoided here on purpose (it breaks the esbuild
+    // pass); the manifests are read as text, which is all this check needs.
+    for (const file of readdirSync(join(srcRoot!, 'modules'))) {
+      let text: string;
+      try {
+        text = readText(`modules/${file}/manifest.ts`);
+      } catch {
+        continue; // not a module directory, or no manifest
+      }
+      for (const raw of text.matchAll(/path:\s*'([^']+)'/g)) {
+        const n = normalise(raw[1]!);
+        if (n) declared.add(n);
+      }
+    }
+    // If this ever collapses to a handful, the readers above silently stopped
+    // finding routes and every assertion below would pass for the wrong reason.
+    expect(declared.size).toBeGreaterThan(100);
+
+    for (const pb of PLAYBOOKS) {
+      for (const step of pb.steps) {
+        const n = normalise(step.to);
+        expect(n, `step "${pb.id}/${step.id}" has a non-absolute target "${step.to}"`).not.toBeNull();
+        expect(
+          declared.has(n!),
+          `step "${pb.id}/${step.id}" points at "${step.to}", which no route declares`,
+        ).toBe(true);
+      }
+    }
+  });
+});
+
+describe('moreCasesFor - the "Other cases" strip on the detail page', () => {
+  it('never lists the current case, an excluded case, or a duplicate', () => {
+    const pb = PLAYBOOKS[0]!;
+    const excluded = PLAYBOOKS[1]!;
+    const out = moreCasesFor(pb, PLAYBOOKS, new Set([excluded.id]), PLAYBOOKS.length);
+    expect(out.some((c) => c.id === pb.id)).toBe(false);
+    expect(out.some((c) => c.id === excluded.id)).toBe(false);
+    expect(new Set(out.map((c) => c.id)).size).toBe(out.length);
+  });
+
+  it('puts every same-market case ahead of every other case', () => {
+    // Behaviour-class assertion over the real catalogue: whichever markets
+    // ship, a market-specific case must lead with its own market whole.
+    const regional = PLAYBOOKS.find((p) => p.region);
+    expect(regional, 'catalogue carries at least one market-specific case').toBeDefined();
+    const pb = regional!;
+    const out = moreCasesFor(pb, PLAYBOOKS, new Set(), PLAYBOOKS.length);
+    const sameCount = PLAYBOOKS.filter(
+      (c) => c.region === pb.region && c.id !== pb.id,
+    ).length;
+    expect(out.slice(0, sameCount).every((c) => c.region === pb.region)).toBe(true);
+    expect(out.slice(sameCount).some((c) => c.region === pb.region)).toBe(false);
+  });
+
+  it('keeps catalogue order inside each group and respects the limit', () => {
+    const pb = PLAYBOOKS[0]!;
+    const limited = moreCasesFor(pb, PLAYBOOKS, new Set(), 5);
+    expect(limited.length).toBeLessThanOrEqual(5);
+    const full = moreCasesFor(pb, PLAYBOOKS, new Set(), PLAYBOOKS.length);
+    expect(limited.map((c) => c.id)).toEqual(full.slice(0, limited.length).map((c) => c.id));
   });
 });

@@ -101,6 +101,10 @@ export interface Assignment {
   task_id?: string | null;
   /** Human-readable task label - populated by the board endpoint only. */
   task_name?: string;
+  /** Schedule activity (the Gantt row) this booking staffs, when it names one.
+   *  There is no matching ``activity_name``: no endpoint resolves one, so the
+   *  UI labels the link generically rather than inventing a name. */
+  activity_id?: string | null;
   work_order_id?: string | null;
   start_at: string;
   end_at: string;
@@ -183,6 +187,7 @@ export interface ProposeAssignmentPayload {
   resource_id: string;
   project_id?: string | null;
   task_id?: string | null;
+  activity_id?: string | null;
   start_at: string;
   end_at: string;
   allocation_percent?: number;
@@ -215,15 +220,22 @@ export interface CreateRequestPayload {
 
 /* ── Resources ──────────────────────────────────────────────────────────── */
 
+/**
+ * List resources. Pass `project_id` on a site surface: the server then
+ * returns the crews homed on that project plus the unhomed company pool,
+ * instead of every resource on the install.
+ */
 export function listResources(params?: {
   type?: ResourceType | '';
   status?: ResourceStatus | '';
+  project_id?: string;
   offset?: number;
   limit?: number;
 }): Promise<Resource[]> {
   const qs = new URLSearchParams();
   if (params?.type) qs.set('type', params.type);
   if (params?.status) qs.set('status', params.status);
+  if (params?.project_id) qs.set('project_id', params.project_id);
   if (params?.offset !== undefined) qs.set('offset', String(params.offset));
   if (params?.limit !== undefined) qs.set('limit', String(params.limit));
   const q = qs.toString();
@@ -267,13 +279,34 @@ export function listSkills(params?: { category?: string; limit?: number }): Prom
 
 export function listAssignmentsForResource(
   resourceId: string,
-  params?: { status?: AssignmentStatus | ''; limit?: number },
+  params?: { status?: AssignmentStatus | ''; activity_id?: string; limit?: number },
 ): Promise<Assignment[]> {
   const qs = new URLSearchParams();
   qs.set('resource_id', resourceId);
   if (params?.status) qs.set('status', params.status);
+  if (params?.activity_id) qs.set('activity_id', params.activity_id);
   if (params?.limit !== undefined) qs.set('limit', String(params.limit));
   return apiGet<Assignment[]>(`/v1/resources/assignments/?${qs.toString()}`);
+}
+
+/**
+ * Every booking made against one schedule activity.
+ *
+ * ``project_id`` is required by the endpoint, not optional: it is the scope the
+ * caller's access is checked against, so an activity id on its own cannot be
+ * used to read another tenant's bookings.
+ */
+export function listAssignmentsForActivity(
+  activityId: string,
+  params: { project_id: string; status?: AssignmentStatus | ''; limit?: number },
+): Promise<Assignment[]> {
+  const qs = new URLSearchParams();
+  qs.set('project_id', params.project_id);
+  if (params.status) qs.set('status', params.status);
+  if (params.limit !== undefined) qs.set('limit', String(params.limit));
+  return apiGet<Assignment[]>(
+    `/v1/resources/assignments/by-activity/${encodeURIComponent(activityId)}?${qs.toString()}`,
+  );
 }
 
 export function proposeAssignment(
@@ -295,10 +328,15 @@ export function completeAssignment(id: string): Promise<Assignment> {
   return apiPost<Assignment>(`/v1/resources/assignments/${id}/complete`, {});
 }
 
-/** Partial update for an existing assignment. */
+/** Partial update for an existing assignment.
+ *
+ *  The backend applies the patch with ``exclude_unset``, so omitting a key
+ *  leaves the stored value alone while sending an explicit ``null`` clears it -
+ *  that is how the project and activity pickers unset a link. */
 export interface UpdateAssignmentPayload {
   project_id?: string | null;
   task_id?: string | null;
+  activity_id?: string | null;
   start_at?: string;
   end_at?: string;
   allocation_percent?: number;

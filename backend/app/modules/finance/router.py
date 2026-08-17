@@ -31,13 +31,15 @@ import io
 import logging
 import uuid
 from collections.abc import Iterable
+from decimal import Decimal
 from typing import Any
 
-from fastapi import APIRouter, Depends, File, HTTPException, Query, Response, UploadFile, status
+from fastapi import APIRouter, Depends, File, Header, HTTPException, Query, Response, UploadFile, status
 from fastapi.responses import StreamingResponse
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.content_disposition import attachment_disposition
 from app.core.file_signature import (
     SIGNATURE_BYTES_REQUIRED,
     FileSignatureMismatch,
@@ -52,6 +54,7 @@ from app.dependencies import (
     RequirePermission,
     SessionDep,
     accessible_project_ids,
+    verify_project_access,
 )
 from app.modules.contacts.models import Contact
 from app.modules.finance.connector_schemas import (
@@ -67,7 +70,12 @@ from app.modules.finance.connector_schemas import (
 )
 from app.modules.finance.connector_service import ConnectorService
 from app.modules.finance.connectors.registry import connector_registry
-from app.modules.finance.models import EVMSnapshot, Invoice, Payment, ProjectBudget
+from app.modules.finance.einvoice_settings_schemas import (
+    EInvoiceSettingsRead,
+    EInvoiceSettingsUpdate,
+)
+from app.modules.finance.models import EVMSnapshot, Invoice, InvoiceLineItem, Payment, ProjectBudget
+from app.modules.finance.retention_ledger import RetentionRollup
 from app.modules.finance.schemas import (
     BalanceSheetResponse,
     BudgetCreate,
@@ -96,6 +104,8 @@ from app.modules.finance.schemas import (
     PaymentListResponse,
     PaymentResponse,
     RecordClaimPaymentRequest,
+    RetentionLedgerResponse,
+    RetentionRollupResponse,
     StatementLineResponse,
     TrialBalanceResponse,
     TrialBalanceRow,
@@ -110,15 +120,49 @@ def _get_service(session: SessionDep) -> FinanceService:
     return FinanceService(session)
 
 
+def _line_item_dicts(line_items: Iterable[InvoiceLineItem] | None) -> list[dict[str, Any]]:
+    """Flatten invoice lines for the ORM-free document renderers.
+
+    Both document routes, the country PDF and the EN 16931 e-invoice, feed the
+    same dict shape to renderers that deliberately take no ORM objects. Built
+    inline at each route, a field added for one document is missing from the
+    other, and the export silently falls back rather than failing.
+
+    Args:
+        line_items: the invoice's persisted lines, in order.
+
+    Returns:
+        One plain dict per line.
+    """
+    return [
+        {
+            "description": li.description,
+            "unit": li.unit,
+            "quantity": li.quantity,
+            "unit_rate": li.unit_rate,
+            "amount": li.amount,
+            # EN 16931 per-line VAT (BT-152 rate, BT-151 category).
+            "vat_rate": li.vat_rate,
+            "vat_category": li.vat_category,
+        }
+        for li in (line_items or [])
+    ]
+
+
 # ── Counterparty enrichment ─────────────────────────────────────────────────
 
 
 def _contact_display_name(c: Contact) -> str:
-    """Return the human-readable contact label (company > "first last" > email)."""
-    if c.company_name:
-        return c.company_name
-    full = f"{c.first_name or ''} {c.last_name or ''}".strip()
-    return full or c.email or ""
+    """Return the human-readable contact label (company > "first last" > email).
+
+    Delegates so that the name shown beside an invoice and the name written into
+    its e-invoice as BT-44 are the same string. They were resolved separately
+    before, and the copy here read ``c.email``, which is not a column on
+    ``Contact`` and raised on any record with neither a company nor a person.
+    """
+    from app.modules.finance.einvoice_parties import contact_display_name
+
+    return contact_display_name(c)
 
 
 async def _fetch_counterparty_names(session: AsyncSession, contact_ids: Iterable[str | None]) -> dict[str, str]:
@@ -595,16 +639,7 @@ async def export_invoice_br_pdf(
         "notes": fresh.notes,
         "metadata": dict(fresh.metadata_ or {}),
     }
-    line_items: list[dict[str, Any]] = [
-        {
-            "description": li.description,
-            "unit": li.unit,
-            "quantity": li.quantity,
-            "unit_rate": li.unit_rate,
-            "amount": li.amount,
-        }
-        for li in (fresh.line_items or [])
-    ]
+    line_items: list[dict[str, Any]] = _line_item_dicts(fresh.line_items)
 
     pdf_bytes = render_br_invoice_pdf(
         invoice=invoice_dict,
@@ -612,31 +647,100 @@ async def export_invoice_br_pdf(
         project=project_dict or None,
     )
 
-    # Sanitise invoice_number before embedding in a quoted Content-Disposition
-    # header.  invoice_number is a user-controlled DB value - it can contain
-    # characters that would break the RFC 6266 quoted-string or inject
-    # additional headers (CRLF injection).  Strip every character that is not
-    # ASCII printable, remove double-quotes (which terminate the quoted-string
-    # token) and forward-slashes (already done historically), and cap length.
+    # Normalise invoice_number before embedding it in the download filename.
+    # invoice_number is a user-controlled DB value - it can contain characters
+    # that would break the RFC 6266 quoted-string or inject additional headers
+    # (CRLF injection). Strip CR/LF, swap double-quotes and forward-slashes
+    # (as historically), and cap length. Non-ASCII stays: the header is built
+    # by attachment_disposition, which emits the RFC 6266 ASCII fallback plus
+    # UTF-8 ``filename*`` pair so accented invoice numbers survive intact.
     _raw_num = invoice.invoice_number or "invoice"
-    _safe_num = (
-        (
-            _raw_num.encode("ascii", errors="replace")  # non-ASCII → b'?'
-            .decode("ascii")
-            .replace("\r", "")
-            .replace("\n", "")
-            .replace('"', "'")
-            .replace("/", "-")
-            .strip()
-        )[:80]
-        or "invoice"
-    )
+    _safe_num = (_raw_num.replace("\r", "").replace("\n", "").replace('"', "'").replace("/", "-").strip())[
+        :80
+    ] or "invoice"
     filename = f"RPS_{_safe_num}.pdf"
     return StreamingResponse(
         io.BytesIO(pdf_bytes),
         media_type="application/pdf",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        headers={"Content-Disposition": attachment_disposition(filename)},
     )
+
+
+@router.get(
+    "/einvoice-profiles",
+    summary="List the EN 16931 country profiles this build can issue",
+    description=(
+        "The profile registry, so a picker never carries its own copy of the "
+        "list. Adding a country is one registry entry in the einvoice module, "
+        "and every caller of this endpoint follows it without a change."
+    ),
+)
+async def list_einvoice_profiles(
+    _perm: None = Depends(RequirePermission("finance.read")),
+) -> dict[str, Any]:
+    """Return the supported e-invoice profiles with their syntax and region."""
+    from app.modules.einvoice import PROFILES
+
+    return {
+        "profiles": [
+            {
+                "key": key,
+                # Standard names (XRechnung 3.0, ZUGFeRD 2.1) are proper nouns
+                # and stay untranslated, so the label ships from the registry.
+                "label": profile.label,
+                "syntax": profile.syntax,
+                "region": profile.region,
+            }
+            for key, profile in PROFILES.items()
+        ]
+    }
+
+
+@router.get(
+    "/einvoice-settings",
+    response_model=EInvoiceSettingsRead,
+    summary="Read the standing e-invoice configuration",
+    description=(
+        "Seller identity, the tax registration behind it and the account a buyer "
+        "pays into. These are the same on every invoice this instance issues, so "
+        "they are held once here and merged beneath whatever an individual "
+        "invoice says for itself."
+    ),
+)
+async def read_einvoice_settings(
+    session: SessionDep,
+    _perm: None = Depends(RequirePermission("finance.read")),
+) -> EInvoiceSettingsRead:
+    """Return the configuration, and which of its required fields are still blank."""
+    from app.modules.finance.einvoice_settings_service import get_settings
+
+    return EInvoiceSettingsRead.from_row(await get_settings(session))
+
+
+@router.put(
+    "/einvoice-settings",
+    response_model=EInvoiceSettingsRead,
+    summary="Write the standing e-invoice configuration",
+    description=(
+        "Replaces the whole configuration, so a field left blank is a field the "
+        "user means to clear. The IBAN is checked against its own check digits "
+        "here, which is the last point at which a mistyped account can be "
+        "caught: a document carrying one is perfectly valid and simply cannot be "
+        "paid."
+    ),
+)
+async def write_einvoice_settings(
+    payload: EInvoiceSettingsUpdate,
+    session: SessionDep,
+    user_id: CurrentUserId,
+    _perm: None = Depends(RequirePermission("finance.einvoice_settings")),
+) -> EInvoiceSettingsRead:
+    """Store the seller identity and payment details for every future e-invoice."""
+    from app.modules.finance.einvoice_settings_service import update_settings
+
+    row = await update_settings(session, payload, user_id=user_id)
+    await session.commit()
+    return EInvoiceSettingsRead.from_row(row)
 
 
 @router.get(
@@ -664,18 +768,27 @@ async def export_invoice_einvoice(
     fmt: str = Query(default="xrechnung", alias="format"),
     dry_run: bool = Query(default=False),
     embed: bool = Query(default=False),
+    locale: str | None = Query(
+        default=None,
+        max_length=10,
+        description="Language of the readable page in the hybrid PDF (e.g. 'de'). "
+        "Overrides Accept-Language. The XML is locale-independent.",
+    ),
+    accept_language: str | None = Header(default=None, alias="accept-language"),
     user_id: CurrentUserId = None,  # type: ignore[assignment]
     _perm: None = Depends(RequirePermission("finance.read")),
     service: FinanceService = Depends(_get_service),
 ) -> StreamingResponse | dict[str, Any]:
     """Stream an EN 16931 e-invoice (CII/UBL XML, or a hybrid PDF) from the invoice."""
     from app.modules.einvoice import (
+        FATAL,
         SUPPORTED_PROFILES,
-        problems_for,
         render_einvoice,
         render_einvoice_pdf,
+        violations_for,
     )
     from app.modules.einvoice.cii import EInvoiceError
+    from app.modules.einvoice.pdf_translations import resolve_pdf_locale
 
     profile = (fmt or "xrechnung").strip().lower()
     if profile not in SUPPORTED_PROFILES:
@@ -686,18 +799,6 @@ async def export_invoice_einvoice(
 
     await _require_invoice_access(session, invoice_id, user_id)
     fresh = await service.get_invoice(invoice_id)
-
-    # Best-effort buyer name fallback from the linked contact (never block on it).
-    buyer_fallback = ""
-    if fresh.contact_id:
-        try:
-            from app.modules.contacts.repository import ContactRepository
-
-            contact = await ContactRepository(session).get_by_id(fresh.contact_id)
-            if contact is not None:
-                buyer_fallback = str(getattr(contact, "name", "") or "").strip()
-        except Exception:  # noqa: BLE001 - fallback only
-            logger.debug("e-invoice: contact lookup failed", exc_info=True)
 
     invoice_dict: dict[str, Any] = {
         "invoice_number": fresh.invoice_number,
@@ -712,49 +813,87 @@ async def export_invoice_einvoice(
         "notes": fresh.notes,
         "metadata": dict(fresh.metadata_ or {}),
     }
-    line_items: list[dict[str, Any]] = [
-        {
-            "description": li.description,
-            "unit": li.unit,
-            "quantity": li.quantity,
-            "unit_rate": li.unit_rate,
-            "amount": li.amount,
-        }
-        for li in (fresh.line_items or [])
-    ]
+    line_items: list[dict[str, Any]] = _line_item_dicts(fresh.line_items)
+    # Resolved once and handed to whichever of the two paths runs below, so the
+    # check and the file are judging the same document. Carries the buyer read
+    # off the linked contact, so the address EN 16931 demands does not have to be
+    # retyped onto every invoice sent to a customer we already know.
+    from app.modules.finance.einvoice_parties import einvoice_defaults_for_invoice
+
+    defaults = await einvoice_defaults_for_invoice(
+        session,
+        contact_id=fresh.contact_id,
+        invoice_direction=fresh.invoice_direction,
+    )
 
     if dry_run:
-        problems = problems_for(
+        found = violations_for(
             invoice=invoice_dict,
             line_items=line_items,
             profile=profile,
-            buyer_fallback_name=buyer_fallback,
+            defaults=defaults,
         )
-        return {"format": profile, "valid": not problems, "problems": problems}
+        # ``problems`` stays the fatal messages, which is what blocks a render.
+        # ``violations`` carries the advisories too, each with the rule id a
+        # receiver would quote back, so a screen can show "this exports, and it
+        # still ought to name a bank account" instead of one undifferentiated list.
+        problems = [v.message for v in found if v.severity == FATAL]
+        return {
+            "format": profile,
+            "valid": not problems,
+            "problems": problems,
+            "violations": [
+                {
+                    "rule_id": v.rule_id,
+                    "severity": v.severity,
+                    "message": v.message,
+                    "term": v.term,
+                    # The values the message interpolates, so a screen showing
+                    # the finding in another language can name the same line
+                    # and quote the same amount instead of falling back to the
+                    # English sentence to keep them.
+                    "params": v.params,
+                }
+                for v in found
+            ],
+        }
 
-    render = render_einvoice_pdf if embed else render_einvoice
     try:
-        filename, media_type, body = render(
-            invoice=invoice_dict,
-            line_items=line_items,
-            profile=profile,
-            buyer_fallback_name=buyer_fallback,
-        )
+        if embed:
+            # The readable page follows the reader's language, the same
+            # resolution the daily-diary PDF uses; the embedded XML does not.
+            filename, media_type, body = render_einvoice_pdf(
+                invoice=invoice_dict,
+                line_items=line_items,
+                profile=profile,
+                defaults=defaults,
+                locale=resolve_pdf_locale(locale, accept_language),
+            )
+        else:
+            filename, media_type, body = render_einvoice(
+                invoice=invoice_dict,
+                line_items=line_items,
+                profile=profile,
+                defaults=defaults,
+            )
     except EInvoiceError as exc:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=(
                 f"invoice is not EN 16931 complete for {profile}: {exc}. "
-                "Fill seller/buyer master data and the buyer reference under the "
-                "invoice metadata 'einvoice' key, or call with ?dry_run=true."
+                "Seller identity and the bank account are set once under the "
+                "e-invoice settings; the buyer address is read from the linked "
+                "contact and the buyer reference belongs to this invoice. Call "
+                "with ?dry_run=true for the full list."
             ),
         ) from exc
 
-    # ``filename`` is already ASCII-sanitised by the service (_safe_token).
+    # ``filename`` is single-line-sanitised by the service (_safe_token) and
+    # may carry non-ASCII; attachment_disposition derives the RFC 6266 pair.
     return StreamingResponse(
         io.BytesIO(body),
         media_type=media_type,
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        headers={"Content-Disposition": attachment_disposition(filename)},
     )
 
 
@@ -937,6 +1076,82 @@ async def record_payment_with_withholding(
         actor_id=str(user_id) if user_id else None,
     )
     return PaymentResponse.model_validate(payment)
+
+
+# -- Retention / withholding ledger (MUST be before /{invoice_id}) ------------
+
+
+def _retention_money(value: Decimal) -> str:
+    """Serialise an always-present retention Decimal to a canonical string."""
+    return format(value, "f")
+
+
+def _retention_pct(value: Decimal | None) -> str | None:
+    """Serialise a guarded ratio Decimal to a string, or None when absent."""
+    return None if value is None else format(value, "f")
+
+
+def _retention_rollup_to_response(
+    rollup: RetentionRollup,
+    names: dict[str, str],
+) -> RetentionRollupResponse:
+    """Map a pure RetentionRollup to its API response, adding the contact name."""
+    return RetentionRollupResponse(
+        currency_code=rollup.currency_code,
+        direction=rollup.direction,
+        contact_id=rollup.contact_id,
+        counterparty_name=names.get(rollup.contact_id) if rollup.contact_id else None,
+        scheduled=_retention_money(rollup.scheduled),
+        held_to_date=_retention_money(rollup.held_to_date),
+        released_to_date=_retention_money(rollup.released_to_date),
+        outstanding=_retention_money(rollup.outstanding),
+        payment_count=rollup.payment_count,
+        released_pct=_retention_pct(rollup.released_pct),
+        outstanding_pct=_retention_pct(rollup.outstanding_pct),
+        held_vs_scheduled_pct=_retention_pct(rollup.held_vs_scheduled_pct),
+        earliest_release_date=rollup.earliest_release_date,
+        latest_release_date=rollup.latest_release_date,
+    )
+
+
+@router.get(
+    "/retention-ledger/",
+    response_model=RetentionLedgerResponse,
+    summary="Retention / withholding ledger for a project",
+    description=(
+        "Unified retainage rollup for a project, computed from stored invoice "
+        "retention and payment withholding. Returns per-counterparty lines and "
+        "per-(currency, direction) totals: retention scheduled, held to date, "
+        "released to date and still outstanding. 'Released' means the "
+        "contractual release date has been reached as of ?as_of (default: "
+        "today); the module records no separate cash return, so this is "
+        "release-due, not cash returned. Nothing is blended across currencies "
+        "or payable / receivable."
+    ),
+)
+async def get_retention_ledger(
+    session: SessionDep,
+    user_id: CurrentUserId,
+    project_id: uuid.UUID = Query(...),
+    as_of: str | None = Query(default=None),
+    _perm: None = Depends(RequirePermission("finance.read")),
+    service: FinanceService = Depends(_get_service),
+) -> RetentionLedgerResponse:
+    """Return the project retention / withholding ledger rollup."""
+    await verify_project_access(project_id, user_id, session)
+
+    ledger = await service.get_retention_ledger(project_id, as_of=as_of)
+
+    # Resolve counterparty display names for the per-contact lines in one round
+    # trip (totals carry no contact_id, so they need no name).
+    names = await _fetch_counterparty_names(session, [g.contact_id for g in ledger.groups])
+
+    return RetentionLedgerResponse(
+        project_id=project_id,
+        as_of=ledger.as_of,
+        groups=[_retention_rollup_to_response(g, names) for g in ledger.groups],
+        totals=[_retention_rollup_to_response(t, names) for t in ledger.totals],
+    )
 
 
 # ── Budgets (MUST be before /{invoice_id}) ──────────────────────────────────

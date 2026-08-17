@@ -4,6 +4,7 @@ import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { boqApi, type CostAutocompleteItem } from './api';
 import { getIntlLocale } from '@/shared/lib/formatters';
 import { AutocompleteTooltip } from './AutocompleteTooltip';
+import { highlightMatch } from './highlightMatch';
 
 /**
  * Autocomplete suggestion for cost items.
@@ -340,9 +341,16 @@ export function AutocompleteInput({
                   : 'hover:bg-surface-secondary'
               } ${idx > 0 ? 'border-t border-border-light' : ''}`}
             >
-              {/* Main content */}
+              {/* Main content. Structured catalogues (NPK, STLB/GAEB, BC3) share a
+                  long common prefix and put the discriminating words at the end, so
+                  a single truncated line renders near-identical entries identically.
+                  Two clamped lines keep that tail on screen; `title` still carries
+                  the full text for the rare description that overflows both. Marking
+                  the typed words on top of that answers the question the reader is
+                  actually asking, which is not "what does this row say" but "why is
+                  this row in my list". */}
               <div className="min-w-0 flex-1">
-                <p className="text-sm text-content-primary truncate">{item.description}</p>
+                <p className="text-sm text-content-primary line-clamp-2" title={item.description}>{highlightMatch(item.description, inputValue)}</p>
                 <div className="mt-0.5 flex items-center gap-1.5">
                   <span className="text-2xs text-content-tertiary font-mono">{item.code}</span>
                   {item.classification && Object.keys(item.classification).length > 0 && (

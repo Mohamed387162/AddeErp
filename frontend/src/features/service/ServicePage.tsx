@@ -3,7 +3,7 @@
 import { useState, useMemo, useEffect } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate, useParams } from 'react-router-dom';
 import clsx from 'clsx';
 import {
   Wrench,
@@ -38,6 +38,8 @@ import {
   ModuleGuideButton,
 } from '@/shared/ui';
 import { PageHeader } from '@/shared/ui/PageHeader';
+import { InsightsPanel, InsightsToggleButton, useModuleInsights } from '@/features/insights';
+import { buildServiceInsights } from './serviceInsights';
 import { UserSearchInput } from '@/shared/ui/UserSearchInput';
 import { DismissibleInfo, IntroRichText } from '@/shared/ui/DismissibleInfo';
 import { MoneyDisplay } from '@/shared/ui/MoneyDisplay';
@@ -93,6 +95,27 @@ const PRIORITY_VARIANT: Record<TicketPriority, 'neutral' | 'blue' | 'success' | 
   critical: 'error',
 };
 
+// The badges used to print the raw enum (`in_progress`, `med`), which reached
+// every language including English. These resolve the same keys the insight
+// panel uses, so a badge and a chart slice never disagree.
+function ticketStatusLabel(
+  status: TicketStatus,
+  t: (k: string, o?: Record<string, unknown>) => string,
+): string {
+  return t(`service.ticket_status_${status}`, {
+    defaultValue: status.charAt(0).toUpperCase() + status.slice(1).replace(/_/g, ' '),
+  });
+}
+
+function priorityLabel(
+  priority: TicketPriority,
+  t: (k: string, o?: Record<string, unknown>) => string,
+): string {
+  return t(`service.priority_${priority}`, {
+    defaultValue: priority.charAt(0).toUpperCase() + priority.slice(1),
+  });
+}
+
 const CONTRACT_STATUS_VARIANT: Record<ContractStatus, 'neutral' | 'blue' | 'success' | 'warning' | 'error'> = {
   draft: 'neutral',
   active: 'success',
@@ -135,29 +158,73 @@ type SLAChipState = {
   minutes: number;
 } | null;
 
-function computeSlaChip(t: ServiceTicket, nowMs: number): SLAChipState {
-  if (t.sla_breached_at) {
-    return { variant: 'error', label: 'Breached', minutes: 0 };
+/** Same shape the badge label helpers above take, so the fakes match too. */
+type Translate = (k: string, o?: Record<string, unknown>) => string;
+
+/**
+ * A span in the largest whole unit it reaches: minutes under an hour, then
+ * hours, then days. Both SLA branches read it, which is the point: the late
+ * branch used to print raw minutes, so a ticket a little over three weeks
+ * overdue announced itself as "34610m late".
+ *
+ * #175: the unit suffixes now come from the shared ``duration.*`` keys instead
+ * of literals, so the chip reads in the user's language. Those keys already
+ * exist in en.ts and every locale, so this inherits the translations that
+ * shipped with #174 rather than asking for new ones.
+ *
+ * The arithmetic is deliberately untouched. ``formatDuration`` floors where
+ * this rounds and carries units this ladder does not, so adopting it would
+ * restate three values ServicePage.test.ts pins on purpose - 1439 minutes
+ * reads "24h" here and would read "23h" there. That swap is a decision worth
+ * making on its own, not a side effect of a translation fix.
+ */
+function slaSpan(minutes: number, t: Translate): string {
+  if (minutes >= 1440) {
+    return t('duration.days', {
+      defaultValue: '{{value}}d',
+      value: Math.round(minutes / 60 / 24),
+    });
   }
-  if (!t.sla_due_at) return null;
-  const dueMs = Date.parse(t.sla_due_at);
+  if (minutes >= 60) {
+    return t('duration.hours', { defaultValue: '{{value}}h', value: Math.round(minutes / 60) });
+  }
+  return t('duration.mins', { defaultValue: '{{value}}m', value: minutes });
+}
+
+export function computeSlaChip(
+  ticket: ServiceTicket,
+  nowMs: number,
+  t: Translate,
+): SLAChipState {
+  if (ticket.sla_breached_at) {
+    return {
+      variant: 'error',
+      label: t('service.sla_breached', { defaultValue: 'Breached' }),
+      minutes: 0,
+    };
+  }
+  if (!ticket.sla_due_at) return null;
+  const dueMs = Date.parse(ticket.sla_due_at);
   if (Number.isNaN(dueMs)) return null;
   // Tickets in terminal states should not flash as overdue forever.
-  if (t.status === 'resolved' || t.status === 'closed' || t.status === 'cancelled') {
+  if (ticket.status === 'resolved' || ticket.status === 'closed' || ticket.status === 'cancelled') {
     return null;
   }
   const minutes = Math.round((dueMs - nowMs) / 60000);
   if (minutes <= 0) {
-    return { variant: 'error', label: `${Math.abs(minutes)}m late`, minutes };
+    // The word around the span is a literal too, and it is the one that hides:
+    // translating only the span would leave "2h late" half-English.
+    return {
+      variant: 'error',
+      label: t('service.sla_late', {
+        defaultValue: '{{span}} late',
+        span: slaSpan(Math.abs(minutes), t),
+      }),
+      minutes,
+    };
   }
   const variant: 'success' | 'warning' = minutes < 60 ? 'warning' : 'success';
-  const label =
-    minutes >= 1440
-      ? `${Math.round(minutes / 60 / 24)}d`
-      : minutes >= 60
-        ? `${Math.round(minutes / 60)}h`
-        : `${minutes}m`;
-  return { variant, label, minutes };
+  return { variant, label: slaSpan(minutes, t), minutes };
 }
 
 function todayIso(offsetDays = 0): string {
@@ -231,6 +298,12 @@ function contactDisplayName(c: ContactLite | undefined, fallback: string): strin
 export function ServicePage() {
   const { t } = useTranslation();
   const navigate = useNavigate();
+  // The module is mounted twice: flat at /service, which is the tenant-wide
+  // dispatcher view, and under /projects/:projectId/service. On the project
+  // mount every list is scoped server-side — narrowing here instead would
+  // page first and filter after, so a project could show an empty tab while
+  // its own records sat just past the page boundary.
+  const { projectId: routeProjectId } = useParams<{ projectId: string }>();
   const [tab, setTab] = useState<Tab>('tickets');
   const [search, setSearch] = useState('');
   const [statusFilter, setStatusFilter] = useState<string>('');
@@ -242,25 +315,34 @@ export function ServicePage() {
   // when creating a work order — keep it enabled on the WO tab too, otherwise
   // the "New Work Order" modal renders an empty ticket dropdown.
   const ticketsQ = useQuery({
-    queryKey: ['service', 'tickets'],
-    queryFn: () => listTickets({ limit: 100 }),
+    queryKey: ['service', 'tickets', routeProjectId ?? ''],
+    queryFn: () => listTickets({ project_id: routeProjectId, limit: 100 }),
     enabled: tab === 'tickets' || tab === 'work_orders',
   });
   const workOrdersQ = useQuery({
-    queryKey: ['service', 'workOrders'],
-    queryFn: () => listWorkOrders({ limit: 100 }),
+    queryKey: ['service', 'workOrders', routeProjectId ?? ''],
+    queryFn: () => listWorkOrders({ project_id: routeProjectId, limit: 100 }),
     enabled: tab === 'work_orders',
   });
   // Contracts back the picker in the ticket/asset create modals, so they must
   // be loaded on every tab whose "New …" action needs to choose a contract.
   const contractsQ = useQuery({
-    queryKey: ['service', 'contracts'],
-    queryFn: () => listContracts({ limit: 100 }),
+    queryKey: ['service', 'contracts', routeProjectId ?? ''],
+    queryFn: () => listContracts({ project_id: routeProjectId, limit: 100 }),
     enabled: true,
   });
   const contracts = contractsQ.data ?? [];
   const [selectedContractId, setSelectedContractId] = useState<string>('');
-  const effectiveContractId = selectedContractId || contracts[0]?.id || '';
+  // A pick made under one scope must not survive into another. Moving between
+  // /service and /projects/:projectId/service re-renders this component
+  // without remounting it, so the state outlives the list it was chosen from,
+  // and a stale id would put a foreign contract's assets under this project's
+  // name — the very thing the scoping is for. Derived rather than reset in an
+  // effect so there is no render where the two disagree.
+  const effectiveContractId =
+    (selectedContractId && contracts.some((c) => c.id === selectedContractId)
+      ? selectedContractId
+      : contracts[0]?.id) || '';
 
   const assetsQ = useQuery({
     queryKey: ['service', 'assets', effectiveContractId],
@@ -334,6 +416,15 @@ export function ServicePage() {
     });
   }, [assetsQ.data, search, statusFilter]);
 
+  // Built from the unfiltered ticket list rather than the search result, so the
+  // panel keeps answering "where are the breaches" while somebody narrows the
+  // table down to one ticket.
+  const insights = useModuleInsights('service');
+  const { datasets, builtins } = useMemo(
+    () => buildServiceInsights(ticketsQ.data ?? [], t),
+    [ticketsQ.data, t],
+  );
+
   const isLoading =
     (tab === 'tickets' && ticketsQ.isLoading) ||
     (tab === 'work_orders' && workOrdersQ.isLoading) ||
@@ -376,6 +467,11 @@ export function ServicePage() {
                 -> work order -> billing flow. Leads the action cluster as the
                 help pill and shows on every tab, including Recurring. */}
             <ModuleGuideButton content={serviceGuide} />
+            {/* Only on the tab whose data the panel describes, so the button
+                never opens a panel the user cannot see. */}
+            {tab === 'tickets' && (
+              <InsightsToggleButton open={insights.open} onClick={insights.toggle} />
+            )}
             {tab !== 'recurring' && (
               <Button
                 variant="primary"
@@ -527,7 +623,7 @@ export function ServicePage() {
 
       {/* Body */}
       {tab === 'recurring' ? (
-        <RecurringSchedulesTab contracts={contracts} />
+        <RecurringSchedulesTab contracts={contracts} projectId={routeProjectId} />
       ) : (
       <Card padding="none">
         {isLoading ? (
@@ -547,11 +643,27 @@ export function ServicePage() {
             }}
           />
         ) : tab === 'tickets' ? (
-          <TicketTable
-            rows={filteredTickets}
-            onSelect={(id) => setSelected({ kind: 'tickets', id })}
-            emptyAction={() => setCreateOpen(true)}
-          />
+          <div className="space-y-4">
+            {/* Inside the tickets tab because that is the tab holding the data
+                it summarises. The explainer above the tab strip stays at page
+                level; this one belongs to the register underneath it. */}
+            <InsightsPanel
+              open={insights.open}
+              title={t('service.insights.title', { defaultValue: 'Service desk insights' })}
+              datasets={datasets}
+              builtins={builtins}
+              custom={insights.custom}
+              onAdd={insights.addCustom}
+              onUpdate={insights.updateCustom}
+              onRemove={insights.removeCustom}
+              onCollapse={() => insights.setOpen(false)}
+            />
+            <TicketTable
+              rows={filteredTickets}
+              onSelect={(id) => setSelected({ kind: 'tickets', id })}
+              emptyAction={() => setCreateOpen(true)}
+            />
+          </div>
         ) : tab === 'work_orders' ? (
           <WorkOrderTable
             rows={filteredWOs}
@@ -595,6 +707,7 @@ export function ServicePage() {
           contracts={contracts}
           tickets={ticketsQ.data ?? []}
           defaultContractId={effectiveContractId}
+          projectId={routeProjectId}
           onClose={() => setCreateOpen(false)}
         />
       )}
@@ -648,7 +761,7 @@ function TicketTable({
         </thead>
         <tbody>
           {rows.map((r) => {
-            const chip = computeSlaChip(r, nowMs);
+            const chip = computeSlaChip(r, nowMs, t);
             return (
             <tr
               key={r.id}
@@ -658,10 +771,12 @@ function TicketTable({
               <td className="px-4 py-2 font-mono text-xs text-content-secondary">{r.ticket_number}</td>
               <td className="px-4 py-2 font-medium text-content-primary truncate max-w-[360px]">{r.title}</td>
               <td className="px-4 py-2">
-                <Badge variant={PRIORITY_VARIANT[r.priority]}>{r.priority}</Badge>
+                <Badge variant={PRIORITY_VARIANT[r.priority]}>{priorityLabel(r.priority, t)}</Badge>
               </td>
               <td className="px-4 py-2">
-                <Badge variant={TICKET_STATUS_VARIANT[r.status]} dot>{r.status}</Badge>
+                <Badge variant={TICKET_STATUS_VARIANT[r.status]} dot>
+                  {ticketStatusLabel(r.status, t)}
+                </Badge>
               </td>
               <td className="px-4 py-2">
                 {chip ? (
@@ -1145,8 +1260,8 @@ function DetailDrawer({
                 <p className="mt-1 text-sm text-content-secondary whitespace-pre-wrap">{ticket.description}</p>
               </div>
               <div className="grid grid-cols-2 gap-3 text-sm">
-                <Field label={t('service.priority')} value={<Badge variant={PRIORITY_VARIANT[ticket.priority]}>{ticket.priority}</Badge>} />
-                <Field label={t('service.status')} value={<Badge variant={TICKET_STATUS_VARIANT[ticket.status]} dot>{ticket.status}</Badge>} />
+                <Field label={t('service.priority')} value={<Badge variant={PRIORITY_VARIANT[ticket.priority]}>{priorityLabel(ticket.priority, t)}</Badge>} />
+                <Field label={t('service.status')} value={<Badge variant={TICKET_STATUS_VARIANT[ticket.status]} dot>{ticketStatusLabel(ticket.status, t)}</Badge>} />
                 <Field label={t('service.reported_at')} value={<DateDisplay value={ticket.reported_at} />} />
                 <Field label={t('service.assigned_to', { defaultValue: 'Assigned to' })} value={resolveUserName(ticket.assigned_to) || '—'} />
                 <Field label={t('service.sla_due', { defaultValue: 'SLA due' })} value={ticket.sla_due_at ? <DateDisplay value={ticket.sla_due_at} /> : '—'} />
@@ -1438,12 +1553,15 @@ function CreateModal({
   contracts,
   tickets,
   defaultContractId,
+  projectId,
   onClose,
 }: {
   kind: Tab;
   contracts: ServiceContract[];
   tickets: ServiceTicket[];
   defaultContractId: string;
+  /** Route project on the scoped mount; the new contract is struck against it. */
+  projectId?: string;
   onClose: () => void;
 }) {
   const { t } = useTranslation();
@@ -1554,6 +1672,10 @@ function CreateModal({
       } else if (kind === 'contracts') {
         await createContract({
           ...contractForm,
+          // Struck from inside a project, the contract belongs to it —
+          // otherwise it would be created and then vanish from the very
+          // list the user was looking at.
+          ...(projectId ? { project_id: projectId } : {}),
           value: Number(contractForm.value) || 0,
         });
         addToast({ type: 'success', title: t('service.contract_created', { defaultValue: 'Contract created' }) });

@@ -22,6 +22,7 @@ import { GraduationCap } from 'lucide-react';
 import clsx from 'clsx';
 
 import { ModuleGuide, type ModuleGuideContent } from './ModuleGuide';
+import { ModuleCasesButton } from '@/features/cases/ModuleCasesButton';
 
 export interface ModuleGuideButtonProps {
   /** The guide content to teach when the button is clicked. */
@@ -51,6 +52,16 @@ export function ModuleGuideButton({
 
   return (
     <>
+      {/* Sibling "Cases for this module" pill, sitting to the LEFT of the
+          How-it-works button. It is route-derived and self-hides when no
+          playbook touches the current module, so it costs nothing on pages
+          without cases. */}
+      <ModuleCasesButton />
+      {/* The re-open control for a collapsed info block used to sit here, and
+          now lives in the top bar beside the module name (founder 2026-08-07).
+          It is not rendered in both places: two controls for one action drift
+          apart, and the point of the move was that the control stops shifting
+          around with the width of each page's action row. */}
       <button
         type="button"
         onClick={() => setOpen(true)}

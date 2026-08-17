@@ -46,6 +46,7 @@ import {
 import clsx from 'clsx';
 import { Card, CardContent, Button, Badge, AIDisclaimerBanner, DismissibleInfo, IntroRichText, Breadcrumb, ModuleGuideButton } from '@/shared/ui';
 import { PageHeader } from '@/shared/ui/PageHeader';
+import { TruncationNotice } from '@/shared/ui/TruncationNotice';
 import { aiGuide } from './aiGuide';
 import { useToastStore } from '@/stores/useToastStore';
 import { useProjectContextStore } from '@/stores/useProjectContextStore';
@@ -151,7 +152,7 @@ const FORMAT_LABELS: { [K in FileTab]: string } = {
   photo: 'JPG, PNG, TIFF, WebP',
   pdf: 'PDF',
   excel: 'Excel (.xlsx), CSV (.csv)',
-  cad: 'Revit (.rvt), IFC (.ifc), DWG (.dwg), DGN (.dgn)',
+  cad: 'Revit® (.rvt), IFC (.ifc), DWG (.dwg), DGN (.dgn)',
 };
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -472,6 +473,13 @@ function RecentEstimatesPanel({
               );
             })}
           </ul>
+          {/* The badge beside the heading has always carried `total`, which
+              reads as "you have 23 estimates" while eight rows are drawn -
+              true, and no help at all in working out that fifteen are missing.
+              This says which of the two numbers the list is. */}
+          <div className="px-4 py-2">
+            <TruncationNotice page={data!} />
+          </div>
         </Card>
       )}
     </section>
@@ -2629,7 +2637,8 @@ export function QuickEstimatePage() {
             defaultValue: 'Pull quantities straight from the model',
           })}
           links={[
-            { label: t('cad_takeoff.intro_link_explorer', { defaultValue: 'Data Explorer' }), onClick: () => navigate('/data-explorer') },
+            // #149 - the sidebar's key, so this link and the page agree.
+            { label: t('nav.cad_bim_explorer', { defaultValue: 'CAD-BIM BI Explorer' }), onClick: () => navigate('/data-explorer') },
             { label: t('cad_takeoff.intro_link_boq', { defaultValue: 'Open BOQ' }), onClick: () => navigate('/boq') },
           ]}
         >
@@ -3487,7 +3496,7 @@ export function QuickEstimatePage() {
                               }
                             }}
                           >
-                            {t('ai.open_explorer', { defaultValue: 'Data Explorer' })}
+                            {t('nav.cad_bim_explorer', { defaultValue: 'CAD-BIM BI Explorer' })}
                           </Button>
                         </div>
                       ) : (
@@ -3599,7 +3608,7 @@ export function QuickEstimatePage() {
                 className="shrink-0 whitespace-nowrap"
               >
                 <Database size={13} className="mr-1" />
-                <span>{t('ai.open_data_explorer', { defaultValue: 'Data Explorer' })}</span>
+                <span>{t('nav.cad_bim_explorer', { defaultValue: 'CAD-BIM BI Explorer' })}</span>
               </Button>
             </div>
           </div>

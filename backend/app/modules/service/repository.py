@@ -13,6 +13,9 @@ from typing import Any, Generic, TypeVar
 
 from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm.attributes import set_committed_value
+from sqlalchemy.orm.util import identity_key
+from sqlalchemy.sql.elements import ClauseElement
 
 from app.database import Base
 from app.modules.service.models import (
@@ -54,7 +57,15 @@ class _BaseRepo(Generic[ModelT]):
         stmt = update(self.model).where(self.model.id == entity_id).values(**fields)
         await self.session.execute(stmt)
         await self.session.flush()
-        self.session.expire_all()
+        instance = self.session.identity_map.get(identity_key(self.model, entity_id))
+        if instance is None:
+            return
+        computed = [name for name, value in fields.items() if isinstance(value, ClauseElement)]
+        for name, value in fields.items():
+            if name not in computed:
+                set_committed_value(instance, name, value)
+        if computed:
+            self.session.expire(instance, computed)
 
     async def delete(self, entity_id: uuid.UUID) -> None:
         obj = await self.get_by_id(entity_id)
@@ -186,12 +197,25 @@ class TicketRepository(_BaseRepo[ServiceTicket]):
         *,
         offset: int = 0,
         limit: int = 50,
+        status: str | None = None,
+        priority: str | None = None,
     ) -> tuple[list[ServiceTicket], int]:
+        """List one project's tickets across every contract it holds.
+
+        Takes ``status`` and ``priority`` for the same reason the by-contract
+        listing does: the endpoint accepts both regardless of how the caller
+        scoped the request, and a filter the query drops on one branch is
+        worse than one it never offered.
+        """
         base = (
             select(ServiceTicket)
             .join(ServiceContract, ServiceContract.id == ServiceTicket.contract_id)
             .where(ServiceContract.project_id == project_id)
         )
+        if status is not None:
+            base = base.where(ServiceTicket.status == status)
+        if priority is not None:
+            base = base.where(ServiceTicket.priority == priority)
         total = (await self.session.execute(select(func.count()).select_from(base.subquery()))).scalar_one()
         stmt = base.order_by(ServiceTicket.reported_at.desc()).offset(offset).limit(limit)
         rows = (await self.session.execute(stmt)).scalars().all()
@@ -265,6 +289,40 @@ class WorkOrderRepository(_BaseRepo[ServiceWorkOrder]):
         )
         rows = (await self.session.execute(stmt)).scalars().all()
         return list(rows)
+
+    async def list_for_project(
+        self,
+        project_id: uuid.UUID,
+        *,
+        offset: int = 0,
+        limit: int = 50,
+        status: str | None = None,
+        technician_id: str | None = None,
+    ) -> tuple[list[ServiceWorkOrder], int]:
+        """List work orders raised against one project's contracts.
+
+        A work order carries no ``project_id`` of its own - it hangs off a
+        ticket, and the ticket off a contract, so the project is two joins
+        away. Filtering here rather than in the page matters because the
+        listing is paginated: a client-side narrowing would first take the
+        newest N work orders tenant-wide and only then drop the foreign ones,
+        so a quiet project would show an empty tab while its work orders sit
+        just past the page boundary.
+        """
+        base = (
+            select(ServiceWorkOrder)
+            .join(ServiceTicket, ServiceTicket.id == ServiceWorkOrder.ticket_id)
+            .join(ServiceContract, ServiceContract.id == ServiceTicket.contract_id)
+            .where(ServiceContract.project_id == project_id)
+        )
+        if status is not None:
+            base = base.where(ServiceWorkOrder.status == status)
+        if technician_id is not None:
+            base = base.where(ServiceWorkOrder.technician_id == technician_id)
+        total = (await self.session.execute(select(func.count()).select_from(base.subquery()))).scalar_one()
+        stmt = base.order_by(ServiceWorkOrder.created_at.desc()).offset(offset).limit(limit)
+        rows = (await self.session.execute(stmt)).scalars().all()
+        return list(rows), int(total)
 
     async def list_all(
         self,

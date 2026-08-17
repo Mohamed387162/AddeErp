@@ -32,7 +32,7 @@ import {
   XCircle,
   CheckCircle2,
 } from 'lucide-react';
-import { Button, Card, Badge, EmptyState, RecoveryCard, DismissibleInfo, IntroRichText, SkeletonTable, Breadcrumb, ConfirmDialog, ModuleGuideButton } from '@/shared/ui';
+import { Button, Card, Badge, EmptyState, RecoveryCard, DismissibleInfo, IntroRichText, SkeletonTable, Breadcrumb, ConfirmDialog, ModuleGuideButton, CollapsibleSection } from '@/shared/ui';
 import { RequiresProject } from '@/shared/auth/RequiresProject';
 import { PageHeader } from '@/shared/ui/PageHeader';
 import {
@@ -57,12 +57,14 @@ import {
   type Recipient,
   type DistributeResponse,
 } from './api';
-import { getIntlLocale } from '@/shared/lib/formatters';
+import { fmtPercent, getIntlLocale } from '@/shared/lib/formatters';
 import {
   listSubcontractors,
   type Subcontractor,
   type PrequalStatus,
 } from '@/features/subcontractors/api';
+import { InsightsPanel, InsightsToggleButton, useModuleInsights } from '@/features/insights';
+import { buildTenderingInsights } from './tenderingInsights';
 
 /* ── Types ─────────────────────────────────────────────────────────────── */
 
@@ -214,13 +216,13 @@ function DeviationBadge({ pct }: { pct: number }) {
   if (pct < 0) {
     return (
       <span className="inline-flex items-center gap-0.5 text-xs font-medium text-semantic-success">
-        <ArrowDownRight size={12} /> {pct.toFixed(1)}%
+        <ArrowDownRight size={12} /> {fmtPercent(pct)}
       </span>
     );
   }
   return (
     <span className="inline-flex items-center gap-0.5 text-xs font-medium text-semantic-error">
-      <ArrowUpRight size={12} /> +{pct.toFixed(1)}%
+      <ArrowUpRight size={12} /> +{fmtPercent(pct)}
     </span>
   );
 }
@@ -1946,12 +1948,15 @@ function HowTenderingWorks() {
   ];
 
   return (
-    <section className="rounded-xl border border-border-light bg-surface-secondary/40 p-4">
-      <h2 className="flex items-center gap-1.5 text-sm font-semibold text-content-primary">
-        <Network size={15} className="text-oe-blue" />
-        {t('tendering.how_title', { defaultValue: 'How tendering fits together' })}
-      </h2>
-      <p className="mt-1 text-xs text-content-tertiary">
+    <CollapsibleSection
+      storageKey="tendering.how"
+      icon={<Network size={15} className="text-oe-blue" />}
+      title={t('tendering.how_title', { defaultValue: 'How tendering fits together' })}
+      subtitle={t('tendering.how_subtitle', {
+        defaultValue: 'From a priced BOQ to an awarded contract, in five steps',
+      })}
+    >
+      <p className="text-xs text-content-tertiary">
         {t('tendering.how_intro', {
           defaultValue:
             'Take a priced BOQ to market: package the work, invite subcontractors, compare their offers and award the winner, which writes the agreed rates back to the BOQ.',
@@ -1997,7 +2002,7 @@ function HowTenderingWorks() {
         ·{' '}
         <ModLink to="/reports">{t('tendering.how_mod_reports', { defaultValue: 'Reports' })}</ModLink>
       </div>
-    </section>
+    </CollapsibleSection>
   );
 }
 
@@ -2073,6 +2078,17 @@ export function TenderingPage() {
   // symbol-less number rather than mislabelling amounts as EUR.
   const currency = selectedProject?.currency || '';
 
+  // Module Insights - the toggleable visualization panel for this module. Its
+  // charts are built client-side from the packages already loaded; when the
+  // project has none the panel draws nothing rather than inventing rows to fill
+  // it. Open state and any user-built charts persist per module via
+  // useModuleInsights.
+  const insights = useModuleInsights('tendering', { defaultOpen: true });
+  const { datasets: insightDatasets, builtins: insightBuiltins } = useMemo(
+    () => buildTenderingInsights(packages ?? [], currency, t),
+    [packages, currency, t],
+  );
+
   const handlePackageCreated = useCallback(() => {
     queryClient.invalidateQueries({
       queryKey: ['tendering-packages', selectedProjectId],
@@ -2097,6 +2113,9 @@ export function TenderingPage() {
         )}
         actions={
           <>
+            {/* Insights toggle - shows or hides this module's visualization
+                panel. Leads the cluster so charts are one obvious click away. */}
+            <InsightsToggleButton open={insights.open} onClick={insights.toggle} />
             {/* How it works guide - explains the package -> issue -> collect ->
                 compare -> award flow. Leads the action cluster as the help pill;
                 the CTA opens the New Tender Package dialog. */}
@@ -2119,6 +2138,21 @@ export function TenderingPage() {
             </span>
           </>
         }
+      />
+
+      {/* Module Insights panel - toggled by the header button. Placed high and
+          before the no-project gate so its charts are visible the moment the
+          module opens. */}
+      <InsightsPanel
+        open={insights.open}
+        title={t('tendering.insights.title', { defaultValue: 'Tendering insights' })}
+        datasets={insightDatasets}
+        builtins={insightBuiltins}
+        custom={insights.custom}
+        onAdd={insights.addCustom}
+        onUpdate={insights.updateCustom}
+        onRemove={insights.removeCustom}
+        onCollapse={() => insights.setOpen(false)}
       />
 
       {/* Workflow explanation */}
